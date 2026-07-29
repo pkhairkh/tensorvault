@@ -17,6 +17,10 @@
 //! - [`planner`] — calibrated analytic cost model (ADR-023) + Kingman
 //!   queueing predictor (ADR-020) used for join ordering, index selection,
 //!   and admission control.
+//! - [`index`] — secondary indexes: bit-sliced index (ADR-014) and
+//!   locality-sensitive hash (ADR-017).
+//! - [`sketch`] — probabilistic, mergeable summaries: HyperLogLog,
+//!   Count-Min, t-Digest (ADR-015).
 //! - [`protocol`] — protocol boundary coordinator (CXL, Raft/RoCEv2).
 //! - [`schema`] — the last layer: MDL schema selection.
 //! - [`sql`] — the SQL surface: tokenizer, recursive-descent parser for
@@ -28,11 +32,13 @@
 #![warn(rust_2018_idioms, missing_docs)]
 
 pub mod executor;
+pub mod index;
 pub mod kernel;
 pub mod memory;
 pub mod planner;
 pub mod protocol;
 pub mod schema;
+pub mod sketch;
 pub mod sql;
 pub mod storage;
 pub mod types;
