@@ -13,6 +13,7 @@
 |----------|-----------|
 | **[docs/FINE_DRAFT.md](docs/FINE_DRAFT.md)** | The definitive synthesis: venture + 25 ADRs + measured performance |
 | **[docs/adr/](docs/adr/)** | 25 accepted ADRs + 7 open questions |
+| **[SPECIFICATION.md](SPECIFICATION.md)** | Formal technical specification for implementers |
 | **[ARCHITECTURE.md](ARCHITECTURE.md)** | The architecture in 1 page |
 | **[docs/README.md](docs/README.md)** | Documentation index (reading order for new contributors) |
 | **[docs/problems/](docs/problems/)** | Problem catalog: 99 problems with status, math, effort, impact |

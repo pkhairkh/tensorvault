@@ -23,5 +23,4 @@
 *.blg
 
 # Cargo lock — library crate, no need to commit
-# (uncomment if this becomes a binary)
-# Cargo.lock
+Cargo.lock

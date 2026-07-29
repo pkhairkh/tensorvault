@@ -87,6 +87,5 @@ XX% (with rationale)
 ## See also
 
 - [OPEN_QUESTIONS.md](./OPEN_QUESTIONS.md) — decisions below 80% confidence
-- [../ROUGH_DRAFT.md](../ROUGH_DRAFT.md) — the rough draft (will become the
-  fine draft once all ADRs are settled)
+- [../FINE_DRAFT.md](../FINE_DRAFT.md) — the definitive synthesis of the venture
 - [../problems/](../problems/) — the full problem catalog

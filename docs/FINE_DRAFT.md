@@ -4,7 +4,7 @@
 > accepted design decisions, 99 catalogued problems, measured performance on
 > real hardware, and an honest assessment of what works and what doesn't.**
 >
-> This document supersedes `ROUGH_DRAFT.md`. It is grounded in:
+> This document is grounded in:
 > - [25 ADRs](./adr/) (≥80% confidence, harmonically compatible)
 > - [7 open questions](./adr/OPEN_QUESTIONS.md) (acknowledged, not resolved)
 > - [99 catalogued problems](./problems/) (9 solved, 19 partial, 71 open)
@@ -661,11 +661,10 @@ This fine draft synthesizes:
 | [Architecture](./architecture/) | instruction-first.md + cpu-energy-kb.md | ~1,300 |
 | [Research](./research/) | math-foundations + math-enhancements + 5 domains + 5 waves | ~8,000 |
 | [Benchmarks](./benchmarks/) | TPC-C analysis + TPC-C math | ~1,400 |
-| [Rough draft](./ROUGH_DRAFT.md) | The predecessor to this document | ~800 |
+
 | **Total corpus** | **~60 documents** | **~18,000 lines** |
 
 ---
 
 *This is the fine draft. It will be updated as open questions are resolved
-and new ADRs are accepted. The rough draft (`ROUGH_DRAFT.md`) is retained
-for historical reference.*
+*

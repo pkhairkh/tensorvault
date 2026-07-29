@@ -17,6 +17,7 @@
 docs/
 ├── README.md                  ← documentation index (start here)
 ├── FINE_DRAFT.md              ← THE definitive synthesis (read first)
+├── SPECIFICATION.md           ← formal technical specification
 ├── adr/                       ← Architecture Decision Records (≥80% confidence)
 │   ├── README.md              ← ADR index with compatibility matrix
 │   ├── OPEN_QUESTIONS.md      ← decisions below 80% confidence
