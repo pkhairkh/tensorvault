@@ -14,6 +14,9 @@
 //! - [`storage`] — instruction-shaped storage format (4 KB page, 2 MB region,
 //!   2 GB tablet).
 //! - [`executor`] — scheduler of instruction streams.
+//! - [`planner`] — calibrated analytic cost model (ADR-023) + Kingman
+//!   queueing predictor (ADR-020) used for join ordering, index selection,
+//!   and admission control.
 //! - [`protocol`] — protocol boundary coordinator (CXL, Raft/RoCEv2).
 //! - [`schema`] — the last layer: SQL parser, MDL schema selection.
 //! - [`types`] — linear/affine memory handles (`CxlRef`, `RaftRef`) that
@@ -24,6 +27,7 @@
 pub mod executor;
 pub mod kernel;
 pub mod memory;
+pub mod planner;
 pub mod protocol;
 pub mod schema;
 pub mod storage;
