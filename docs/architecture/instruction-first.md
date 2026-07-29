@@ -400,7 +400,7 @@ Schema changes (add column, drop column, change type) are cheap because the sche
 
 ### 9.2 Schema-on-Read
 
-For semi-structured data (JSON, logs), the engine stores raw bytes in 64-bit cells (NaN-boxed short strings or pointers to long strings). The schema is discovered at query time by the MDL schema selector (see `mdl_sketch.pdf`). The kernel for a schema-on-read column is polymorphic — it dispatches per batch based on the homogeneity mask in the page header.
+For semi-structured data (JSON, logs), the engine stores raw bytes in 64-bit cells (NaN-boxed short strings or pointers to long strings). The schema is discovered at query time by the MDL schema selector (see ADR-015 and the schema layer). The kernel for a schema-on-read column is polymorphic — it dispatches per batch based on the homogeneity mask in the page header.
 
 ## 10. Why This Beats Table-and-Column Engines
 

@@ -76,7 +76,6 @@ tensorvault/
     │   └── waves/                    ← per-problem solution evaluations (performance/time/energy)
     ├── problems/                     ← problem catalog: 99 problems across 10 files
     ├── benchmarks/                   ← TPC-C and TPC-H analysis
-    └── archive/                      ← old NaN-boxing thesis (superseded)
 ```
 
 ## The storage format: instruction-shaped, not schema-shaped

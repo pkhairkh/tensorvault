@@ -195,4 +195,4 @@ that wins on:
 - `docs/instruction_first_architecture.md` — long-form architecture document
 - `docs/tpcc_analysis.md` — TPC-C bottleneck analysis
 - `docs/tpcc_math.md` — TPC-C mathematical analysis with path to beating it
-- `docs/archive/` — old NaN-boxing thesis (superseded by this architecture)
+
