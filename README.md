@@ -7,6 +7,16 @@
 > treat every protocol boundary (CXL / RoCEv2 / IB) as a first-class design
 > axis. The table-and-column model is the last layer, not the first.
 
+## Quick links
+
+| Document | What it is |
+|----------|-----------|
+| **[docs/FINE_DRAFT.md](docs/FINE_DRAFT.md)** | The master document: the venture, the problem catalog with solutions, the 30-month build plan |
+| **[ARCHITECTURE.md](ARCHITECTURE.md)** | The architecture in 1 page |
+| **[docs/README.md](docs/README.md)** | Documentation index (reading order for new contributors) |
+| **[docs/problems/](docs/problems/)** | Problem catalog: 99 problems with status, math, effort, impact |
+| **[docs/research/waves/](docs/research/waves/)** | Per-problem solution evaluations (performance / time / energy) |
+
 ## Why this exists
 
 Every existing database engine — Postgres, MySQL, DuckDB, ClickHouse — starts
@@ -42,52 +52,29 @@ Instruction Sets → Memory Hierarchy → Protocols → Storage Layout → Execu
 ```
 tensorvault/
 ├── README.md                         ← you are here
-├── ARCHITECTURE.md                   ← the instruction-first architecture
+├── ARCHITECTURE.md                   ← the instruction-first architecture (1-page summary)
 ├── Cargo.toml
-├── src/
-│   ├── lib.rs                        ← crate root
+├── src/                              ← Rust source code
 │   ├── kernel/                       ← THE KERNEL TABLE (the moat)
-│   │   ├── mod.rs                    ← Kernel trait, KernelTable, dispatch
-│   │   ├── cpu.rs                    ← CPU detection (CPUID, feature flags)
-│   │   ├── scan.rs                   ← scan_eq, scan_range kernels
-│   │   ├── hash.rs                   ← hash_build, hash_probe kernels
-│   │   ├── aggregate.rs              ← sum, count, count_distinct kernels
-│   │   └── similarity.rs             ← hamming distance kernel
 │   ├── memory/                       ← tier-aware memory manager
-│   │   ├── mod.rs
-│   │   ├── tier.rs                   ← L3/DDR5/HBM/CXL/NVMe tier definitions
-│   │   ├── region.rs                 ← 2 MB region, placement, migration
-│   │   └── numa.rs                   ← NUMA topology, CXL discovery
 │   ├── storage/                      ← instruction-shaped storage format
-│   │   ├── mod.rs
-│   │   ├── page.rs                   ← 4 KB page (512 cells)
-│   │   ├── tablet.rs                 ← 2 GB tablet (1024 regions)
-│   │   └── wal.rs                    ← ZNS-aware WAL
 │   ├── executor/                     ← scheduler of instruction streams
-│   │   ├── mod.rs
-│   │   ├── plan.rs                   ← logical plan → kernel DAG
-│   │   └── scheduler.rs              ← dispatch kernels respecting tiers
 │   ├── protocol/                     ← protocol boundary coordinator
-│   │   ├── mod.rs
-│   │   ├── cxl.rs                    ← single-rack CXL coherence (stub)
-│   │   └── raft.rs                   ← cross-rack Raft over RoCEv2 (stub)
-│   └── schema/                       ← the LAST layer
-│       ├── mod.rs
-│       └── mdl.rs                    ← MDL-driven schema selection
-├── examples/
-│   └── smoke.rs                      ← end-to-end demo
-├── benches/
-│   └── throughput.rs                 ← criterion benchmarks
+│   └── schema/                       ← the LAST layer (MDL schema selection)
+├── examples/smoke.rs                 ← end-to-end demo
+├── benches/                          ← criterion benchmarks
 └── docs/
-    ├── ARCHITECTURE.md               ← the design doc
-    ├── cpu_energy_kb.md              ← per-instruction energy knowledgebase
-    ├── instruction_first_architecture.md ← long-form architecture
-    ├── tpcc_analysis.md              ← TPC-C bottleneck analysis
-    ├── tpcc_math.md                  ← TPC-C mathematical analysis
+    ├── README.md                     ← documentation index (start here)
+    ├── FINE_DRAFT.md                 ← THE master document: venture + catalog + solutions
+    ├── architecture/                 ← design docs + CPU energy knowledgebase
+    ├── research/                     ← math foundations + domain deep-dives + wave evaluations
+    │   ├── math-foundations.md
+    │   ├── math-enhancements.md
+    │   ├── domains/                  ← 5 mathematical pillars (info theory, spectral, prob, opt, category)
+    │   └── waves/                    ← per-problem solution evaluations (performance/time/energy)
+    ├── problems/                     ← problem catalog: 99 problems across 10 files
+    ├── benchmarks/                   ← TPC-C and TPC-H analysis
     └── archive/                      ← old NaN-boxing thesis (superseded)
-        ├── position_paper.{tex,pdf}
-        ├── mdl_sketch.{tex,pdf}
-        └── commodity_hw.{tex,pdf}
 ```
 
 ## The storage format: instruction-shaped, not schema-shaped
