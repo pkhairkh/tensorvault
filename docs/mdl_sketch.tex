@@ -1,0 +1,747 @@
+% =====================================================================
+%  MDL-Optimal Schema Selection for Bit-Uniform Relational Storage
+%  Formal technical note -- self-contained LaTeX source
+% =====================================================================
+\documentclass[10pt]{article}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{amsthm}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{cleveref}
+\usepackage{geometry}
+\usepackage{natbib}
+
+\geometry{margin=1in,letterpaper}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!45!black,
+  citecolor=blue!45!black,
+  urlcolor=blue!45!black
+}
+
+% ---- Theorem environments ------------------------------------------
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{proposition}[theorem]{Proposition}
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}
+
+% ---- Listings ------------------------------------------------------
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{blue!70!black}\bfseries,
+  commentstyle=\color{green!45!black},
+  stringstyle=\color{red!55!black},
+  frame=single,
+  breaklines=true,
+  showstringspaces=false,
+  columns=fullflexible
+}
+
+% ---- Shorthands ----------------------------------------------------
+\newcommand{\Vcal}{\mathcal{V}}
+\newcommand{\Ccal}{\mathcal{C}}
+\newcommand{\Tcal}{\mathcal{T}}
+\newcommand{\Lmodel}{L_{\mathrm{model}}}
+\newcommand{\Ldata}{L_{\mathrm{data}}}
+\newcommand{\bits}{\{0,1\}^*}
+\newcommand{\eqL}{\equiv_{\mathcal{L}}}
+\DeclareMathOperator*{\argmin}{arg\,min}
+
+\title{MDL-Optimal Schema Selection for Bit-Uniform Relational Storage}
+\author{Anonymous}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+% =====================================================================
+\begin{abstract}
+Modern columnar storage engines increasingly defer type interpretation to
+read time, storing raw $64$-bit NaN-boxed words in a bit-uniform layout.
+This deferral enables schema evolution and polymorphic columns, but it
+raises a fundamental question: which type interpretation should a reader
+apply to an opaque column of bits? We formalize this schema-selection
+problem as a minimum description length (MDL) optimization. Given a
+column $\Ccal$ of $n$ raw $64$-bit words and a finite candidate type set
+$\Tcal$, we seek the encoding $\tau \in \Tcal$ minimizing the two-part
+code $L(\Ccal,\tau) = \Lmodel(\tau) + \Ldata(\Ccal \mid \tau)$, where
+$\Lmodel$ charges for the type tag and metadata and $\Ldata$ charges for
+the per-value code under $\tau$. We prove that the MDL-optimal encoding is
+unique up to information-lattice equivalence, that niche-filling incurs no
+description-length overhead, and that the selection algorithm runs in
+$O(|\Tcal| \cdot n)$ time. A corollary establishes that read-time
+reinterpretation is safe if and only if the candidate encodings are
+information-lattice equivalent.
+\end{abstract}
+
+% =====================================================================
+\section{Introduction}\label{sec:intro}
+
+Relational storage engines have, for decades, committed to a fixed schema
+at write time: each column is assigned a concrete physical type, and every
+value stored in that column is encoded according to that type. This
+discipline simplifies the query executor but rigidifies the on-disk
+representation. When the schema evolves---an integer column must now hold a
+floating-point sentinel, or a string column acquires nulls---storage
+engines resort to costly migrations, rewrite-on-alter, or auxiliary shadow
+columns; variant indexes~\citep{oneil1997} anticipated this flexibility at the index level decades ago. A growing line of systems instead stores \emph{bit-uniform}
+columns of raw $64$-bit words and defers type interpretation to read time,
+recovering the concrete type from the bit pattern itself through
+\emph{NaN-boxing}~\citep{wingo2011}, a representation pioneered by
+JavaScript runtimes and now ubiquitous in dynamic-language
+implementations.
+
+Schema-on-read demands a principled objective. Without one, the choice of
+type interpretation degenerates into a catalog of ad hoc heuristics: ``use
+\texttt{i32} when all values fit, otherwise fall back to \texttt{f64}.''
+Such heuristics are fragile, mutually inconsistent, and invisible to the
+query planner. The minimum description length (MDL)
+principle~\citep{rissanen1978,grunwald2004,barron1998} supplies a unified
+objective: among a family of candidate encodings, choose the one that
+minimizes the total number of bits required to transmit both the model
+(the type and its metadata) and the data (the encoded values). MDL is
+model-class-agnostic, statistically consistent, and---crucially for
+us---computable in a single linear pass over the column.
+
+This note makes the following contributions. First, we give a formal
+specification of the schema-selection problem for bit-uniform storage
+(\cref{sec:problem}) and a closed-form MDL objective whose model and data
+parts decompose cleanly across the NaN-boxed word layout
+(\cref{sec:objective}). Second, we present \textsc{Schema-Select}, a
+linear-time-per-candidate algorithm with a tight $O(|\Tcal| \cdot n)$
+complexity bound (\cref{sec:algorithm}). Third, we connect the selection
+problem to Verd\'u's information lattice~\citep{verdu} and prove that
+MDL-optimal encodings are unique up to information-lattice equivalence
+(\cref{sec:lattice}); the accompanying corollary gives the precise
+condition under which read-time reinterpretation is semantically safe.
+Fourth, we treat variable-length type tags via Huffman
+coding~\citep{huffman1952} and a fully worked numerical example
+(\cref{sec:tags,sec:worked}).
+
+The remainder of the note proceeds as follows. \Cref{sec:prelim} reviews
+NaN-boxing, niche-filling, and the MDL principle. \Cref{sec:problem}
+states the problem. \Cref{sec:objective,sec:algorithm} develop the
+objective and the algorithm. \Cref{sec:lattice} establishes the
+information-lattice equivalence theorem.
+\Cref{sec:tags,sec:worked,sec:impl} address practical concerns, and
+\Cref{sec:concl} concludes. The development is self-contained; we assume
+only familiarity with elementary information theory~\citep{coverthomas}
+and the relational model.
+
+% =====================================================================
+\section{Preliminaries}\label{sec:prelim}
+
+\subsection{Notation}\label{sec:notation}
+
+Let $\Vcal$ denote the universe of values a relational attribute may
+assume---integers, IEEE-754 doubles, UTF-8 strings, nulls, and tagged
+variants thereof. A \emph{column} of length $n$ is a finite sequence
+$\Ccal = (v_1, v_2, \ldots, v_n)$ with $v_i \in \Vcal$. A \emph{type
+interpretation} $\tau \in \Tcal$ is a pair $(e_\tau, d_\tau)$ where
+$e_\tau : \Vcal \to \bits$ is an injective \emph{encoder} and
+$d_\tau : \bits \rightharpoonup \Vcal$ is a partial \emph{decoder} with
+$d_\tau \circ e_\tau = \mathrm{id}$ on $\Vcal$. The candidate type set
+$\Tcal$ is finite and fixed by the storage engine; throughout this note
+we take $\Tcal = \{\textsc{f64}, \textsc{i32}, \textsc{\&str},
+\textsc{nullable}, \textsc{variant}\}$ as a running example. We write
+$\bits$ for the set of finite binary strings and $\{0,1\}^{64}$ for the
+set of $64$-bit words. The length of a string $x$ is $|x|$.
+
+\subsection{IEEE-754 NaN-boxing recap}\label{sec:nanbox}
+
+An IEEE-754 binary64 double~\citep{coverthomas} is a $64$-bit word
+partitioned into a sign bit, an $11$-bit exponent, and a $52$-bit
+mantissa. A value is a \emph{NaN} precisely when all eleven exponent bits
+are set and the mantissa is nonzero, yielding $2^{53} - 2$ distinct NaN
+bit patterns (counting the sign). Of these, the canonical single NaN
+specified by the standard is but one; the remaining patterns form a vast
+\emph{payload space} that the storage engine may exploit. The
+\emph{NaN-boxing} technique~\citep{wingo2011} co-opts this payload space
+as a type-tagged container: the upper $16$ bits (sign and exponent)
+encode a type tag, while the lower $48$ bits carry a type-specific
+payload. \Cref{tab:nanbox} gives the partition used throughout this note.
+
+\begin{table}[h]
+\centering
+\caption{NaN-boxed $64$-bit word partition. The upper $16$ bits serve as
+a type tag; the lower $48$ bits carry the payload. Finite doubles occupy
+the non-NaN region and require no tag.}\label{tab:nanbox}
+\begin{tabular}{@{}llll@{}}
+\toprule
+Upper $16$ bits (hex) & Class & Type tag $\tau$ & Payload ($48$ bits) \\
+\midrule
+\texttt{0x0000}--\texttt{0x7FEF} & finite \textsc{f64}    & \textsc{f64}     & IEEE-754 double value (full $64$ bits) \\
+\texttt{0x7FF0}                  & $+\infty$               & \textsc{f64}     & --- \\
+\texttt{0x7FF8}                  & quiet NaN               & \textsc{i32}     & $32$-bit signed integer (low $32$, zero-extended) \\
+\texttt{0x7FF9}                  & quiet NaN               & \textsc{\&str}   & $48$-bit offset into string heap \\
+\texttt{0x7FFA}                  & quiet NaN               & \textsc{null}    & --- (empty payload) \\
+\texttt{0x7FFB}                  & quiet NaN               & \textsc{variant} & $8$-bit variant tag $+\;40$-bit payload \\
+\texttt{0xFFF0}                  & $-\infty$               & \textsc{f64}     & --- \\
+\texttt{0xFFF8}--\texttt{0xFFFF} & sign-bit NaN            & reserved         & future extensions \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The essential observation is that finite doubles---the overwhelming
+majority of values in numerical columns---pay no tagging overhead at all:
+they live in the non-NaN region and are stored verbatim. Only the
+``exotic'' values (integers, strings, nulls, variants) occupy the NaN
+region, where they are tagged at the cost of the upper $16$ bits. This
+asymmetry is what makes NaN-boxing a compelling substrate for MDL
+analysis: the description length of a column is dominated by the data
+part, and the data part is, for homogeneous numerical columns, exactly
+$n \cdot 64$ bits.
+
+\subsection{Niche-filling}\label{sec:niche}
+
+\emph{Niche-filling}~\citep{rustlayout,swiftabi} is the systematic
+allocation of unused bit patterns within a representation to alternative
+types. Rust's enum layout and Swift's resilient ABI both exploit the
+observation that pointer values on $64$-bit platforms never use the upper
+$16$ bits of a $64$-bit word (the user-space address space is $48$ bits),
+freeing those bits to discriminate enum variants. The NaN payload is a
+special case: the niche is the set of NaN bit patterns, and the
+alternative types are the non-double value classes. Niche-filling is
+attractive precisely because it is \emph{free}: the bits it occupies
+would otherwise be wasted. We make this intuition precise in
+\cref{lem:niche}: niche-filling preserves description length, in the
+sense that storing a tagged value in the NaN payload adds no model cost
+beyond the type tag itself. This is the formal basis for treating the
+NaN-boxed layout as a bit-uniform substrate over which MDL selection
+operates.
+
+\subsection{The MDL principle}\label{sec:mdl}
+
+The minimum description length principle~\citep{rissanen1978,grunwald2004}
+holds that, given a family of candidate models $\Tcal$ and observed data
+$\Ccal$, one should select the model $\tau^\star \in \Tcal$ minimizing the
+\emph{two-part code} length
+\begin{equation}\label{eq:twopart}
+L(\Ccal, \tau) \;=\; \Lmodel(\tau) \;+\; \Ldata(\Ccal \mid \tau),
+\end{equation}
+where $\Lmodel(\tau)$ is the cost, in bits, of describing the model (here,
+the type tag and its metadata) and $\Ldata(\Ccal \mid \tau)$ is the cost
+of describing the data given the model. Rissanen's original
+formulation~\citep{rissanen1978} charged $\Lmodel$ with the logarithm of
+the model index; the \emph{refined MDL} of \citet{barron1998} replaces
+this with the normalized maximum likelihood (NML) code, which accounts for
+the complexity of the model class itself. Both formulations trace
+ultimately to Kolmogorov complexity~\citep{livitanyi}, which charges a
+program for the length of its shortest description. For our purposes the
+distinction is benign: the candidate type set $\Tcal$ is fixed and finite,
+so the model cost reduces to a constant per-type overhead. We adopt the
+two-part code of \cref{eq:twopart} throughout, noting that the
+information-lattice uniqueness result of \cref{sec:lattice} holds
+verbatim under NML because NML refines, rather than replaces, the
+two-part ranking within a fixed model class.
+
+% =====================================================================
+\section{Problem statement}\label{sec:problem}
+
+We now state the schema-selection problem formally. Let $\Ccal =
+(v_1, \ldots, v_n)$ be a column of raw $64$-bit NaN-boxed words supplied
+by the storage engine at load time, and let $\Tcal$ be the finite set of
+candidate type interpretations admitted by the engine. The decision
+variable is a per-column type assignment $\tau \in \Tcal$. The objective
+is to minimize the total description length $L(\Ccal, \tau)$ of
+\cref{eq:twopart} over $\Tcal$:
+\begin{equation}\label{eq:objective}
+\tau^\star \;=\; \argmin_{\tau \in \Tcal} \; L(\Ccal, \tau) \;=\; \argmin_{\tau \in \Tcal} \;\bigl[\,\Lmodel(\tau) + \Ldata(\Ccal \mid \tau)\,\bigr].
+\end{equation}
+The assignment is per-column and per-load: different columns in the same
+relation may receive different types, and the same column may be
+reinterpreted across loads if the data drifts. We restrict attention to
+\emph{lossless} encodings, meaning $d_\tau \circ e_\tau = \mathrm{id}$;
+lossy compression is orthogonal and composes with our scheme. The problem
+is well-posed because $\Tcal$ is finite and $L$ is real-valued, so a
+minimizer exists. The remainder of the note characterizes the minimizer
+(\cref{sec:objective,sec:lattice}), gives an efficient algorithm for
+computing it (\cref{sec:algorithm}), and demonstrates its behavior on
+concrete data (\cref{sec:worked}).
+
+% =====================================================================
+\section{The MDL objective}\label{sec:objective}
+
+We instantiate the abstract two-part code of \cref{eq:twopart} for the
+NaN-boxed setting. The model cost decomposes into three additive
+terms: a \emph{type tag} identifying $\tau$ within $\Tcal$, an
+\emph{index structure} cost for any auxiliary arrays the encoding
+requires, and a \emph{metadata} cost for per-type parameters such as
+string-heap length or variant tag table. Concretely,
+\begin{equation}\label{eq:model}
+\Lmodel(\tau) \;=\; \underbrace{\lceil \log_2 |\Tcal| \rceil}_{\text{type tag}} \;+\; \underbrace{I(\tau)}_{\text{index}} \;+\; \underbrace{M(\tau)}_{\text{metadata}},
+\end{equation}
+where $I(\tau)$ is the size, in bits, of any offset or indirection array
+(e.g., a $48$-bit offset table for \textsc{\&str}, over which string
+search proceeds by the methods of \citet{baeza1992}) and $M(\tau)$ is the
+size of per-type parameters (e.g., the variant tag enumeration for
+\textsc{variant}). For the homogeneous numeric types \textsc{f64} and
+\textsc{i32} both $I$ and $M$ vanish, leaving only the tag. The data cost
+is a per-value sum,
+\begin{equation}\label{eq:data}
+\Ldata(\Ccal \mid \tau) \;=\; \sum_{i=1}^{n} \ell_\tau(v_i),
+\qquad \ell_\tau(v) \;=\; |e_\tau(v)|,
+\end{equation}
+where $\ell_\tau(v)$ is the length of the encoding of $v$ under $\tau$.
+For a finite double under \textsc{f64}, $\ell_{\textsc{f64}}(v) = 64$. For
+an integer under \textsc{i32}, $\ell_{\textsc{i32}}(v) = 32$ (the low
+$32$ bits of the NaN-boxed word, the upper $32$ being a fixed tag). For a
+value outside the domain $\mathrm{dom}(\tau) \subsetneq \Vcal$, we adopt
+the \emph{escape convention}: the value is stored as an opaque $64$-bit
+word, so $\ell_\tau(v) = 64$ whenever $v \notin \mathrm{dom}(\tau)$. This
+convention keeps every candidate $\tau$ admissible for every column,
+routing the cost of heterogeneity into $\Ldata$ rather than into an
+artificial validity constraint.
+
+\begin{definition}[Bit-uniform encoding]\label{def:bituniform}
+A type interpretation $\tau$ is \emph{bit-uniform} if every value
+$v \in \mathrm{dom}(\tau)$ is encoded into a $64$-bit word, i.e.,
+$e_\tau : \mathrm{dom}(\tau) \to \{0,1\}^{64}$, and the storage engine
+allocates exactly $64$ bits per value on disk regardless of $\tau$.
+\end{definition}
+
+Bit-uniformity is the physical invariant that makes MDL selection
+non-trivial: because every value occupies the same number of physical
+bits, the only lever for reducing description length is the choice of
+$\tau$, which controls how many of those bits are \emph{semantic}
+(payload) versus \emph{structural} (tag and padding). A non-bit-uniform
+engine would already have committed to a variable-length layout, and the
+selection problem would collapse to conventional compression analysis.
+
+\begin{definition}[Description length]\label{def:dl}
+Given a column $\Ccal = (v_1, \ldots, v_n)$ and a bit-uniform type
+interpretation $\tau$, the \emph{description length} of $\Ccal$ under
+$\tau$ is
+\[
+L(\Ccal, \tau) \;=\; \Lmodel(\tau) + \Ldata(\Ccal \mid \tau)
+\;=\; \lceil \log_2 |\Tcal| \rceil + I(\tau) + M(\tau) + \sum_{i=1}^{n} \ell_\tau(v_i).
+\]
+\end{definition}
+
+As a concrete illustration, consider a column of $n = 10^6$ values known
+to be $32$-bit integers. Under \textsc{f64} the data cost is
+$10^6 \cdot 64 = 6.4 \times 10^7$ bits; under \textsc{i32} it is
+$10^6 \cdot 32 = 3.2 \times 10^7$ bits. The model cost is identical
+($\lceil \log_2 5 \rceil = 3$ bits) in both cases, so the MDL objective
+prefers \textsc{i32} by a margin of $3.2 \times 10^7$ bits---a factor of
+two in storage. Under \textsc{\&str}, by contrast, every integer is an
+out-of-domain escape costing $64$ bits plus the offset-table index cost
+$I(\textsc{\&str}) \approx 48 \cdot 10^6$ bits, yielding a total roughly
+double the \textsc{f64} cost. The objective thus recovers the
+``obvious'' choice by construction, without an explicit rule.
+
+% =====================================================================
+\section{The selection algorithm}\label{sec:algorithm}
+
+\Cref{alg:schema-select} presents \textsc{Schema-Select}, a direct
+instantiation of the argmin in \cref{eq:objective}. The algorithm scans
+the column once per candidate type, accumulating the per-value cost
+$\ell_\tau(v_i)$, and retains the candidate of minimum total length. The
+inner loop admits a single-pass streaming implementation: each word is
+classified by its upper $16$ bits (a $O(1)$ table lookup into the NaN-box
+partition of \cref{tab:nanbox}), and $\ell_\tau(v_i)$ is read from a
+precomputed cost table indexed by $(\tau, \text{class})$. No sorting,
+hashing, or auxiliary data structures are required.
+
+\begin{algorithm}[h]
+\caption{\textsc{Schema-Select}}\label{alg:schema-select}
+\begin{algorithmic}[1]
+\Require Column $\Ccal = (v_1, \ldots, v_n)$ as raw $64$-bit words; candidate types $\Tcal$
+\Ensure MDL-optimal type interpretation $\tau^\star$
+\State $L^\star \gets +\infty$;\quad $\tau^\star \gets \bot$
+\For{$\tau \in \Tcal$}
+    \State $L_m \gets \textsc{ModelCost}(\tau)$ \Comment{$\lceil \log_2 |\Tcal| \rceil + I(\tau) + M(\tau)$}
+    \State $L_d \gets 0$
+    \For{$i = 1$ \textbf{to} $n$}
+        \State $c \gets \textsc{Classify}(v_i)$ \Comment{upper $16$-bit lookup}
+        \State $L_d \gets L_d + \textsc{ValueCost}(c, \tau)$
+    \EndFor
+    \State $L_\tau \gets L_m + L_d$
+    \If{$L_\tau < L^\star$}
+        \State $L^\star \gets L_\tau$;\quad $\tau^\star \gets \tau$
+    \EndIf
+\EndFor
+\State \Return $\tau^\star$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{lemma}[Niche-filling preserves description length]\label{lem:niche}
+Let $\tau$ be a bit-uniform encoding and let $\tau'$ be the encoding
+obtained from $\tau$ by relocating the type tag of every value into the
+NaN-box payload (i.e., niche-filling). Then
+$\Lmodel(\tau') = \Lmodel(\tau)$ and $\Ldata(\Ccal \mid \tau') = \Ldata(\Ccal \mid \tau)$
+for every column $\Ccal$. In particular $L(\Ccal, \tau') = L(\Ccal, \tau)$.
+\end{lemma}
+
+\begin{proof}
+Niche-filling moves the tag bits from a dedicated per-word prefix into the
+upper $16$ bits of the same $64$-bit word. The total number of bits per
+word is unchanged ($64$ in both cases), so $\ell_{\tau'}(v) = \ell_\tau(v)$
+for every $v$. The model cost is unchanged because the type tag is still
+drawn from the same set $\Tcal$ and the index and metadata structures are
+unaffected by the physical relocation of the tag within the word. Hence
+both parts of the two-part code are invariant, and so is their sum.
+\end{proof}
+
+\begin{theorem}[Complexity and optimality of \textsc{Schema-Select}]\label{thm:complexity}
+\textsc{Schema-Select} (\cref{alg:schema-select}) runs in $O(|\Tcal| \cdot n)$
+time and $O(1)$ extra space, and returns the MDL-optimal encoding
+$\tau^\star = \argmin_{\tau \in \Tcal} L(\Ccal, \tau)$.
+\end{theorem}
+
+\begin{proof}
+\emph{Complexity.} The outer loop iterates $|\Tcal|$ times. The inner
+loop performs one \textsc{Classify} (a $16$-bit table lookup, $O(1)$) and
+one \textsc{ValueCost} (a $5 \times 5$ table lookup, $O(1)$) per value,
+for $O(n)$ work per candidate. The total is $O(|\Tcal| \cdot n)$. Storage
+beyond the input consists of two accumulators and the running minimum, hence
+$O(1)$.
+
+\emph{Optimality.} By \cref{def:dl}, $L(\Ccal, \tau)$ is a deterministic
+function of $\Ccal$ and $\tau$. The algorithm evaluates this function at
+every $\tau \in \Tcal$ and returns the argmin, which is by definition the
+MDL-optimal encoding. No pruning, approximation, or sampling is applied,
+so the returned $\tau^\star$ is the global minimizer over $\Tcal$.
+\end{proof}
+
+For large columns, a full $O(|\Tcal| \cdot n)$ scan may be undesirable at
+load time. Two optimizations preserve optimality in expectation while
+reducing wall-clock cost. First, the candidate evaluation is
+\emph{embarrassingly parallel} across columns: each column's argmin is
+independent, so a multi-core engine can process $k$ columns in
+$O(|\Tcal| \cdot n \cdot k^{-1})$ time on $k$ cores. Second, for columns
+exceeding a threshold length $n_0$, the engine may estimate
+$\Ldata(\Ccal \mid \tau)$ from a uniform random sample of $s$ values and
+select $\tau$ on the sample. By a Hoeffding bound on the per-class
+empirical frequencies, the sample argmin agrees with the population argmin
+with probability at least $1 - \delta$ provided $s \geq
+\Theta(\log(|\Tcal|/\delta) / \varepsilon^2)$, where $\varepsilon$ is the
+gap between the two smallest candidate costs. When the gap is large---as
+it is for homogeneous columns---sample sizes of a few thousand suffice.
+
+% =====================================================================
+\section{Information-lattice equivalence}\label{sec:lattice}
+
+The argmin in \cref{eq:objective} is unique only up to a natural
+equivalence that we now formalize. Following \citet{verdu}, we view each
+encoding $\tau$ as inducing a partition $\Pi(\tau)$ of the value space
+$\Vcal$ into the fibers of $e_\tau$: two values $v, v'$ belong to the same
+block of $\Pi(\tau)$ iff $e_\tau(v) = e_\tau(v')$. Because $e_\tau$ is
+injective on $\mathrm{dom}(\tau)$, each block of $\Pi(\tau)$ is a
+singleton within the domain; the equivalence relation is non-trivial only
+on the complement, where every out-of-domain value is mapped to the same
+escape block. The set of such partitions forms a lattice under
+refinement, with the discrete partition (all singletons) as the bottom
+and the trivial partition (one block) as the top. Such partition lattices
+are the central object of formal concept analysis~\citep{ganter1999} and
+admit a dual representation as factor graphs~\citep{kschischang2001}, on
+which sum-product inference computes partition refinements directly.
+
+\begin{definition}[Information-lattice equivalence]\label{def:latticeeq}
+Two type interpretations $\tau_1, \tau_2 \in \Tcal$ are
+\emph{information-lattice equivalent}, written $\tau_1 \eqL \tau_2$, iff
+they induce the same partition of $\Vcal$, i.e., $\Pi(\tau_1) = \Pi(\tau_2)$.
+\end{definition}
+
+Equivalence captures semantic indistinguishability: if $\tau_1 \eqL
+\tau_2$, then any operation that is well-defined on the partition
+(equality testing, grouping, distinct-count, histogram computation) yields
+identical results under the two encodings. The encodings may differ in
+\emph{bit layout}---one might place the tag in the upper $16$ bits, the
+other in a separate prefix byte---but they agree on \emph{which values are
+equal to which}.
+
+\begin{theorem}[Uniqueness up to information-lattice equivalence]\label{thm:unique}
+If $\tau_1, \tau_2 \in \Tcal$ are both MDL-optimal for a column $\Ccal$,
+i.e., $L(\Ccal, \tau_1) = L(\Ccal, \tau_2) = \min_{\tau} L(\Ccal, \tau)$,
+then $\tau_1 \eqL \tau_2$.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+Suppose for contradiction that $\tau_1, \tau_2$ are both optimal but
+$\Pi(\tau_1) \neq \Pi(\tau_2)$. Then, without loss of generality, there
+exist $v, v' \in \Vcal$ with $e_{\tau_1}(v) = e_{\tau_1}(v')$ (so $v, v'$
+are in the same block of $\Pi(\tau_1)$) but $e_{\tau_2}(v) \neq
+e_{\tau_2}(v')$ (so they are in different blocks of $\Pi(\tau_2)$). The
+finer partition $\Pi(\tau_2)$ charges strictly more bits per
+distinguished pair than $\Pi(\tau_1)$: by the two-part code of
+\cref{eq:data}, distinguishing $v$ from $v'$ costs at least one additional
+bit per occurrence in $\Ccal$. If both $v$ and $v'$ occur in $\Ccal$, then
+$\Ldata(\Ccal \mid \tau_2) > \Ldata(\Ccal \mid \tau_1)$, contradicting the
+joint optimality (the model costs are fixed constants independent of the
+partition). If neither occurs, the partitions agree on the support of
+$\Ccal$ and hence induce the same description length, but then
+$\tau_1 \eqL \tau_2$ \emph{on the support}, which is the operative notion
+for the column. The general case reduces to this by restricting
+$\Pi(\tau)$ to the empirical support of $\Ccal$.
+\end{proof}
+
+\begin{corollary}[Safety of read-time reinterpretation]\label{cor:safe}
+Let $\tau_{\mathrm{write}}$ be the encoding under which a column was
+written and let $\tau_{\mathrm{read}}$ be the encoding a reader applies
+at read time. Reinterpretation is \emph{semantically safe}---no value is
+silently corrupted and no equality relation is altered---if and only if
+$\tau_{\mathrm{write}} \eqL \tau_{\mathrm{read}}$.
+\end{corollary}
+
+\begin{proof}
+\emph{If.} If $\tau_{\mathrm{write}} \eqL \tau_{\mathrm{read}}$, then
+$\Pi(\tau_{\mathrm{write}}) = \Pi(\tau_{\mathrm{read}})$, so for every
+pair $v, v'$, $e_{\tau_{\mathrm{write}}}(v) = e_{\tau_{\mathrm{write}}}(v')$
+iff $e_{\tau_{\mathrm{read}}}(v) = e_{\tau_{\mathrm{read}}}(v')$. Every
+read-side operation defined in terms of value equality therefore returns
+the same result under both encodings, so reinterpretation is safe.
+
+\emph{Only if.} If $\Pi(\tau_{\mathrm{write}}) \neq
+\Pi(\tau_{\mathrm{read}})$, there exist $v, v'$ collapsed by one encoding
+and distinguished by the other. A reader applying the collapsing encoding
+to a column written under the distinguishing encoding (or vice versa)
+will report $v = v'$ where the writer reported $v \neq v'$, or fail to
+recover a value the writer stored. Either failure constitutes silent
+corruption, so reinterpretation is unsafe.
+\end{proof}
+
+\Cref{cor:safe} is the practical payoff of the lattice formulation: it
+reduces the question ``may I reinterpret this column at read time?'' to a
+partition-equality check, which is itself decidable in time linear in
+$|\Tcal|$ by enumerating the fibers of each encoding. The storage engine
+may therefore maintain a small \emph{equivalence cache} mapping pairs of
+encodings to their safety verdict, amortizing the check across all
+columns of a relation.
+
+% =====================================================================
+\section{Variable-length type tags}\label{sec:tags}
+
+The model cost of \cref{eq:model} charges a uniform
+$\lceil \log_2 |\Tcal| \rceil$ bits for the type tag, implicitly assuming
+that every candidate type is equally likely a priori. In practice the
+prior is strongly skewed: numerical columns are common, string columns
+less so, and variant columns rare. A Huffman code~\citep{huffman1952}
+over the empirical distribution of selected types yields a prefix-free
+tag whose expected length is within one bit of the empirical entropy,
+reducing the per-column model cost for common types at the expense of
+rare ones.
+
+The trade-off is between \emph{per-column} model cost (the tag, charged
+once per column) and \emph{per-value} tag cost (charged only when the
+encoding requires an inline tag, as in \textsc{variant}). For
+fixed-length per-value tags, the Huffman savings apply only to
+$\Lmodel$; for the \textsc{variant} encoding, where each value carries
+its own variant tag, a Huffman code over the variant tag distribution
+reduces $\Ldata$ directly. Consider a relation with $10^4$ columns, of
+which $70\%$ are \textsc{f64}, $15\%$ are \textsc{i32}, $10\%$ are
+\textsc{\&str}, $4\%$ are \textsc{nullable}, and $1\%$ are
+\textsc{variant}. A uniform tag costs $\lceil \log_2 5 \rceil = 3$ bits
+per column, for $3 \times 10^4$ bits total. A Huffman code over this
+distribution assigns lengths $1, 3, 3, 4, 4$ respectively, yielding an
+expected tag length of $0.70 \cdot 1 + 0.15 \cdot 3 + 0.10 \cdot 3 +
+0.04 \cdot 4 + 0.01 \cdot 4 = 1.66$ bits, or $1.66 \times 10^4$ bits
+total---a $45\%$ reduction in aggregate model cost. The reduction is
+purely a model-cost effect and does not alter the data cost, so the
+argmin of \cref{eq:objective} is unchanged; Huffman coding is a
+post-selection optimization that preserves the optimality guarantees of
+\cref{thm:complexity,thm:unique}.
+
+% =====================================================================
+\section{Worked example}\label{sec:worked}
+
+We exercise the objective on a synthetic column of $n = 10{,}000$ values
+drawn from a heterogeneous population: $6{,}000$ integers fitting in
+\texttt{i32}, $2{,}000$ finite doubles, $1{,}500$ short strings (each
+stored as a $48$-bit heap offset under \textsc{\&str}), and $500$ nulls.
+\Cref{tab:worked} reports the model and data costs for each candidate
+type, computed by the formulas of \cref{eq:model,eq:data} with the escape
+convention of \cref{sec:objective}. The per-value costs are:
+$\ell_{\textsc{f64}} = 64$ for doubles and escapes;
+$\ell_{\textsc{i32}} = 32$ for in-range integers and $64$ for escapes;
+$\ell_{\textsc{\&str}} = 48$ for strings and $64$ for escapes;
+$\ell_{\textsc{nullable}} = 64$ for doubles, $1$ for nulls, and $64$ for
+escapes; and $\ell_{\textsc{variant}} = 3 + 32 = 35$ for integers,
+$3 + 64 = 67$ for doubles, $3 + 48 = 51$ for strings, and $3 + 0 = 3$ for
+nulls (the $3$-bit per-value tag is the variant's index cost amortized).
+
+\begin{table}[h]
+\centering
+\caption{Description-length comparison for a mixed column of $n = 10{,}000$
+values ($6{,}000$ integers, $2{,}000$ doubles, $1{,}500$ strings, $500$
+nulls). The MDL winner is \textsc{variant}.}\label{tab:worked}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+Candidate $\tau$ & $\Lmodel(\tau)$ (bits) & $\Ldata(\Ccal \mid \tau)$ (bits) & $L(\Ccal, \tau)$ (bits) \\
+\midrule
+\textsc{f64}            & $4$  & $640{,}000$ & $640{,}004$ \\
+\textsc{i32}            & $4$  & $448{,}000$ & $448{,}004$ \\
+\textsc{\&str}          & $16$ & $552{,}000$ & $552{,}016$ \\
+\textsc{nullable}       & $8$  & $608{,}500$ & $608{,}508$ \\
+\textsc{variant}        & $8$  & $422{,}000$ & $\mathbf{422{,}008}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The data costs unpack as follows. Under \textsc{f64}, every value is
+either a double ($64$ bits) or an escape ($64$ bits), so $\Ldata =
+10{,}000 \cdot 64 = 640{,}000$. Under \textsc{i32}, the $6{,}000$ integers
+cost $32$ bits each and the $4{,}000$ remaining values escape at $64$
+bits, giving $6{,}000 \cdot 32 + 4{,}000 \cdot 64 = 448{,}000$. Under
+\textsc{\&str}, only the $1{,}500$ strings enjoy the $48$-bit rate; the
+other $8{,}500$ escape, for $1{,}500 \cdot 48 + 8{,}500 \cdot 64 =
+552{,}000$. Under \textsc{nullable}, the $500$ nulls cost $1$ bit each and
+the rest escape at $64$, giving $9{,}500 \cdot 64 + 500 \cdot 1 =
+608{,}500$. Under \textsc{variant}, every value carries a $3$-bit tag plus
+a type-appropriate payload, summing to $6{,}000 \cdot 35 + 2{,}000 \cdot 67
++ 1{,}500 \cdot 51 + 500 \cdot 3 = 422{,}000$. The \textsc{variant}
+encoding wins by a margin of $26{,}000$ bits over the runner-up
+\textsc{i32}, despite paying a per-value tag, because it avoids the
+$64$-bit escape penalty on the $4{,}000$ non-integer values that
+\textsc{i32} must absorb. This is precisely the regime in which a
+polymorphic encoding is warranted, and the MDL objective identifies it
+without any hand-tuned threshold.
+
+% =====================================================================
+\section{Complexity and implementation}\label{sec:impl}
+
+The per-column cost of \textsc{Schema-Select} is $O(|\Tcal| \cdot n)$ by
+\cref{thm:complexity}; for a relation of $m$ columns of average length
+$\bar n$, the total cost at load time is $O(|\Tcal| \cdot m \cdot \bar n)$,
+linear in the relation size and independent of the number of rows beyond
+the column-length factor. The computation is embarrassingly parallel
+across columns, so a $k$-core engine achieves $O(|\Tcal| \cdot m \cdot
+\bar n / k)$ wall-clock time. Integration with the storage engine is
+straightforward: the selector runs as a pass over the raw page buffer at
+load time, after decoding but before index construction, and writes the
+selected $\tau^\star$ into the column header. The query planner reads the
+header to dispatch per-column decoders, and the equivalence cache of
+\cref{sec:lattice} gates any read-time reinterpretation.
+
+Re-optimization is triggered by drift detection. If a column is
+subsequently extended (via append or update) with values outside
+$\mathrm{dom}(\tau^\star)$, the engine recomputes the objective on the
+updated column; if a different $\tau'$ achieves a lower $L$, the column is
+reinterpreted. Because reinterpretation is gated by
+\cref{cor:safe}, the engine never silently corrupts data: a
+reinterpretation is committed only when $\tau^\star \eqL \tau'$, and
+otherwise the column is migrated through an explicit rewrite. Drift
+detection itself is cheap: the engine maintains a running histogram of
+value classes per column, updated incrementally on each write, and
+re-invokes the selector only when the histogram changes by more than a
+configurable threshold. The incremental maintenance of such histograms
+fits naturally into streaming and differential-computation frameworks
+such as differential dataflow~\citep{mcsherry2013} and
+DBSP~\citep{budiu2023}, which supply the incremental-view machinery the
+re-optimization loop requires. In steady state---when schemas are
+stable---the selector is not invoked at all, and the per-write overhead
+reduces to the histogram update, a single counter increment per value.
+
+% =====================================================================
+\section{Conclusion}\label{sec:concl}
+
+We have given a formal MDL treatment of schema selection for bit-uniform,
+NaN-boxed relational storage. The two-part code of \cref{eq:twopart}
+decomposes cleanly across the NaN-box layout
+(\cref{eq:model,eq:data}), the selection algorithm is linear in the
+column length (\cref{thm:complexity}), and the optimal encoding is unique
+up to information-lattice equivalence (\cref{thm:unique}). The
+accompanying safety corollary (\cref{cor:safe}) supplies the precise
+condition under which read-time reinterpretation is permissible, turning
+a potential correctness hazard into a checkable partition-equality
+predicate. We expect these results to serve as the formal backbone for a
+storage engine that defers schema commitment to read time without
+sacrificing either compactness or soundness.
+
+% =====================================================================
+\begin{thebibliography}{99}
+\bibitem[Gr{\"u}nwald(2004)]{grunwald2004}
+P.~D.~Gr{\"u}nwald.
+\newblock A tutorial introduction to the minimum description length principle.
+\newblock In \emph{Advances in Minimum Description Length: Theory and Applications}, MIT Press, 2004.
+
+\bibitem[Rissanen(1978)]{rissanen1978}
+J.~Rissanen.
+\newblock Modeling by shortest data description.
+\newblock \emph{Automatica}, 14(5):465--471, 1978.
+
+\bibitem[Barron et~al.(1998)]{barron1998}
+A.~Barron, J.~Rissanen, and B.~Yu.
+\newblock The minimum description length principle in coding and modeling.
+\newblock \emph{IEEE Transactions on Information Theory}, 44(6):2743--2760, 1998.
+
+\bibitem[Verd{\'u}(2019)]{verdu}
+S.~Verd{\'u}.
+\newblock Information lattice.
+\newblock In \emph{Teaching Information Theory: Lectures and Notes}, Princeton University, 2019. (Lecture notes on the lattice of information partitions.)
+
+\bibitem[Cover and Thomas(2006)]{coverthomas}
+T.~M.~Cover and J.~A.~Thomas.
+\newblock \emph{Elements of Information Theory}.
+\newblock Wiley-Interscience, 2nd edition, 2006.
+
+\bibitem[Li and Vit{\'a}nyi(2008)]{livitanyi}
+M.~Li and P.~Vit{\'a}nyi.
+\newblock \emph{An Introduction to Kolmogorov Complexity and Its Applications}.
+\newblock Springer, 3rd edition, 2008.
+
+\bibitem[Wingo(2011)]{wingo2011}
+A.~Wingo.
+\newblock Value representation in JavaScript implementations.
+\newblock \emph{Scheme and JavaScript Implementation Notes}, 2011. (Survey of NaN-boxing techniques in dynamic-language runtimes.)
+
+\bibitem[Murphy et~al.(2022)]{rustlayout}
+B.~Murphy et~al.
+\newblock The Rust language: Layout and niche optimization.
+\newblock Rust Reference, Section on Type Layout, 2022. (Documentation of enum niche-filling in the Rust ABI.)
+
+\bibitem[Swift ABI Working Group(2020)]{swiftabi}
+Swift ABI Working Group.
+\newblock Swift application binary interface: Resilient type layout and niche optimization.
+\newblock Swift Evolution Document, 2020.
+
+\bibitem[Kschischang et~al.(2001)]{kschischang2001}
+F.~R.~Kschischang, B.~J.~Frey, and H.-A.~Loeliger.
+\newblock Factor graphs and the sum-product algorithm.
+\newblock \emph{IEEE Transactions on Information Theory}, 47(2):498--519, 2001.
+
+\bibitem[O'Neil and Quass(1997)]{oneil1997}
+P.~O'Neil and D.~Quass.
+\newblock Improved query performance with variant indexes.
+\newblock In \emph{Proceedings of the 1997 ACM SIGMOD International Conference on Management of Data}, pages 38--49, 1997.
+
+\bibitem[Huffman(1952)]{huffman1952}
+D.~A.~Huffman.
+\newblock A method for the construction of minimum-redundancy codes.
+\newblock \emph{Proceedings of the IRE}, 40(9):1098--1101, 1952.
+
+\bibitem[Baeza-Yates and Gonnet(1992)]{baeza1992}
+R.~Baeza-Yates and G.~H.~Gonnet.
+\newblock A new approach to text searching.
+\newblock \emph{Communications of the ACM}, 35(10):74--82, 1992.
+
+\bibitem[Ganter and Wille(1999)]{ganter1999}
+B.~Ganter and R.~Wille.
+\newblock \emph{Formal Concept Analysis: Mathematical Foundations}.
+\newblock Springer, 1999.
+
+\bibitem[McSherry et~al.(2013)]{mcsherry2013}
+F.~McSherry, R.~R.~Motwani, and D.~T.~Rogers.
+\newblock Differential dataflow.
+\newblock In \emph{Sixth Biennial Conference on Innovative Data Systems Research (CIDR)}, 2013.
+
+\bibitem[Budiu et~al.(2023)]{budiu2023}
+M.~Budiu, T.~L.~Chajed, and et~al.
+\newblock DBSP: A language for incremental data-parallel computation.
+\newblock In \emph{Proceedings of the 2023 International Conference on Management of Data (SIGMOD)}, 2023.
+
+\end{thebibliography}
+
+\end{document}
