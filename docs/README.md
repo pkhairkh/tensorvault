@@ -15,25 +15,32 @@
 
 ```
 docs/
-├── FINE_DRAFT.md              ← THE master document (start here)
-├── architecture/              ← Design docs: the architecture + CPU energy knowledgebase
-├── research/                  ← Mathematical foundations + 5 domain deep-dives + 5 wave evaluations
-│   ├── math-foundations.md    ← Synthesis of all 5 mathematical pillars
-│   ├── math-enhancements.md   ← 5 concrete enhancement proposals
-│   ├── domains/               ← Deep research per mathematical domain
-│   └── waves/                 ← Per-problem solution evaluation (performance/time/energy)
-├── problems/                  ← Problem catalog: 99 problems across 10 files
+├── README.md                  ← documentation index (start here)
+├── ROUGH_DRAFT.md             ← the rough draft (will become fine draft after ADRs settle)
+├── adr/                       ← Architecture Decision Records (≥80% confidence)
+│   ├── README.md              ← ADR index with compatibility matrix
+│   ├── OPEN_QUESTIONS.md      ← decisions below 80% confidence
+│   ├── 001-64-bit-word-...    ← 22 accepted ADRs
+│   └── ...
+├── architecture/              ← design docs + CPU energy knowledgebase
+├── research/                  ← math foundations + domain deep-dives + wave evaluations
+│   ├── math-foundations.md
+│   ├── math-enhancements.md
+│   ├── domains/               ← 5 mathematical pillars
+│   └── waves/                 ← per-problem solution evaluations (performance/time/energy)
+├── problems/                  ← problem catalog: 99 problems across 10 files
 ├── benchmarks/                ← TPC-C and TPC-H analysis
-└── archive/                   ← Old NaN-boxing thesis (superseded)
+└── archive/                   ← old NaN-boxing thesis (superseded)
 ```
 
 ## Reading order for a new contributor
 
-1. **[FINE_DRAFT.md](./FINE_DRAFT.md)** — the whole venture in one document
-2. **[architecture/instruction-first.md](./architecture/instruction-first.md)** — the design philosophy
-3. **[problems/README.md](./problems/README.md)** — the problem catalog index
-4. **[research/math-foundations.md](./research/math-foundations.md)** — the mathematical grounding
-5. Pick a problem from the catalog and dive into its wave evaluation
+1. **[ROUGH_DRAFT.md](./ROUGH_DRAFT.md)** — the whole venture in one document (rough; will become fine draft after ADRs settle)
+2. **[adr/README.md](./adr/README.md)** — the 22 accepted decisions (≥80% confidence)
+3. **[adr/OPEN_QUESTIONS.md](./adr/OPEN_QUESTIONS.md)** — the 10 undecided questions (<80% confidence)
+4. **[architecture/instruction-first.md](./architecture/instruction-first.md)** — the design philosophy
+5. **[problems/README.md](./problems/README.md)** — the problem catalog index
+6. **[research/math-foundations.md](./research/math-foundations.md)** — the mathematical grounding
 
 ## Reading order for a researcher
 
@@ -45,6 +52,4 @@ docs/
 ## Reading order for an engineer
 
 1. **[../ARCHITECTURE.md](../ARCHITECTURE.md)** — the design summary
-2. **[architecture/cpu-energy-kb.md](./architecture/cpu-energy-kb.md)** — the per-instruction energy reference
-3. **[problems/](./problems/)** — pick a problem tagged 🟡 (partial) or 🔴 (open)
 4. **[research/waves/](./research/waves/)** — see the candidate solutions with effort estimates
