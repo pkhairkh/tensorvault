@@ -18,7 +18,10 @@
 //!   queueing predictor (ADR-020) used for join ordering, index selection,
 //!   and admission control.
 //! - [`protocol`] — protocol boundary coordinator (CXL, Raft/RoCEv2).
-//! - [`schema`] — the last layer: SQL parser, MDL schema selection.
+//! - [`schema`] — the last layer: MDL schema selection.
+//! - [`sql`] — the SQL surface: tokenizer, recursive-descent parser for
+//!   `SELECT`, scanner for the seven turboGP extensions, and the lowering
+//!   pass that turns a parsed query into a [`executor::plan::LogicalPlan`].
 //! - [`types`] — linear/affine memory handles (`CxlRef`, `RaftRef`) that
 //!   enforce protocol boundaries at compile time (ADR-013).
 
@@ -30,6 +33,7 @@ pub mod memory;
 pub mod planner;
 pub mod protocol;
 pub mod schema;
+pub mod sql;
 pub mod storage;
 pub mod types;
 
