@@ -3,6 +3,13 @@
 //! The Hamming distance between two u64 cells is the popcount of their XOR.
 //! This works for ANY column type (because every cell is a 64-bit word) and is
 //! the unified similarity primitive.
+//!
+//! ## Branchless discipline (ADR-004)
+//!
+//! All hot loops use mask accumulation. The scalar tail loop computes
+//! `(dist <= max_d) as u64` and adds it directly — no per-cell `if`. The
+//! AVX-512 path uses `VPOPCNTDQ` → `VCMPLE` → mask → popcount, fully
+//! branchless in the SIMD body.
 
 use crate::kernel::cpu::CpuTarget;
 use crate::kernel::{Kernel, KernelParams, KernelResult, Operator};
@@ -30,15 +37,15 @@ impl Kernel for HammingScalar {
         _output: *mut u8,
         params: &KernelParams,
     ) -> KernelResult {
+        // SAFETY: caller guarantees `input` points to `cell_count * 8` readable bytes.
         let cells = std::slice::from_raw_parts(input as *const u64, params.cell_count);
         let target = params.target_u64;
         let max_d = params.max_distance;
         let mut count = 0u64;
         for &c in cells {
+            // Branchless: `(dist <= max_d) as u64` produces 0 or 1 (ADR-004).
             let dist = (c ^ target).count_ones();
-            if dist <= max_d {
-                count += 1;
-            }
+            count += (dist <= max_d) as u64;
         }
         KernelResult { count, sum: 0.0, mask: 0 }
     }
@@ -73,6 +80,7 @@ impl Kernel for HammingAvx512 {
         _output: *mut u8,
         params: &KernelParams,
     ) -> KernelResult {
+        // SAFETY: caller guarantees `input` points to `cell_count * 8` readable bytes.
         let cells = std::slice::from_raw_parts(input as *const u64, params.cell_count);
         let target = params.target_u64;
         let max_d = params.max_distance;
@@ -81,17 +89,16 @@ impl Kernel for HammingAvx512 {
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx512vpopcntdq") {
+                // SAFETY: runtime-checked feature gate.
                 return hamming_avx512_vpopcntdq(cells, target, max_d);
             }
         }
 
-        // Fallback: scalar.
+        // Fallback: scalar branchless accumulation (ADR-004).
         let mut count = 0u64;
         for &c in cells {
             let dist = (c ^ target).count_ones();
-            if dist <= max_d {
-                count += 1;
-            }
+            count += (dist <= max_d) as u64;
         }
         KernelResult { count, sum: 0.0, mask: 0 }
     }
@@ -105,6 +112,8 @@ unsafe fn hamming_avx512_vpopcntdq(cells: &[u64], target: u64, max_d: u32) -> Ke
     let max_vec = _mm512_set1_epi64(max_d as i64);
     let mut count = 0u64;
     let mut i = 0;
+    // SIMD body: VPOPCNTDQ + VCMPLE + mask + POPCNT. Branchless (ADR-004);
+    // the only branch is the loop-termination check.
     while i + 8 <= cells.len() {
         let v = _mm512_loadu_epi64(cells.as_ptr().add(i) as *const i64);
         let xored = _mm512_xor_epi64(v, target_vec);
@@ -113,11 +122,10 @@ unsafe fn hamming_avx512_vpopcntdq(cells: &[u64], target: u64, max_d: u32) -> Ke
         count += mask.count_ones() as u64;
         i += 8;
     }
+    // Tail: branchless via mask accumulation (ADR-004).
     while i < cells.len() {
         let dist = (cells[i] ^ target).count_ones();
-        if dist <= max_d {
-            count += 1;
-        }
+        count += (dist <= max_d) as u64;
         i += 1;
     }
     KernelResult { count, sum: 0.0, mask: 0 }

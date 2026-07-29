@@ -181,7 +181,7 @@ mod tests {
 
         let count = sched.scan_eq(0, 3).unwrap();
         // 1000 / 7 ≈ 142.857, so 3 appears either 142 or 143 times.
-        assert!(count >= 142 && count <= 143);
+        assert!((142..=143).contains(&count));
     }
 
     #[test]

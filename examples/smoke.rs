@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use turbogp::{
     executor::Scheduler,
-    kernel::{CpuTarget, KernelTable, Operator},
+    kernel::KernelTable,
     memory::{region::Region, tier::MemoryTier, NumaTopology},
     protocol::{CxlCoordinator, RaftCoordinator},
     storage::PAGE_CELLS,

@@ -29,7 +29,6 @@ pub mod similarity;
 
 pub use crate::memory::tier::MemoryTier;
 pub use cpu::{detect_cpu, CpuTarget, CpuVendor};
-
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -49,6 +48,12 @@ pub enum Operator {
     ScanEqU64,
     /// Range scan: count cells in [low, high].
     ScanRangeU64,
+    /// Multi-predicate scan: count cells matching ALL of up to 3 predicates.
+    ///
+    /// Each predicate is `(target, op)` where `op ∈ {Eq, Gt, Lt}`. Predicates
+    /// are AND-combined; a cell must satisfy every predicate to count.
+    /// Implements P-01-05 (fused multi-predicate scan via `VPTERNLOGQ`).
+    ScanMultiPredicate,
     /// Hash table build.
     HashBuild,
     /// Hash table probe.
@@ -61,10 +66,28 @@ pub enum Operator {
     SimilarityHamming,
 }
 
+/// A single comparison predicate used by `ScanMultiPredicate`.
+///
+/// `Eq` matches cells equal to `target`, `Gt` matches cells strictly greater
+/// than `target`, `Lt` matches cells strictly less than `target`. Up to three
+/// predicates are AND-combined per scan; unused slots default to `Eq` with a
+/// `target` of `u64::MAX` (which matches everything when AND-combined with a
+/// real predicate — but the kernel only honors `predicate_count` predicates).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum PredicateOp {
+    /// `cell == target`
+    #[default]
+    Eq,
+    /// `cell > target`
+    Gt,
+    /// `cell < target`
+    Lt,
+}
+
 /// Parameters passed to a kernel at execution time.
 #[derive(Debug, Clone, Copy)]
 pub struct KernelParams {
-    /// Target value for equality / similarity kernels.
+    /// Target value for equality / similarity kernels (also predicate 1 target).
     pub target_u64: u64,
     /// Low bound for range kernels.
     pub low_u64: u64,
@@ -74,11 +97,35 @@ pub struct KernelParams {
     pub max_distance: u32,
     /// Number of cells to process.
     pub cell_count: usize,
+    /// Target value for predicate 2 of `ScanMultiPredicate`.
+    pub target2_u64: u64,
+    /// Target value for predicate 3 of `ScanMultiPredicate`.
+    pub target3_u64: u64,
+    /// Comparison operator for predicate 1 of `ScanMultiPredicate`.
+    pub pred1_op: PredicateOp,
+    /// Comparison operator for predicate 2 of `ScanMultiPredicate`.
+    pub pred2_op: PredicateOp,
+    /// Comparison operator for predicate 3 of `ScanMultiPredicate`.
+    pub pred3_op: PredicateOp,
+    /// Number of predicates active in `ScanMultiPredicate` (1..=3).
+    pub predicate_count: u8,
 }
 
 impl Default for KernelParams {
     fn default() -> Self {
-        Self { target_u64: 0, low_u64: 0, high_u64: u64::MAX, max_distance: 0, cell_count: 0 }
+        Self {
+            target_u64: 0,
+            low_u64: 0,
+            high_u64: u64::MAX,
+            max_distance: 0,
+            cell_count: 0,
+            target2_u64: 0,
+            target3_u64: 0,
+            pred1_op: PredicateOp::Eq,
+            pred2_op: PredicateOp::Eq,
+            pred3_op: PredicateOp::Eq,
+            predicate_count: 0,
+        }
     }
 }
 
@@ -204,6 +251,10 @@ fn register_scan_kernels(
         (Operator::ScanRangeU64, CpuTarget::Scalar, MemoryTier::L3),
         Arc::new(ScanRangeScalar),
     );
+    kernels.insert(
+        (Operator::ScanMultiPredicate, CpuTarget::Scalar, MemoryTier::L3),
+        Arc::new(ScanMultiPredicateScalar),
+    );
 
     // AVX-512 kernels (Sapphire Rapids, Zen 4/5).
     #[cfg(target_arch = "x86_64")]
@@ -223,6 +274,10 @@ fn register_scan_kernels(
         kernels.insert(
             (Operator::ScanRangeU64, CpuTarget::X86Avx512, MemoryTier::L3),
             Arc::new(ScanRangeAvx512L3),
+        );
+        kernels.insert(
+            (Operator::ScanMultiPredicate, CpuTarget::X86Avx512, MemoryTier::L3),
+            Arc::new(ScanMultiPredicateAvx512),
         );
     }
 

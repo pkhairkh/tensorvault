@@ -1,4 +1,11 @@
 //! Aggregate kernels: sum, count, count distinct.
+//!
+//! ## Branchless discipline (ADR-004)
+//!
+//! All hot loops in this module use mask accumulation instead of conditional
+//! branches. `count_distinct` is a HashSet-backed prototype (no SIMD path)
+//! and has no per-cell `if` to remove — `HashSet::insert` returns a bool that
+//! we accumulate directly.
 
 use crate::kernel::cpu::CpuTarget;
 use crate::kernel::{Kernel, KernelParams, KernelResult, Operator};
@@ -30,6 +37,7 @@ impl Kernel for SumF64Scalar {
         _output: *mut u8,
         params: &KernelParams,
     ) -> KernelResult {
+        // SAFETY: caller guarantees `input` points to `cell_count * 8` readable bytes.
         let cells = std::slice::from_raw_parts(input as *const u64, params.cell_count);
         let sum: f64 = cells.iter().map(|&bits| f64::from_bits(bits)).sum();
         KernelResult { count: params.cell_count as u64, sum, mask: 0 }
@@ -61,10 +69,12 @@ impl Kernel for SumF64Avx2 {
         params: &KernelParams,
     ) -> KernelResult {
         use std::arch::x86_64::*;
+        // SAFETY: caller guarantees `input` points to `cell_count * 8` readable bytes.
         let cells = std::slice::from_raw_parts(input as *const u64, params.cell_count);
         let mut acc = _mm256_setzero_pd();
         let mut i = 0;
-        // Process 4 f64s per iteration.
+        // Process 4 f64s per iteration. No per-cell branch (ADR-004); only the
+        // loop-termination check, which is perfectly predicted.
         while i + 4 <= cells.len() {
             let bits = _mm256_loadu_si256(cells.as_ptr().add(i) as *const __m256i);
             let doubles = _mm256_castsi256_pd(bits);
@@ -73,9 +83,10 @@ impl Kernel for SumF64Avx2 {
         }
         // Horizontal sum.
         let mut tmp = [0f64; 4];
+        // SAFETY: `tmp` is a 4-element f64 array, properly aligned for `__m256d`.
         _mm256_storeu_pd(tmp.as_mut_ptr(), acc);
         let mut sum = tmp.iter().sum::<f64>();
-        // Tail.
+        // Tail: linear accumulation, no per-cell branch (ADR-004).
         while i < cells.len() {
             sum += f64::from_bits(cells[i]);
             i += 1;
@@ -111,10 +122,11 @@ impl Kernel for SumF64Avx512 {
         params: &KernelParams,
     ) -> KernelResult {
         use std::arch::x86_64::*;
+        // SAFETY: caller guarantees `input` points to `cell_count * 8` readable bytes.
         let cells = std::slice::from_raw_parts(input as *const u64, params.cell_count);
         let mut acc = _mm512_setzero_pd();
         let mut i = 0;
-        // Process 8 f64s per iteration.
+        // Process 8 f64s per iteration. No per-cell branch (ADR-004).
         while i + 8 <= cells.len() {
             let bits = _mm512_loadu_epi64(cells.as_ptr().add(i) as *const i64);
             let doubles = _mm512_castsi512_pd(bits);
@@ -123,9 +135,10 @@ impl Kernel for SumF64Avx512 {
         }
         // Horizontal sum.
         let mut tmp = [0f64; 8];
+        // SAFETY: `tmp` is an 8-element f64 array, properly aligned for `__m512d`.
         _mm512_storeu_pd(tmp.as_mut_ptr(), acc);
         let mut sum = tmp.iter().sum::<f64>();
-        // Tail.
+        // Tail: linear accumulation, no per-cell branch (ADR-004).
         while i < cells.len() {
             sum += f64::from_bits(cells[i]);
             i += 1;
@@ -164,6 +177,7 @@ impl Kernel for CountDistinctScalar {
         params: &KernelParams,
     ) -> KernelResult {
         use std::collections::HashSet;
+        // SAFETY: caller guarantees `input` points to `cell_count * 8` readable bytes.
         let cells = std::slice::from_raw_parts(input as *const u64, params.cell_count);
         let distinct: HashSet<u64> = cells.iter().copied().collect();
         KernelResult { count: distinct.len() as u64, sum: 0.0, mask: 0 }
