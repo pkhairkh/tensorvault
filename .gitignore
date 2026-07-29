@@ -24,3 +24,7 @@
 
 # Cargo lock — library crate, no need to commit
 Cargo.lock
+
+# Editor
+*.bak
+*.tmp
