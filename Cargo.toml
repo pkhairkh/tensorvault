@@ -1,23 +1,40 @@
 [package]
-name = "tensorvault-bitcell"
-version = "0.1.0"
+name = "tensorvault"
+version = "0.2.0"
 edition = "2021"
 authors = ["TensorVault Contributors"]
 license = "MIT OR Apache-2.0"
-description = "Phase-1 prototype of the niche-filled NaN-boxed Cell type for bit-uniform relational storage."
+description = "Instruction-first, memory-centric relational database engine. The kernel table is the moat."
 readme = "README.md"
-keywords = ["database", "nan-boxing", "vectorized", "simd", "relational"]
-categories = ["database-implementations", "data-structures"]
+keywords = ["database", "kernel", "avx512", "memory-hierarchy", "oltp"]
+categories = ["database-implementations"]
 
 [lib]
-name = "bitcell"
+name = "tensorvault"
 path = "src/lib.rs"
 
 [dependencies]
+# Serialization
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Zero-copy / byte manipulation
 bytemuck = { version = "1.14", features = ["derive"] }
+# Memory-mapped I/O
+memmap2 = "0.9"
+# Hashing
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+# Error handling
+anyhow = "1"
+thiserror = "1"
+# Concurrency
+parking_lot = "0.12"
+# CPU detection
+raw-cpuid = "11.0"
+# Logging
+tracing = "0.1"
 
 [dev-dependencies]
+tempfile = "3.10"
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]
@@ -29,6 +46,8 @@ path = "benches/throughput.rs"
 opt-level = 3
 lto = "fat"
 codegen-units = 1
+panic = "abort"
+strip = "symbols"
 
 [profile.bench]
 opt-level = 3

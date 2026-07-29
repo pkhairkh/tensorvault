@@ -1,68 +1,124 @@
-// Smoke test: build a mixed-type column, run all the bitcell operations.
-use bitcell::{Cell, CellColumn};
-use bitcell::bitcell::{bsi::BitSlicedIndex, hash::JoinTable, mdl, scan};
+//! End-to-end smoke test of the instruction-first engine.
+
+use std::sync::Arc;
+use std::time::Instant;
+use tensorvault::{
+    executor::Scheduler,
+    kernel::{CpuTarget, KernelTable, Operator},
+    memory::{region::Region, tier::MemoryTier, NumaTopology},
+    protocol::{CxlCoordinator, RaftCoordinator},
+    storage::PAGE_CELLS,
+};
 
 fn main() {
-    println!("=== bitcell Phase-1 prototype smoke test ===\n");
+    println!("=== TensorVault instruction-first engine — smoke test ===\n");
 
-    // 1. Build a mixed-type column (the killer feature).
-    let mut col = CellColumn::new();
-    col.push_i32(42);
-    col.push_f64(3.14);
-    col.push(Cell::from_bool(true));
-    col.push_null();
-    col.push(Cell::from_short_str(b"hello").unwrap());
-    col.push_i32(42);
-    col.push_f64(2.71);
-    println!("Mixed-type column ({} cells, {} bytes):", col.len(), col.byte_size());
-    for (i, c) in col.cells.iter().enumerate() {
-        println!("  [{}] bits=0x{:016X} tag={:?}", i, c.to_bits(), c.tag());
+    // 1. Detect CPU.
+    let table = KernelTable::new();
+    println!("Detected CPU: {}", table.detected_cpu().name());
+    println!("Registered kernels: {}", table.list().len());
+    println!();
+
+    // 2. Detect NUMA topology.
+    let topo = NumaTopology::detect();
+    print!("{}", topo.dump());
+
+    // 3. Detect CXL.
+    let cxl = CxlCoordinator::new();
+    println!("CXL available: {}", cxl.is_available());
+    if cxl.is_available() {
+        println!("  Single-rack commit latency: ~{} ns", cxl.commit(0));
     }
+    println!();
 
-    // 2. MDL schema selection.
-    let result = mdl::schema_select_with_diagnostics(&col);
-    println!("\nMDL schema selection: chose = {}", result.chosen.name());
-    for (t, dl) in &result.all_costs {
-        println!("  {:10} total={:>10.1} bits (model={:.0}, data={:.1})",
-            t.name(), dl.total(), dl.model_bits, dl.data_bits);
+    // 4. Create a Raft coordinator for cross-rack.
+    let raft = RaftCoordinator::new(3, 0);
+    println!(
+        "Raft cluster: {} nodes, quorum {}, commit ~{} ns",
+        raft.cluster_size,
+        raft.quorum(),
+        raft.commit(0)
+    );
+    println!();
+
+    // 5. Create a scheduler.
+    let scheduler = Scheduler::new(Arc::new(table));
+
+    // 6. Create a region with u64 cells. A region is 2 MB = 262144 u64 cells.
+    let cell_count = 262_144; // exactly one region
+    let mut bytes = vec![0u8; cell_count * 8];
+    for i in 0..cell_count {
+        let v = (i % 1000) as u64;
+        bytes[i * 8..(i + 1) * 8].copy_from_slice(&v.to_le_bytes());
     }
+    let region = Arc::new(Region::from_bytes(0, MemoryTier::L3, &bytes));
+    scheduler.register_region(region);
+    println!(
+        "Registered region 0: {} cells, tier={}",
+        cell_count,
+        MemoryTier::L3
+    );
+    println!();
 
-    // 3. Scan: count_eq.
-    let count = scan::count_eq(&col.cells, Cell::from_i32(42));
-    println!("\ncount_eq(i32=42) = {}", count);
-
-    // 4. Scan: count_similar (Hamming distance).
-    let similar = scan::count_similar(&col.cells, Cell::from_f64(3.14), 30);
-    println!("count_similar(f64=3.14, d<=30) = {}", similar);
-
-    // 5. BSI: find_eq.
-    let bsi = BitSlicedIndex::build(&col.cells);
-    let matches = bsi.find_eq(Cell::from_i32(42));
-    println!("BSI find_eq(i32=42) -> rows {:?}", matches.set_indices());
-
-    // 6. Hash join on mixed types.
-    let build: Vec<Cell> = vec![Cell::from_i32(42), Cell::from_f64(3.14), Cell::from_short_str(b"hi").unwrap()];
-    let probe: Vec<Cell> = vec![Cell::from_f64(3.14), Cell::from_i32(99), Cell::from_short_str(b"hi").unwrap()];
-    let table = JoinTable::build(build);
-    let joined = table.probe_all(&probe);
-    println!("\nHash join (mixed types): {} matches", joined.len());
-    for (pi, bi) in &joined {
-        println!("  probe[{}] <-> build[{}]", pi, bi);
-    }
-
-    // 7. Performance: large monomorphic column.
-    let big: Vec<Cell> = (0..1_000_000).map(|i| Cell::from_f64((i as f64) + 1.0)).collect();
-    let start = std::time::Instant::now();
-    let _ = scan::sum_f64(&big);
+    // 7. Run scan_eq: count cells equal to 42.
+    let start = Instant::now();
+    let count = scheduler.scan_eq(0, 42).unwrap();
     let elapsed = start.elapsed();
-    println!("\nSum 1M f64 cells: {:?} ({:.0} cells/sec)",
-        elapsed, 1_000_000.0 / elapsed.as_secs_f64());
+    println!(
+        "scan_eq(target=42): count={}, {:?} ({:.0} M cells/sec)",
+        count,
+        elapsed,
+        cell_count as f64 / elapsed.as_secs_f64() / 1_000_000.0
+    );
 
-    let start = std::time::Instant::now();
-    let _ = scan::count_eq(&big, Cell::from_f64(500_000.0 + 1.0));
+    // 8. Run sum_f64: treat cells as f64 and sum.
+    // First, refill the region with f64 values.
+    let mut bytes = vec![0u8; cell_count * 8];
+    for i in 0..cell_count {
+        let v = (i as f64) + 1.0;
+        bytes[i * 8..(i + 1) * 8].copy_from_slice(&v.to_bits().to_le_bytes());
+    }
+    let region = Arc::new(Region::from_bytes(0, MemoryTier::L3, &bytes));
+    let sched2 = Scheduler::new(Arc::new(KernelTable::new()));
+    sched2.register_region(region);
+
+    let start = Instant::now();
+    let sum = sched2.sum_f64(0).unwrap();
     let elapsed = start.elapsed();
-    println!("count_eq 1M cells: {:?} ({:.0} cells/sec)",
-        elapsed, 1_000_000.0 / elapsed.as_secs_f64());
+    let expected: f64 = (1..=cell_count).map(|i| i as f64).sum();
+    println!(
+        "sum_f64: sum={:.0} (expected {:.0}), {:?} ({:.0} M cells/sec)",
+        sum,
+        expected,
+        elapsed,
+        cell_count as f64 / elapsed.as_secs_f64() / 1_000_000.0
+    );
 
-    println!("\n=== smoke test complete ===");
+    // 9. Run count_similar: Hamming distance.
+    let start = Instant::now();
+    let count = sched2.count_similar(0, 1u64, 0).unwrap();
+    let elapsed = start.elapsed();
+    println!(
+        "count_similar(target=1, d=0): count={}, {:?} ({:.0} M cells/sec)",
+        count,
+        elapsed,
+        cell_count as f64 / elapsed.as_secs_f64() / 1_000_000.0
+    );
+
+    // 10. Show page geometry.
+    println!();
+    println!("Storage geometry:");
+    println!("  Page size: 4 KB ({} cells)", PAGE_CELLS);
+    println!("  Region size: 2 MB ({} pages)", 2 * 1024 * 1024 / 4096);
+    println!("  Tablet size: 2 GB ({} regions)", 1024);
+
+    // 11. Show kernel table.
+    println!();
+    println!("Kernel table ({} entries):", sched2.kernel_table.list().len());
+    for (op, cpu, tier, name) in sched2.kernel_table.list() {
+        println!("  {:?} / {} / {} → {}", op, cpu.name(), tier.name(), name);
+    }
+
+    println!();
+    println!("=== smoke test complete ===");
 }
