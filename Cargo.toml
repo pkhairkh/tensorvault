@@ -59,6 +59,11 @@ name = "bench_sketches"
 harness = false
 path = "benches/bench_sketches.rs"
 
+[[bench]]
+name = "bench_wcoj"
+harness = false
+path = "benches/bench_wcoj.rs"
+
 [profile.release]
 opt-level = 3
 lto = "fat"

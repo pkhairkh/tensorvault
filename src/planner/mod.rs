@@ -28,10 +28,17 @@
 //!   and join-cost tail latency.
 //! - [`dpccp`] — left-deep DPccp join ordering for `n ≤ 15` relations
 //!   (ADR-019).
+//! - [`agm`] — Atserias-Grohe-Marx fractional cover bound, the worst-case
+//!   size of a join result and the runtime bound of worst-case optimal join
+//!   algorithms.
+//! - [`wcoj`] — worst-case optimal join (Leapfrog triejoin) plan selection:
+//!   picks between hash join and leapfrog based on the AGM bound.
 //! - [`cardinality`] — simple per-table row-count and selectivity estimates
 //!   used by the cost model and the join reorderer.
 //! - [`lowerer`] — cost-aware lowering of a `LogicalPlan` into a sequence of
-//!   `KernelInvocation`s, picking the cheapest tier per operator.
+//!   `KernelInvocation`s, picking the cheapest tier per operator and
+//!   dispatching each join to either `HashProbe` or `LeapfrogJoin` via
+//!   [`wcoj::choose_join_algorithm`].
 //!
 //! ## Calibration
 //!
@@ -54,12 +61,14 @@ pub mod cardinality;
 pub mod dpccp;
 pub mod kingman;
 pub mod lowerer;
+pub mod wcoj;
 
 pub use agm::{agm_bound, JoinHypergraph};
 pub use cardinality::CardinalityEstimator;
 pub use dpccp::{dpccp, JoinRelation, JoinTree};
 pub use kingman::KingmanPredictor;
 pub use lowerer::PlanLowerer;
+pub use wcoj::{build_wcoj_plan, choose_join_algorithm, JoinAlgorithm, WcojPlan};
 
 use crate::executor::plan::{LogicalPlan, PlanNode};
 use crate::kernel::Operator;
