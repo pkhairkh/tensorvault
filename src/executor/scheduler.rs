@@ -1,10 +1,9 @@
 //! The scheduler: dispatches kernel invocations respecting data dependencies
 //! and tier bandwidth.
 
-use crate::executor::plan::{KernelInvocation, LogicalPlan, lower_to_kernels, PlanResult};
+use crate::executor::plan::{lower_to_kernels, KernelInvocation, LogicalPlan, PlanResult};
 use crate::kernel::{KernelParams, KernelResult, KernelTable, Operator};
 use crate::memory::region::{Region, RegionId};
-use crate::memory::tier::MemoryTier;
 use crate::Result;
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -21,10 +20,7 @@ pub struct Scheduler {
 impl Scheduler {
     /// Create a new scheduler.
     pub fn new(kernel_table: Arc<KernelTable>) -> Self {
-        Self {
-            kernel_table,
-            regions: RwLock::new(HashMap::new()),
-        }
+        Self { kernel_table, regions: RwLock::new(HashMap::new()) }
     }
 
     /// Register a region with the scheduler.
@@ -61,9 +57,7 @@ impl Scheduler {
         // Execute the kernel.
         // SAFETY: the data vector is valid and has at least cell_count * 8 bytes.
         let mut output = [0u8; 64];
-        let result = unsafe {
-            kernel.execute(data.as_ptr(), output.as_mut_ptr(), &params)
-        };
+        let result = unsafe { kernel.execute(data.as_ptr(), output.as_mut_ptr(), &params) };
 
         Ok(result)
     }
@@ -102,11 +96,7 @@ impl Scheduler {
             operator: Operator::ScanEqU64,
             tier: region.tier,
             region_id,
-            params: KernelParams {
-                target_u64: target,
-                cell_count,
-                ..Default::default()
-            },
+            params: KernelParams { target_u64: target, cell_count, ..Default::default() },
         };
         Ok(self.execute_invocation(&inv)?.count)
     }
@@ -122,16 +112,18 @@ impl Scheduler {
             operator: Operator::AggregateSumF64,
             tier: region.tier,
             region_id,
-            params: KernelParams {
-                cell_count,
-                ..Default::default()
-            },
+            params: KernelParams { cell_count, ..Default::default() },
         };
         Ok(self.execute_invocation(&inv)?.sum)
     }
 
     /// Convenience: count cells within Hamming distance of a target.
-    pub fn count_similar(&self, region_id: RegionId, target: u64, max_distance: u32) -> Result<u64> {
+    pub fn count_similar(
+        &self,
+        region_id: RegionId,
+        target: u64,
+        max_distance: u32,
+    ) -> Result<u64> {
         let region = self
             .get_region(region_id)
             .ok_or_else(|| crate::Error::NotFound(format!("region {}", region_id)))?;
@@ -161,6 +153,7 @@ impl Scheduler {
 mod tests {
     use super::*;
     use crate::kernel::KernelTable;
+    use crate::memory::tier::MemoryTier;
 
     fn make_region_with_cells(id: RegionId, tier: MemoryTier, cells: &[u64]) -> Arc<Region> {
         let mut bytes = vec![0u8; 2 * 1024 * 1024]; // 2 MB

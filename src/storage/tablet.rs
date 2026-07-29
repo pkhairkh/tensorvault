@@ -35,12 +35,7 @@ pub struct Tablet {
 impl Tablet {
     /// Create a new empty tablet.
     pub fn new(id: TabletId, tier: MemoryTier) -> Self {
-        Self {
-            id,
-            regions: RwLock::new(vec![None; TABLET_REGIONS]),
-            tier,
-            numa_node: None,
-        }
+        Self { id, regions: RwLock::new(vec![None; TABLET_REGIONS]), tier, numa_node: None }
     }
 
     /// Place a region at a specific slot.

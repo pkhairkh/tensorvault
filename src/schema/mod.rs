@@ -9,4 +9,4 @@
 
 pub mod mdl;
 
-pub use mdl::{TypeInterpretation, schema_select, schema_select_with_diagnostics};
+pub use mdl::{schema_select, schema_select_with_diagnostics, TypeInterpretation};

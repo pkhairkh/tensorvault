@@ -57,32 +57,22 @@ impl NumaTopology {
                     Err(_) => continue,
                 };
 
-                let cpus = read_cpu_list(&format!(
-                    "/sys/devices/system/node/node{}/cpulist",
-                    id
-                ));
-                let memory_bytes = fs::read_to_string(format!(
-                    "/sys/devices/system/node/node{}/meminfo",
-                    id
-                ))
-                .ok()
-                .and_then(|s| {
-                    s.lines()
-                        .find(|l| l.contains("MemTotal"))
-                        .and_then(|l| l.split_whitespace().last())
-                        .and_then(|v| v.parse::<u64>().ok())
-                        .map(|v| v * 1024)
-                })
-                .unwrap_or(0);
+                let cpus = read_cpu_list(&format!("/sys/devices/system/node/node{}/cpulist", id));
+                let memory_bytes =
+                    fs::read_to_string(format!("/sys/devices/system/node/node{}/meminfo", id))
+                        .ok()
+                        .and_then(|s| {
+                            s.lines()
+                                .find(|l| l.contains("MemTotal"))
+                                .and_then(|l| l.split_whitespace().last())
+                                .and_then(|v| v.parse::<u64>().ok())
+                                .map(|v| v * 1024)
+                        })
+                        .unwrap_or(0);
 
                 let tier = classify_node(id, &cpus);
 
-                nodes.push(NumaNode {
-                    id,
-                    cpus,
-                    tier,
-                    memory_bytes,
-                });
+                nodes.push(NumaNode { id, cpus, tier, memory_bytes });
             }
         }
 

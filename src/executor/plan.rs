@@ -3,7 +3,6 @@
 use crate::kernel::{KernelParams, KernelResult, Operator};
 use crate::memory::region::RegionId;
 use crate::memory::tier::MemoryTier;
-use std::sync::Arc;
 
 /// A node in a logical plan.
 #[derive(Debug, Clone)]
@@ -85,11 +84,7 @@ pub fn lower_to_kernels(plan: &LogicalPlan) -> Vec<KernelInvocation> {
 
 fn lower_node(node: &PlanNode, invocations: &mut Vec<KernelInvocation>) {
     match node {
-        PlanNode::Scan {
-            region_id,
-            operator,
-            params,
-        } => {
+        PlanNode::Scan { region_id, operator, params } => {
             invocations.push(KernelInvocation {
                 operator: *operator,
                 tier: MemoryTier::L3, // Default; the scheduler will refine.
@@ -106,11 +101,7 @@ fn lower_node(node: &PlanNode, invocations: &mut Vec<KernelInvocation>) {
                 params: KernelParams::default(),
             });
         }
-        PlanNode::Join {
-            left,
-            right,
-            operator,
-        } => {
+        PlanNode::Join { left, right, operator } => {
             lower_node(left, invocations);
             lower_node(right, invocations);
             invocations.push(KernelInvocation {
@@ -120,10 +111,7 @@ fn lower_node(node: &PlanNode, invocations: &mut Vec<KernelInvocation>) {
                 params: KernelParams::default(),
             });
         }
-        PlanNode::Materialize {
-            child,
-            target_region: _,
-        } => {
+        PlanNode::Materialize { child, target_region: _ } => {
             lower_node(child, invocations);
         }
     }
@@ -138,11 +126,7 @@ mod tests {
         let plan = LogicalPlan::new(PlanNode::Scan {
             region_id: 42,
             operator: Operator::ScanEqU64,
-            params: KernelParams {
-                target_u64: 99,
-                cell_count: 504,
-                ..Default::default()
-            },
+            params: KernelParams { target_u64: 99, cell_count: 504, ..Default::default() },
         });
         let invocations = lower_to_kernels(&plan);
         assert_eq!(invocations.len(), 1);

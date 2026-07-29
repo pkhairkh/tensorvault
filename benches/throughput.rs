@@ -26,9 +26,7 @@ fn bench_scan_eq(c: &mut Criterion) {
         sched.register_region(region);
 
         group.bench_function(format!("tier={}", tier.name()), |b| {
-            b.iter(|| {
-                black_box(sched.scan_eq(black_box(0), black_box(42)).unwrap())
-            });
+            b.iter(|| black_box(sched.scan_eq(black_box(0), black_box(42)).unwrap()));
         });
     }
     group.finish();

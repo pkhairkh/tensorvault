@@ -122,9 +122,7 @@ impl Region {
     pub fn as_u64_cells(&self) -> Vec<u64> {
         self.stats.record_read();
         let data = self.data.lock();
-        data.chunks_exact(8)
-            .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
-            .collect()
+        data.chunks_exact(8).map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap())).collect()
     }
 
     /// Number of u64 cells in this region.

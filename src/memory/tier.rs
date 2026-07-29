@@ -7,13 +7,14 @@ use serde::{Deserialize, Serialize};
 /// Each tier has a characteristic latency, bandwidth, and energy profile.
 /// The kernel table has different kernels for different tiers because the
 /// optimal prefetch distance, batch size, and SIMD width depend on the tier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum MemoryTier {
     /// L1/L2 cache (per-core, ~1–4 ns). Auto-managed by hardware.
     L1L2,
     /// L3 / Smart Cache / Infinity Cache (per-socket, ~10–20 ns).
     L3,
     /// Local DDR5 (per-socket, ~80–100 ns).
+    #[default]
     Ddr5,
     /// HBM (Xeon Max / MI300A, ~100–150 ns, multi-TB/s).
     Hbm,
@@ -92,12 +93,6 @@ impl MemoryTier {
     /// Is this a local tier (no network hop)?
     pub fn is_local(self) -> bool {
         matches!(self, Self::L1L2 | Self::L3 | Self::Ddr5 | Self::Hbm | Self::Cxl | Self::Nvme)
-    }
-}
-
-impl Default for MemoryTier {
-    fn default() -> Self {
-        Self::Ddr5
     }
 }
 

@@ -1,2 +1,5 @@
 # Clippy configuration
-msrv = "1.74"
+# MSRV is 1.89: the kernel module uses AVX-512 intrinsics
+# (_mm512_loadu_epi64, _mm512_cmpeq_epi64_mask, etc.) that were
+# stabilized in Rust 1.89.0.
+msrv = "1.89"

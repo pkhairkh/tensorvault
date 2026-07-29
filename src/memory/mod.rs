@@ -19,6 +19,6 @@ pub mod numa;
 pub mod region;
 pub mod tier;
 
-pub use numa::{NumaTopology, NumaNode};
+pub use numa::{NumaNode, NumaTopology};
 pub use region::{Region, RegionId, RegionStats};
 pub use tier::MemoryTier;

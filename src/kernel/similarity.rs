@@ -4,8 +4,8 @@
 //! This works for ANY column type (because every cell is a 64-bit word) and is
 //! the unified similarity primitive.
 
-use crate::kernel::{Kernel, KernelParams, KernelResult, Operator};
 use crate::kernel::cpu::CpuTarget;
+use crate::kernel::{Kernel, KernelParams, KernelResult, Operator};
 use crate::memory::tier::MemoryTier;
 
 /// Scalar Hamming similarity — counts cells within `max_distance` bits of target.

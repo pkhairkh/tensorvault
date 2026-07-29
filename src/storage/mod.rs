@@ -9,6 +9,6 @@ pub mod page;
 pub mod tablet;
 pub mod wal;
 
-pub use page::{Page, PageHeader, PAGE_SIZE, PAGE_CELLS};
+pub use page::{Page, PageHeader, PAGE_CELLS, PAGE_SIZE};
 pub use tablet::{Tablet, TabletId, REGION_SIZE, TABLET_REGIONS, TABLET_SIZE};
 pub use wal::Wal;

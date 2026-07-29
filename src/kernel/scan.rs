@@ -4,9 +4,9 @@
 //! The scalar fallback works everywhere; the AVX-512 kernels require Ice Lake+
 //! or Zen 4+ and use `VPCMPEQQ` + `KMOVQ` for 8-lanes-per-cycle throughput.
 
+use crate::kernel::cpu::CpuTarget;
 use crate::kernel::{Kernel, KernelParams, KernelResult, Operator};
 use crate::memory::tier::MemoryTier;
-use crate::kernel::cpu::CpuTarget;
 
 // ---------------------------------------------------------------------------
 // Scalar fallbacks (work everywhere)
@@ -87,6 +87,7 @@ impl Kernel for ScanRangeScalar {
 // AVX-2 kernels (Haswell+, 2013+)
 // ---------------------------------------------------------------------------
 
+/// AVX-2 kernel for `ScanEqU64` on L3-resident data (Haswell+, 2013+).
 #[cfg(target_arch = "x86_64")]
 pub struct ScanEqAvx2;
 
@@ -381,18 +382,10 @@ mod tests {
     }
 
     unsafe fn run_scan_eq(kernel: &dyn Kernel, cells: &[u64], target: u64) -> u64 {
-        let params = KernelParams {
-            target_u64: target,
-            cell_count: cells.len(),
-            ..Default::default()
-        };
+        let params =
+            KernelParams { target_u64: target, cell_count: cells.len(), ..Default::default() };
         let mut output = [0u8; 64];
-        kernel.execute(
-            cells.as_ptr() as *const u8,
-            output.as_mut_ptr(),
-            &params,
-        )
-        .count
+        kernel.execute(cells.as_ptr() as *const u8, output.as_mut_ptr(), &params).count
     }
 
     #[test]

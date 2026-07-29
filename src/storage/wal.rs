@@ -44,11 +44,7 @@ impl Wal {
     pub fn open<P: AsRef<Path>>(path: P, tier: MemoryTier) -> crate::Result<Self> {
         let path = path.as_ref().to_path_buf();
         std::fs::create_dir_all(path.parent().unwrap_or(Path::new(".")))?;
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).read(true).open(&path)?;
         Ok(Self {
             path,
             file: Mutex::new(BufWriter::new(file)),
@@ -129,18 +125,8 @@ mod tests {
     fn wal_append_and_sync() {
         let dir = tempdir().unwrap();
         let wal = Wal::open(dir.path().join("wal.log"), MemoryTier::Nvme).unwrap();
-        wal.append(&WalRecord {
-            txn_id: 1,
-            record_type: 0,
-            payload: b"hello".to_vec(),
-        })
-        .unwrap();
-        wal.append(&WalRecord {
-            txn_id: 2,
-            record_type: 2,
-            payload: b"world".to_vec(),
-        })
-        .unwrap();
+        wal.append(&WalRecord { txn_id: 1, record_type: 0, payload: b"hello".to_vec() }).unwrap();
+        wal.append(&WalRecord { txn_id: 2, record_type: 2, payload: b"world".to_vec() }).unwrap();
         wal.sync().unwrap();
         assert_eq!(wal.records_written(), 2);
         assert!(wal.bytes_written() > 0);
@@ -153,12 +139,7 @@ mod tests {
 
         {
             let wal = Wal::open(&path, MemoryTier::Nvme).unwrap();
-            wal.append(&WalRecord {
-                txn_id: 42,
-                record_type: 0,
-                payload: vec![1, 2, 3],
-            })
-            .unwrap();
+            wal.append(&WalRecord { txn_id: 42, record_type: 0, payload: vec![1, 2, 3] }).unwrap();
             wal.sync().unwrap();
         }
 

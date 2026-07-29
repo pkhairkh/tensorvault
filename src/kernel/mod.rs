@@ -27,12 +27,20 @@ pub mod hash;
 pub mod scan;
 pub mod similarity;
 
-pub use cpu::{CpuTarget, CpuVendor, detect_cpu};
 pub use crate::memory::tier::MemoryTier;
+pub use cpu::{detect_cpu, CpuTarget, CpuVendor};
 
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// The key into the kernel table: `(Operator, CpuTarget, MemoryTier)`.
+pub type KernelKey = (Operator, CpuTarget, MemoryTier);
+
+/// The map type backing the kernel table.
+///
+/// Factored into a type alias to keep the `KernelTable` struct readable.
+pub type KernelMap = RwLock<HashMap<KernelKey, Arc<dyn Kernel>>>;
 
 /// Identifies an operator that kernels implement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -70,13 +78,7 @@ pub struct KernelParams {
 
 impl Default for KernelParams {
     fn default() -> Self {
-        Self {
-            target_u64: 0,
-            low_u64: 0,
-            high_u64: u64::MAX,
-            max_distance: 0,
-            cell_count: 0,
-        }
+        Self { target_u64: 0, low_u64: 0, high_u64: u64::MAX, max_distance: 0, cell_count: 0 }
     }
 }
 
@@ -124,7 +126,7 @@ pub trait Kernel: Send + Sync {
 /// kernel for that combination.
 pub struct KernelTable {
     /// All registered kernels, keyed by (operator, cpu, tier).
-    kernels: RwLock<HashMap<(Operator, CpuTarget, MemoryTier), Arc<dyn Kernel>>>,
+    kernels: KernelMap,
     /// The detected CPU of this machine.
     detected_cpu: CpuTarget,
 }
@@ -145,10 +147,7 @@ impl KernelTable {
         register_aggregate_kernels(&mut kernels);
         register_similarity_kernels(&mut kernels);
 
-        Self {
-            kernels: RwLock::new(kernels),
-            detected_cpu,
-        }
+        Self { kernels: RwLock::new(kernels), detected_cpu }
     }
 
     /// Select the best kernel for `(operator, tier)` on the detected CPU.
@@ -163,10 +162,7 @@ impl KernelTable {
             return Some(k.clone());
         }
         // Last resort: any kernel for this operator on any CPU/tier.
-        kernels
-            .values()
-            .find(|k| k.operator() == op)
-            .cloned()
+        kernels.values().find(|k| k.operator() == op).cloned()
     }
 
     /// The detected CPU target.
@@ -196,14 +192,14 @@ impl Default for KernelTable {
     }
 }
 
-fn register_scan_kernels(kernels: &mut HashMap<(Operator, CpuTarget, MemoryTier), Arc<dyn Kernel>>) {
+fn register_scan_kernels(
+    kernels: &mut HashMap<(Operator, CpuTarget, MemoryTier), Arc<dyn Kernel>>,
+) {
     use scan::*;
 
     // Scalar fallback (works everywhere).
-    kernels.insert(
-        (Operator::ScanEqU64, CpuTarget::Scalar, MemoryTier::L3),
-        Arc::new(ScanEqScalar),
-    );
+    kernels
+        .insert((Operator::ScanEqU64, CpuTarget::Scalar, MemoryTier::L3), Arc::new(ScanEqScalar));
     kernels.insert(
         (Operator::ScanRangeU64, CpuTarget::Scalar, MemoryTier::L3),
         Arc::new(ScanRangeScalar),
@@ -240,7 +236,9 @@ fn register_scan_kernels(kernels: &mut HashMap<(Operator, CpuTarget, MemoryTier)
     }
 }
 
-fn register_hash_kernels(kernels: &mut HashMap<(Operator, CpuTarget, MemoryTier), Arc<dyn Kernel>>) {
+fn register_hash_kernels(
+    kernels: &mut HashMap<(Operator, CpuTarget, MemoryTier), Arc<dyn Kernel>>,
+) {
     use hash::*;
     kernels.insert(
         (Operator::HashBuild, CpuTarget::Scalar, MemoryTier::Ddr5),
@@ -279,11 +277,7 @@ fn register_aggregate_kernels(
         );
     }
     kernels.insert(
-        (
-            Operator::AggregateCountDistinct,
-            CpuTarget::Scalar,
-            MemoryTier::Ddr5,
-        ),
+        (Operator::AggregateCountDistinct, CpuTarget::Scalar, MemoryTier::Ddr5),
         Arc::new(CountDistinctScalar),
     );
 }

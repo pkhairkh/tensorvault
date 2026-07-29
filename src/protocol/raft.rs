@@ -14,10 +14,7 @@ pub struct RaftCoordinator {
 impl RaftCoordinator {
     /// Create a new Raft coordinator.
     pub fn new(cluster_size: usize, node_id: u64) -> Self {
-        Self {
-            cluster_size,
-            node_id,
-        }
+        Self { cluster_size, node_id }
     }
 
     /// Commit a transaction via Raft quorum.

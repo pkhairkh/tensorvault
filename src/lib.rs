@@ -16,6 +16,8 @@
 //! - [`executor`] — scheduler of instruction streams.
 //! - [`protocol`] — protocol boundary coordinator (CXL, Raft/RoCEv2).
 //! - [`schema`] — the last layer: SQL parser, MDL schema selection.
+//! - [`types`] — linear/affine memory handles (`CxlRef`, `RaftRef`) that
+//!   enforce protocol boundaries at compile time (ADR-013).
 
 #![warn(rust_2018_idioms, missing_docs)]
 
@@ -25,6 +27,7 @@ pub mod memory;
 pub mod protocol;
 pub mod schema;
 pub mod storage;
+pub mod types;
 
 pub use error::{Error, Result};
 
@@ -44,7 +47,12 @@ mod error {
 
         /// Dimension mismatch.
         #[error("dimension mismatch: expected {expected}, got {actual}")]
-    DimMismatch { expected: usize, actual: usize },
+        DimMismatch {
+            /// Expected dimension.
+            expected: usize,
+            /// Actual dimension.
+            actual: usize,
+        },
 
         /// Invalid argument.
         #[error("invalid argument: {0}")]
@@ -65,6 +73,22 @@ mod error {
         /// Generic.
         #[error("{0}")]
         Other(String),
+
+        /// Tier-related error (e.g., data not in requested tier).
+        #[error("tier error: {0}")]
+        Tier(String),
+
+        /// Protocol boundary violation (e.g., CXL data leaked to a Raft txn).
+        #[error("protocol error: {0}")]
+        Protocol(String),
+
+        /// SQL parse error.
+        #[error("parse error: {0}")]
+        Parse(String),
+
+        /// Operation timed out after the given number of milliseconds.
+        #[error("timeout after {0} ms")]
+        Timeout(u64),
     }
 
     /// Convenience Result alias.

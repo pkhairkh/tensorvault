@@ -53,11 +53,7 @@ fn main() {
     }
     let region = Arc::new(Region::from_bytes(0, MemoryTier::L3, &bytes));
     scheduler.register_region(region);
-    println!(
-        "Registered region 0: {} cells, tier={}",
-        cell_count,
-        MemoryTier::L3
-    );
+    println!("Registered region 0: {} cells, tier={}", cell_count, MemoryTier::L3);
     println!();
 
     // 7. Run scan_eq: count cells equal to 42.

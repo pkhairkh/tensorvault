@@ -108,10 +108,7 @@ pub fn description_length(
         }
     };
 
-    DescriptionLength {
-        model_bits,
-        data_bits,
-    }
+    DescriptionLength { model_bits, data_bits }
 }
 
 /// MDL-optimal schema selection.
@@ -160,10 +157,7 @@ pub fn schema_select_with_diagnostics(
     let mut all_costs: Vec<(TypeInterpretation, DescriptionLength)> = candidates
         .iter()
         .map(|&tau| {
-            (
-                tau,
-                description_length(total, f64_count, i32_count, bool_count, null_count, tau),
-            )
+            (tau, description_length(total, f64_count, i32_count, bool_count, null_count, tau))
         })
         .collect();
 
@@ -171,10 +165,7 @@ pub fn schema_select_with_diagnostics(
         a.total().partial_cmp(&b.total()).unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    let chosen = all_costs
-        .first()
-        .map(|(t, _)| *t)
-        .unwrap_or(TypeInterpretation::Variant);
+    let chosen = all_costs.first().map(|(t, _)| *t).unwrap_or(TypeInterpretation::Variant);
 
     (chosen, all_costs)
 }

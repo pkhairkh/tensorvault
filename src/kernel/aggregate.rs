@@ -1,7 +1,7 @@
 //! Aggregate kernels: sum, count, count distinct.
 
-use crate::kernel::{Kernel, KernelParams, KernelResult, Operator};
 use crate::kernel::cpu::CpuTarget;
+use crate::kernel::{Kernel, KernelParams, KernelResult, Operator};
 use crate::memory::tier::MemoryTier;
 
 // ---------------------------------------------------------------------------
@@ -31,15 +31,8 @@ impl Kernel for SumF64Scalar {
         params: &KernelParams,
     ) -> KernelResult {
         let cells = std::slice::from_raw_parts(input as *const u64, params.cell_count);
-        let sum: f64 = cells
-            .iter()
-            .map(|&bits| f64::from_bits(bits))
-            .sum();
-        KernelResult {
-            count: params.cell_count as u64,
-            sum,
-            mask: 0,
-        }
+        let sum: f64 = cells.iter().map(|&bits| f64::from_bits(bits)).sum();
+        KernelResult { count: params.cell_count as u64, sum, mask: 0 }
     }
 }
 
@@ -87,11 +80,7 @@ impl Kernel for SumF64Avx2 {
             sum += f64::from_bits(cells[i]);
             i += 1;
         }
-        KernelResult {
-            count: params.cell_count as u64,
-            sum,
-            mask: 0,
-        }
+        KernelResult { count: params.cell_count as u64, sum, mask: 0 }
     }
 }
 
@@ -141,11 +130,7 @@ impl Kernel for SumF64Avx512 {
             sum += f64::from_bits(cells[i]);
             i += 1;
         }
-        KernelResult {
-            count: params.cell_count as u64,
-            sum,
-            mask: 0,
-        }
+        KernelResult { count: params.cell_count as u64, sum, mask: 0 }
     }
 }
 
@@ -181,11 +166,7 @@ impl Kernel for CountDistinctScalar {
         use std::collections::HashSet;
         let cells = std::slice::from_raw_parts(input as *const u64, params.cell_count);
         let distinct: HashSet<u64> = cells.iter().copied().collect();
-        KernelResult {
-            count: distinct.len() as u64,
-            sum: 0.0,
-            mask: 0,
-        }
+        KernelResult { count: distinct.len() as u64, sum: 0.0, mask: 0 }
     }
 }
 
@@ -195,10 +176,7 @@ mod tests {
 
     unsafe fn run_sum_f64(kernel: &dyn Kernel, values: &[f64]) -> f64 {
         let cells: Vec<u64> = values.iter().map(|v| v.to_bits()).collect();
-        let params = KernelParams {
-            cell_count: cells.len(),
-            ..Default::default()
-        };
+        let params = KernelParams { cell_count: cells.len(), ..Default::default() };
         let mut output = [0u8; 64];
         kernel.execute(cells.as_ptr() as *const u8, output.as_mut_ptr(), &params).sum
     }
@@ -237,10 +215,7 @@ mod tests {
     #[test]
     fn count_distinct_works() {
         let cells: Vec<u64> = vec![1, 2, 3, 2, 4, 1, 5];
-        let params = KernelParams {
-            cell_count: cells.len(),
-            ..Default::default()
-        };
+        let params = KernelParams { cell_count: cells.len(), ..Default::default() };
         let mut output = [0u8; 64];
         let result = unsafe {
             CountDistinctScalar.execute(cells.as_ptr() as *const u8, output.as_mut_ptr(), &params)

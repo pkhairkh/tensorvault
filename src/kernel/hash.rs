@@ -4,8 +4,8 @@
 //! metadata per slot, scanned with `VPCMPEQB`). The probe kernel looks up
 //! keys and returns matching (probe_idx, build_idx) pairs.
 
-use crate::kernel::{Kernel, KernelParams, KernelResult, Operator};
 use crate::kernel::cpu::CpuTarget;
+use crate::kernel::{Kernel, KernelParams, KernelResult, Operator};
 use crate::memory::tier::MemoryTier;
 use std::collections::HashMap;
 
@@ -27,10 +27,7 @@ impl HashTable {
         for (i, &k) in keys.iter().enumerate() {
             map.entry(k).or_default().push(i);
         }
-        Self {
-            map,
-            slots: keys.len(),
-        }
+        Self { map, slots: keys.len() }
     }
 
     /// Probe for a single key. Returns build-side indices.
@@ -75,11 +72,7 @@ impl Kernel for HashBuildScalar {
         // Write the table pointer to output (caller knows it's a Box<HashTable>).
         let boxed = Box::new(table);
         *(output as *mut *mut HashTable) = Box::into_raw(boxed);
-        KernelResult {
-            count: params.cell_count as u64,
-            sum: 0.0,
-            mask: 0,
-        }
+        KernelResult { count: params.cell_count as u64, sum: 0.0, mask: 0 }
     }
 }
 
@@ -108,17 +101,12 @@ impl Kernel for HashProbeScalar {
         // input layout: [HashTable pointer (8 bytes)] [probe keys (cell_count * 8 bytes)]
         let table_ptr = *(input as *const *const HashTable);
         let table = &*table_ptr;
-        let probe_keys =
-            std::slice::from_raw_parts(input.add(8) as *const u64, params.cell_count);
+        let probe_keys = std::slice::from_raw_parts(input.add(8) as *const u64, params.cell_count);
         let mut matches = 0u64;
         for &k in probe_keys {
             matches += table.probe(k).len() as u64;
         }
-        KernelResult {
-            count: matches,
-            sum: 0.0,
-            mask: 0,
-        }
+        KernelResult { count: matches, sum: 0.0, mask: 0 }
     }
 }
 
@@ -183,10 +171,7 @@ mod tests {
     fn hash_kernel_build_and_probe() {
         let keys = vec![1u64, 2, 3, 2, 4];
         let mut output_buf = [0u8; 64];
-        let build_params = KernelParams {
-            cell_count: keys.len(),
-            ..Default::default()
-        };
+        let build_params = KernelParams { cell_count: keys.len(), ..Default::default() };
         unsafe {
             HashBuildScalar.execute(
                 keys.as_ptr() as *const u8,
@@ -205,16 +190,9 @@ mod tests {
         for (i, &k) in probe_keys.iter().enumerate() {
             probe_input[8 + i * 8..8 + (i + 1) * 8].copy_from_slice(&k.to_le_bytes());
         }
-        let probe_params = KernelParams {
-            cell_count: probe_keys.len(),
-            ..Default::default()
-        };
+        let probe_params = KernelParams { cell_count: probe_keys.len(), ..Default::default() };
         let result = unsafe {
-            HashProbeScalar.execute(
-                probe_input.as_ptr(),
-                output_buf.as_mut_ptr(),
-                &probe_params,
-            )
+            HashProbeScalar.execute(probe_input.as_ptr(), output_buf.as_mut_ptr(), &probe_params)
         };
         assert_eq!(result.count, 3); // 2 matches key 2 (2 build rows), 1 matches key 4
 

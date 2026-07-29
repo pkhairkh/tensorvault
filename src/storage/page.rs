@@ -23,7 +23,7 @@ pub const PAGE_CELLS: usize = (PAGE_SIZE - HEADER_SIZE) / 8;
 
 /// Page header — 64 bytes, exactly one cache line.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Pod, Zeroable, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable, Serialize, Deserialize, Default)]
 pub struct PageHeader {
     /// Page type tag (which kernel operates on this page).
     pub page_type: u64,
@@ -53,21 +53,6 @@ impl PageHeader {
     }
 }
 
-impl Default for PageHeader {
-    fn default() -> Self {
-        Self {
-            page_type: 0,
-            tier_hint: 0,
-            homogeneity: 0,
-            row_count: 0,
-            checksum: 0,
-            predecessor: 0,
-            successor: 0,
-            reserved: 0,
-        }
-    }
-}
-
 /// A 4 KB page.
 #[repr(C, align(64))]
 pub struct Page {
@@ -80,21 +65,14 @@ pub struct Page {
 impl Page {
     /// Allocate a new zeroed page.
     pub fn new() -> Self {
-        Self {
-            header: PageHeader::default(),
-            cells: [0u8; PAGE_SIZE - HEADER_SIZE],
-        }
+        Self { header: PageHeader::default(), cells: [0u8; PAGE_SIZE - HEADER_SIZE] }
     }
 
     /// Get a cell as a u64.
     pub fn get_cell(&self, index: usize) -> u64 {
         assert!(index < PAGE_CELLS, "cell index {} out of range", index);
         let offset = index * 8;
-        u64::from_le_bytes(
-            self.cells[offset..offset + 8]
-                .try_into()
-                .unwrap(),
-        )
+        u64::from_le_bytes(self.cells[offset..offset + 8].try_into().unwrap())
     }
 
     /// Set a cell as a u64.
@@ -138,10 +116,7 @@ impl Page {
     /// Read a page from a byte slice.
     pub fn from_bytes(bytes: &[u8]) -> crate::Result<Self> {
         if bytes.len() < PAGE_SIZE {
-            return Err(crate::Error::Corruption(format!(
-                "page too small: {} bytes",
-                bytes.len()
-            )));
+            return Err(crate::Error::Corruption(format!("page too small: {} bytes", bytes.len())));
         }
         let header: PageHeader = *bytemuck::from_bytes(&bytes[..HEADER_SIZE]);
         let mut cells = [0u8; PAGE_SIZE - HEADER_SIZE];

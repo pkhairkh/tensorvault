@@ -15,9 +15,7 @@ pub struct CxlCoordinator {
 impl CxlCoordinator {
     /// Create a new CXL coordinator.
     pub fn new() -> Self {
-        Self {
-            available: crate::memory::numa::cxl_available(),
-        }
+        Self { available: crate::memory::numa::cxl_available() }
     }
 
     /// Is CXL available?
