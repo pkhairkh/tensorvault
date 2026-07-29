@@ -224,7 +224,7 @@ mod tests {
             h.add(xxh3::xxh3_64(&i.to_le_bytes()));
         }
         let est = h.estimate();
-        assert!(est >= 25.0 && est <= 75.0, "small count estimate {est} off");
+        assert!((25.0..=75.0).contains(&est), "small count estimate {est} off");
     }
 
     #[test]

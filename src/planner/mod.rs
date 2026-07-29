@@ -1,5 +1,6 @@
 //! The query planner: a calibrated analytic cost model (ADR-023) + Kingman
-//! queueing predictor (ADR-020).
+//! queueing predictor (ADR-020) + DPccp join ordering (ADR-019) + a
+//! cost-aware plan lowerer.
 //!
 //! ## Overview
 //!
@@ -20,6 +21,18 @@
 //!    only operator that can contend on a shared hash table) in the current
 //!    simple model.
 //!
+//! ## Submodules
+//!
+//! - [`CostModel`] (this file) — per-tier compute-cost estimates.
+//! - [`kingman`] — Kingman's-formula queueing predictor for admission control
+//!   and join-cost tail latency.
+//! - [`dpccp`] — left-deep DPccp join ordering for `n ≤ 15` relations
+//!   (ADR-019).
+//! - [`cardinality`] — simple per-table row-count and selectivity estimates
+//!   used by the cost model and the join reorderer.
+//! - [`lowerer`] — cost-aware lowering of a `LogicalPlan` into a sequence of
+//!   `KernelInvocation`s, picking the cheapest tier per operator.
+//!
 //! ## Calibration
 //!
 //! The default [`CostModel`] encodes Zen 5 measurements taken on an
@@ -36,9 +49,15 @@
 //! `CostModel` defaults (or by constructing a custom one and passing it to
 //! [`estimate_cost`]).
 
+pub mod cardinality;
+pub mod dpccp;
 pub mod kingman;
+pub mod lowerer;
 
+pub use cardinality::CardinalityEstimator;
+pub use dpccp::{dpccp, JoinRelation, JoinTree};
 pub use kingman::KingmanPredictor;
+pub use lowerer::PlanLowerer;
 
 use crate::executor::plan::{LogicalPlan, PlanNode};
 use crate::kernel::Operator;
