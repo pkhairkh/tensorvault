@@ -32,6 +32,11 @@
 | [020](./020-kingman-admission-control.md) | Kingman ρ-guard + token bucket for admission | 80% | Accepted |
 | [021](./021-tpc-h-accept-loss.md) | TPC-H: run as-is, accept 1.2–1.5× loss | 95% | Accepted |
 | [022](./022-rapl-energy-benchmarking.md) | RAPL + external meter for energy benchmarking | 85% | Accepted |
+| [023](./023-calibrated-analytic-cost-model.md) | Calibrated analytic cost model (Kingman + measured AVX-512) | 85% | Accepted |
+| [024](./024-mcdiarmid-eps-delta-joins.md) | McDiarmid bounded-differences for (ε,δ) through joins | 85% | Accepted |
+| [025](./025-rans-cold-tier-only.md) | rANS compression for cold-tier columns only (CXL, NVMe) | 80% | Accepted |
+
+**25 ADRs accepted. 7 open questions remain** (see [OPEN_QUESTIONS.md](./OPEN_QUESTIONS.md)).
 
 ## Compatibility matrix
 
