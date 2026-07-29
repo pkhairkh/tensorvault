@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 use std::time::Instant;
-use tensorvault::{
+use turbogp::{
     executor::Scheduler,
     kernel::{CpuTarget, KernelTable, Operator},
     memory::{region::Region, tier::MemoryTier, NumaTopology},
@@ -11,7 +11,7 @@ use tensorvault::{
 };
 
 fn main() {
-    println!("=== TensorVault instruction-first engine — smoke test ===\n");
+    println!("=== turbogp instruction-first engine — smoke test ===\n");
 
     // 1. Detect CPU.
     let table = KernelTable::new();

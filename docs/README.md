@@ -1,6 +1,6 @@
 # Documentation Index
 
-> Entry point for all TensorVault documentation. Read in order if you're new;
+> Entry point for all turboGP documentation. Read in order if you're new;
 > jump to a section if you're looking for something specific.
 
 ## Start here

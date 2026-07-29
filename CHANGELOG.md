@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to TensorVault are documented here.
+All notable changes to turboGP are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]

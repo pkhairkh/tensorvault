@@ -1,4 +1,4 @@
-# TensorVault Architecture
+# turboGP Architecture
 
 > Design the database from the silicon up: pick the cheapest instructions per
 > joule, place data in the memory tier that feeds them, and treat every
@@ -13,7 +13,7 @@ and works down to the hardware:
 Schema → Tables → Columns → Rows → Storage Format → Indexes → Executor
 ```
 
-TensorVault inverts this:
+turboGP inverts this:
 
 ```
 Instruction Sets → Memory Hierarchy → Protocols → Storage Layout → Executor → Schema (last)
@@ -43,7 +43,7 @@ Example kernels (see `src/kernel/`):
 The same operator has different kernels for different tiers because the
 optimal prefetch distance, batch size, and SIMD width depend on the tier's
 latency and bandwidth. A generic vectorized executor picks one kernel and
-runs it regardless of where the data lives — TensorVault picks a different
+runs it regardless of where the data lives — turboGP picks a different
 kernel per tier.
 
 ### 2. Data placement follows the hierarchy, not the schema

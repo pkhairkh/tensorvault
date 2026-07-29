@@ -1,4 +1,4 @@
-//! # TensorVault
+//! # turbogp
 //!
 //! An instruction-first, memory-centric relational database engine.
 //!

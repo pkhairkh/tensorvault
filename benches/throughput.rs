@@ -2,7 +2,7 @@
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use std::sync::Arc;
-use tensorvault::{
+use turbogp::{
     executor::Scheduler,
     kernel::KernelTable,
     memory::{region::Region, tier::MemoryTier},

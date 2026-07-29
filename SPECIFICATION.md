@@ -1,4 +1,4 @@
-# TensorVault Technical Specification
+# turboGP Technical Specification
 
 > **Formal specification of the instruction-first, memory-centric database
 > engine.** This document defines the interfaces, data structures, algorithms,
@@ -31,7 +31,7 @@
 
 ### 1.1 Scope
 
-This specification defines the TensorVault database engine: a tier-aware,
+This specification defines the turboGP database engine: a tier-aware,
 instruction-tuned, schema-fluid relational engine. It covers:
 
 - The on-disk and in-memory storage format

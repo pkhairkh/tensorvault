@@ -9,7 +9,7 @@
 //!
 //! A generic vectorized executor (DuckDB, ClickHouse) picks one
 //! implementation per operator and runs it regardless of where the data
-//! lives. TensorVault picks a *different* kernel for L3-resident data vs
+//! lives. turbogp picks a *different* kernel for L3-resident data vs
 //! CXL-resident data, because the optimal prefetch distance, batch size,
 //! and SIMD width depend on the tier's latency and bandwidth.
 //!

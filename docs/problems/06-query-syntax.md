@@ -14,7 +14,7 @@
 ## Design philosophy
 
 1. **Standard SQL is the baseline.** Every query that runs on Postgres/DuckDB
-   runs on TensorVault with no changes. The extensions are opt-in.
+   runs on turboGP with no changes. The extensions are opt-in.
 
 2. **Every extension has a mathematical guarantee.** `APPROXIMATE WITHIN ε
    CONFIDENCE 1-δ` is backed by Hoeffding's inequality. `TIER L3` is backed

@@ -3,7 +3,7 @@
 **Version:** 1.2
 **Effective Date:** 2026-07-27
 
-Copyright (c) 2025 TensorVault Contributors. All rights reserved.
+Copyright (c) 2025 turboGP Contributors. All rights reserved.
 
 This License governs Use of the Work identified above. By exercising any right to the Work, You accept and agree to be bound by this License.
 

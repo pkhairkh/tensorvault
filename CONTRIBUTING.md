@@ -1,4 +1,4 @@
-# Contributing to TensorVault
+# Contributing to turboGP
 
 ## Getting started
 

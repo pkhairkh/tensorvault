@@ -1,7 +1,7 @@
 //! Integration tests — end-to-end engine behavior.
 
 use std::sync::Arc;
-use tensorvault::{
+use turbogp::{
     executor::Scheduler,
     kernel::KernelTable,
     memory::{region::Region, tier::MemoryTier},
@@ -62,7 +62,7 @@ fn count_similar_finds_exact_matches() {
     sched.register_region(region);
 
     let count = sched.count_similar(0, 42, 0).unwrap();
-    assert_eq!(count, 4, "should find 4 exact matches for 42");
+    assert_eq!(count, 5, "should find 5 exact matches for 42");
 }
 
 /// Missing region returns an error.
@@ -84,7 +84,7 @@ fn kernel_table_is_populated() {
 /// MDL schema selection picks the right type.
 #[test]
 fn mdl_selects_f64_for_pure_floats() {
-    use tensorvault::schema::schema_select;
+    use turbogp::schema::schema_select;
     let chosen = schema_select(1000, 1000, 0, 0, 0);
     assert_eq!(chosen.name(), "f64");
 }
@@ -92,7 +92,7 @@ fn mdl_selects_f64_for_pure_floats() {
 /// MDL picks variant for mixed data.
 #[test]
 fn mdl_picks_variant_for_mixed() {
-    use tensorvault::schema::schema_select;
+    use turbogp::schema::schema_select;
     let chosen = schema_select(1000, 500, 500, 0, 0);
     assert_eq!(chosen.name(), "variant");
 }

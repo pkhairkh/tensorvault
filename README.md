@@ -1,4 +1,4 @@
-# TensorVault
+# turboGP
 
 > An **instruction-first, memory-centric** relational database engine.
 >
@@ -28,7 +28,7 @@ performance afterthought, and pay 1.5–2× energy and latency penalties because
 their inner loops weren't designed around the actual instructions the silicon
 can execute.
 
-TensorVault inverts the design order:
+turboGP inverts the design order:
 
 ```
 Instruction Sets → Memory Hierarchy → Protocols → Storage Layout → Executor → Schema (last)

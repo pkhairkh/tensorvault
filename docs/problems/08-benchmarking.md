@@ -37,7 +37,7 @@ But we should run it anyway to:
 ### Success criteria
 
 - A `benches/tpch/` directory with all 22 TPC-H queries.
-- A benchmark report comparing TensorVault vs DuckDB at SF=1, SF=10, SF=100.
+- A benchmark report comparing turboGP vs DuckDB at SF=1, SF=10, SF=100.
 - Honest documentation of where we lose and why.
 
 ---
@@ -128,7 +128,7 @@ GROUP BY JSON_EXTRACT(payload, '$.region');
 ### Success criteria
 
 - A `benches/tpc_fluid/` directory with 10 queries.
-- TensorVault at 5–10× DuckDB on schema-fluid queries.
+- turboGP at 5–10× DuckDB on schema-fluid queries.
 
 ---
 
@@ -173,7 +173,7 @@ ON a.fingerprint SIMILAR TO b.fingerprint WITHIN HAMMING DISTANCE 10;
 ### Success criteria
 
 - A `benches/similarity/` directory with 3 workloads.
-- TensorVault at 100× DuckDB (which doesn't have native similarity joins).
+- turboGP at 100× DuckDB (which doesn't have native similarity joins).
 
 ---
 
@@ -254,7 +254,7 @@ Report: joules per query, queries per joule, tpmC per watt.
 ### Success criteria
 
 - A `benches/energy/` directory with the energy measurement harness.
-- A report comparing TensorVault vs DuckDB on joules/query.
+- A report comparing turboGP vs DuckDB on joules/query.
 - Target: 3–5× lower energy per query on schema-fluid workloads.
 
 ---

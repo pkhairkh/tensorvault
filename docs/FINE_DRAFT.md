@@ -1,4 +1,4 @@
-# TensorVault: Instruction-First Database Engine — Fine Draft
+# turboGP: Instruction-First Database Engine — Fine Draft
 
 > **The definitive synthesis of the venture: the idea, the architecture, 25
 > accepted design decisions, 99 catalogued problems, measured performance on
@@ -34,7 +34,7 @@
 
 ## 1. Executive Summary
 
-TensorVault is a **research-grade relational database engine** built on a
+turboGP is a **research-grade relational database engine** built on a
 single design inversion: **start from the silicon, not from the schema.**
 
 Every existing database — Postgres, MySQL, DuckDB, ClickHouse — starts from
@@ -44,7 +44,7 @@ the memory hierarchy (L1 through NVMe, 1000× latency gap) as flat DRAM, and
 pay 1.5–2× energy and latency penalties because their inner loops weren't
 designed around the actual silicon.
 
-TensorVault inverts the order:
+turboGP inverts the order:
 
 ```
 Instruction Sets → Memory Hierarchy → Protocols → Storage → Executor → Schema (last)
@@ -104,7 +104,7 @@ can't tune prefetch distance, batch size, or SIMD width per tier.
 
 ### The inversion
 
-TensorVault designs from the silicon up:
+turboGP designs from the silicon up:
 
 1. **Pick the cheapest instructions per joule.** From the energy
    knowledgebase: `VPTERNLOGQ` (0.4 nJ), `VFMADD231PS` (0.6 nJ),
@@ -645,7 +645,7 @@ integration, not the concept.
 **The VPOPCNTDQ similarity join is the signature feature.** No existing
 database has native Hamming-distance SQL on arbitrary column types. At 24.2
 G cells/sec on Zen 5, a 1M-row similarity scan completes in ~40 µs. This
-is the feature that makes TensorVault categorically different from every
+is the feature that makes turboGP categorically different from every
 other database.
 
 ---
