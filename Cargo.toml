@@ -44,6 +44,21 @@ name = "throughput"
 harness = false
 path = "benches/throughput.rs"
 
+[[bench]]
+name = "bench_kernels"
+harness = false
+path = "benches/bench_kernels.rs"
+
+[[bench]]
+name = "bench_tpch"
+harness = false
+path = "benches/bench_tpch.rs"
+
+[[bench]]
+name = "bench_sketches"
+harness = false
+path = "benches/bench_sketches.rs"
+
 [profile.release]
 opt-level = 3
 lto = "fat"
