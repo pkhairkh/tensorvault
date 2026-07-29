@@ -16,7 +16,7 @@
 ```
 docs/
 ├── README.md                  ← documentation index (start here)
-├── ROUGH_DRAFT.md             ← the rough draft (will become fine draft after ADRs settle)
+├── FINE_DRAFT.md              ← THE definitive synthesis (read first)
 ├── adr/                       ← Architecture Decision Records (≥80% confidence)
 │   ├── README.md              ← ADR index with compatibility matrix
 │   ├── OPEN_QUESTIONS.md      ← decisions below 80% confidence
@@ -35,7 +35,7 @@ docs/
 
 ## Reading order for a new contributor
 
-1. **[ROUGH_DRAFT.md](./ROUGH_DRAFT.md)** — the whole venture in one document (rough; will become fine draft after ADRs settle)
+1. **[FINE_DRAFT.md](./FINE_DRAFT.md)** — the definitive synthesis of the venture
 2. **[adr/README.md](./adr/README.md)** — the 22 accepted decisions (≥80% confidence)
 3. **[adr/OPEN_QUESTIONS.md](./adr/OPEN_QUESTIONS.md)** — the 10 undecided questions (<80% confidence)
 4. **[architecture/instruction-first.md](./architecture/instruction-first.md)** — the design philosophy

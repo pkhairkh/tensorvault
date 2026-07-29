@@ -11,8 +11,8 @@
 
 | Document | What it is |
 |----------|-----------|
-| **[docs/adr/](docs/adr/)** | Architecture Decision Records (22 accepted, 10 open) |
-| **[docs/ROUGH_DRAFT.md](docs/ROUGH_DRAFT.md)** | The rough draft (will become fine draft after ADRs settle) |
+| **[docs/FINE_DRAFT.md](docs/FINE_DRAFT.md)** | The definitive synthesis: venture + 25 ADRs + measured performance |
+| **[docs/adr/](docs/adr/)** | 25 accepted ADRs + 7 open questions |
 | **[ARCHITECTURE.md](ARCHITECTURE.md)** | The architecture in 1 page |
 | **[docs/README.md](docs/README.md)** | Documentation index (reading order for new contributors) |
 | **[docs/problems/](docs/problems/)** | Problem catalog: 99 problems with status, math, effort, impact |
