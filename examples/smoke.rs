@@ -24,20 +24,26 @@ fn main() {
     print!("{}", topo.dump());
 
     // 3. Detect CXL.
-    let cxl = CxlCoordinator::new();
+    let mut cxl = CxlCoordinator::new(None);
     println!("CXL available: {}", cxl.is_available());
     if cxl.is_available() {
-        println!("  Single-rack commit latency: ~{} ns", cxl.commit(0));
+        let ts = cxl.commit(0).unwrap();
+        println!("  Single-rack commit timestamp: {}", ts);
+    } else {
+        let ts = cxl.commit(0).unwrap();
+        println!("  Single-rack commit (WAL fallback) timestamp: {}", ts);
     }
     println!();
 
     // 4. Create a Raft coordinator for cross-rack.
-    let raft = RaftCoordinator::new(3, 0);
+    let mut raft = RaftCoordinator::new_as_leader(3, 0, None);
+    let ts = raft.commit(0).unwrap();
     println!(
-        "Raft cluster: {} nodes, quorum {}, commit ~{} ns",
+        "Raft cluster: {} nodes, quorum {}, leader={}, commit ts={}",
         raft.cluster_size,
         raft.quorum(),
-        raft.commit(0)
+        raft.is_leader(),
+        ts,
     );
     println!();
 
