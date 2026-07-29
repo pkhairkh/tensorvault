@@ -49,11 +49,13 @@
 //! `CostModel` defaults (or by constructing a custom one and passing it to
 //! [`estimate_cost`]).
 
+pub mod agm;
 pub mod cardinality;
 pub mod dpccp;
 pub mod kingman;
 pub mod lowerer;
 
+pub use agm::{agm_bound, JoinHypergraph};
 pub use cardinality::CardinalityEstimator;
 pub use dpccp::{dpccp, JoinRelation, JoinTree};
 pub use kingman::KingmanPredictor;

@@ -24,6 +24,7 @@
 pub mod aggregate;
 pub mod cpu;
 pub mod hash;
+pub mod leapfrog;
 pub mod scan;
 pub mod similarity;
 
@@ -64,6 +65,11 @@ pub enum Operator {
     AggregateCountDistinct,
     /// Hamming similarity scan.
     SimilarityHamming,
+    /// Leapfrog triejoin (Veldhuizen 2014): worst-case optimal multiway
+    /// intersection on a sorted key. The scalar kernel runs a 2-way
+    /// leapfrog intersection over two concatenated slices; multi-way joins
+    /// use [`crate::kernel::leapfrog::LeapfrogJoin`] directly.
+    LeapfrogJoin,
 }
 
 /// A single comparison predicate used by `ScanMultiPredicate`.
@@ -193,6 +199,7 @@ impl KernelTable {
         register_hash_kernels(&mut kernels);
         register_aggregate_kernels(&mut kernels);
         register_similarity_kernels(&mut kernels);
+        register_join_kernels(&mut kernels);
 
         Self { kernels: RwLock::new(kernels), detected_cpu }
     }
@@ -352,6 +359,18 @@ fn register_similarity_kernels(
             Arc::new(HammingAvx512),
         );
     }
+}
+
+fn register_join_kernels(
+    kernels: &mut HashMap<(Operator, CpuTarget, MemoryTier), Arc<dyn Kernel>>,
+) {
+    use leapfrog::*;
+    // Scalar leapfrog — works everywhere, runs a 2-way intersection over
+    // two concatenated slices. Multi-way joins use LeapfrogJoin directly.
+    kernels.insert(
+        (Operator::LeapfrogJoin, CpuTarget::Scalar, MemoryTier::L3),
+        Arc::new(LeapfrogScalar),
+    );
 }
 
 #[cfg(test)]
