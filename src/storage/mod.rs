@@ -6,9 +6,11 @@
 //! granularity, unit of migration); tablets are 2 GB (NUMA placement unit).
 
 pub mod page;
+pub mod sstable;
 pub mod tablet;
 pub mod wal;
 
-pub use page::{Page, PageHeader, PAGE_CELLS, PAGE_SIZE};
+pub use page::{Page, PageHeader, HEADER_SIZE, PAGE_CELLS, PAGE_SIZE};
+pub use sstable::{SsTableReader, SsTableWriter};
 pub use tablet::{Tablet, TabletId, REGION_SIZE, TABLET_REGIONS, TABLET_SIZE};
-pub use wal::Wal;
+pub use wal::{detect_zns, Wal, WalReader, WalRecord, WalZone, WalZoneState};
