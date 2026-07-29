@@ -47,17 +47,22 @@ impl Scheduler {
             ))
         })?;
 
-        // Read the region data.
-        let data = region.data.lock().clone();
-        let cell_count = inv.params.cell_count.min(data.len() / 8);
+        // Lock the region's backing once and keep the guard alive across the
+        // kernel call so the underlying pointer remains valid.
+        let data = region.data.lock();
+        let cell_count = inv.params.cell_count.min(data.as_slice().len() / 8);
 
         let mut params = inv.params;
         params.cell_count = cell_count;
 
         // Execute the kernel.
-        // SAFETY: the data vector is valid and has at least cell_count * 8 bytes.
+        // SAFETY: `data` borrows the region's `RegionBacking` for the
+        // duration of the lock; `as_slice().as_ptr()` is valid for
+        // `data.len()` bytes — at least `cell_count * 8`. The output buffer
+        // is a local stack array, valid for 64 bytes.
         let mut output = [0u8; 64];
-        let result = unsafe { kernel.execute(data.as_ptr(), output.as_mut_ptr(), &params) };
+        let result =
+            unsafe { kernel.execute(data.as_slice().as_ptr(), output.as_mut_ptr(), &params) };
 
         Ok(result)
     }

@@ -32,6 +32,8 @@ parking_lot = "0.12"
 raw-cpuid = "11.0"
 # Logging
 tracing = "0.1"
+# libc bindings for mmap/madvise (ADR-009 huge pages)
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3.10"
