@@ -136,7 +136,7 @@ impl Default for KernelParams {
 }
 
 /// Result of a kernel execution.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct KernelResult {
     /// Count of matching cells (for scan / similarity kernels).
     pub count: u64,

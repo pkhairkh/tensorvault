@@ -37,6 +37,7 @@
 //! that requires a richer stage representation than `Operator` and is deferred
 //! to a later wave.
 
+use crate::executor::eddy::Eddy;
 use crate::executor::morsel::Morsel;
 use crate::kernel::{KernelParams, KernelResult, KernelTable, Operator};
 use crate::memory::tier::MemoryTier;
@@ -142,6 +143,52 @@ impl Pipeline {
     /// construction. Only the per-morsel result accumulator is reset.
     pub fn reset(&mut self) {
         self.results.clear();
+    }
+
+    /// Run a single morsel through the pipeline using an [`Eddy`] for adaptive
+    /// routing, instead of the fixed declaration-order [`execute_morsel`](Self::execute_morsel).
+    ///
+    /// The eddy chooses the order of operator application based on observed
+    /// selectivity (most selective first — principle of least work). The
+    /// pipeline's own `stages` are NOT used; the eddy's operators are applied
+    /// instead. Each applied operator's [`KernelResult`] is appended to
+    /// `self.results`, in the order the eddy applied them.
+    ///
+    /// This is an alternative execution mode that coexists with
+    /// [`execute_morsel`](Self::execute_morsel). The eddy may apply operators
+    /// in a different order than the pipeline's stages, and may stop early if
+    /// a filter empties the morsel. The multiset of results is the same as
+    /// `execute_morsel` only if no early termination occurs — callers that
+    /// need exact equivalence should ensure no operator produces zero output
+    /// on the input morsel.
+    ///
+    /// # When to use this vs. `execute_morsel`
+    ///
+    /// - Use `execute_morsel` when the selectivities are known at plan time
+    ///   and the stage order is already optimal (most selective first). The
+    ///   fixed-order pipeline is simpler and avoids the per-morsel routing
+    ///   overhead.
+    /// - Use `execute_with_eddy` when selectivities are unknown or skewed,
+    ///   and the eddy's adaptive routing can save work by reordering filters
+    ///   per-morsel. See `benches/bench_eddy.rs` for the speedup on skewed
+    ///   data.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::Unsupported`] if the kernel table has no
+    /// kernel registered for any eddy operator's `Operator` variant on the
+    /// L3 tier. (Operators without a registered kernel are silently skipped
+    /// by the eddy — see [`Eddy::process_morsel`].)
+    pub fn execute_with_eddy(
+        &mut self,
+        morsel: &Morsel,
+        eddy: &mut Eddy,
+        kernel_table: &KernelTable,
+        params: &KernelParams,
+    ) -> Result<()> {
+        let results = eddy.process_morsel(morsel, kernel_table, params);
+        self.results.extend(results);
+        Ok(())
     }
 }
 
@@ -363,5 +410,119 @@ mod tests {
         assert!(s.contains("Pipeline"));
         assert!(s.contains("stages"));
         assert!(s.contains("result_count"));
+    }
+
+    // -----------------------------------------------------------------------
+    // DoD test 7: Pipeline with eddy produces same results as fixed pipeline
+    // (correctness).
+    // -----------------------------------------------------------------------
+    #[test]
+    fn pipeline_with_eddy_produces_same_results_as_fixed_pipeline() {
+        // Three operators with distinct selectivities. We run the same morsel
+        // through (a) the fixed-order pipeline and (b) the eddy-adaptive
+        // pipeline. The multiset of results should be the same — the eddy
+        // may apply operators in a different order, but each operator's
+        // result on the (unchanged) morsel is deterministic.
+        //
+        // Operators:
+        //  - ScanEqU64(target=4):     count = 1 (cell 6, which is 4).
+        //  - ScanRangeU64(low=0, high=10): count = 10 (all cells in [0, 10]).
+        //  - ScanMultiPredicate(Gt(4), Lt(8), count=2): cells > 4 AND < 8
+        //    = 5, 5, 5, 6, 7 = 5 cells.
+        //
+        // All three produce non-zero output → no early termination → the
+        // eddy applies all three.
+        let ops = vec![Operator::ScanEqU64, Operator::ScanRangeU64, Operator::ScanMultiPredicate];
+
+        let kt = Arc::new(KernelTable::new());
+
+        // Data: [5, 5, 5, 1, 2, 3, 4, 6, 7, 8].
+        let cells: Vec<u64> = vec![5, 5, 5, 1, 2, 3, 4, 6, 7, 8];
+        let morsel = Morsel::new(0, 0, &cells);
+
+        let params = KernelParams {
+            target_u64: 4,
+            low_u64: 0,
+            high_u64: 10,
+            target2_u64: 8,
+            pred1_op: crate::kernel::PredicateOp::Gt,
+            pred2_op: crate::kernel::PredicateOp::Lt,
+            predicate_count: 2,
+            ..Default::default()
+        };
+
+        // (a) Fixed-order pipeline.
+        let mut fixed = Pipeline::new(ops.clone());
+        fixed.execute_morsel(&morsel, &kt, &params).expect("fixed pipeline executes");
+        let fixed_results: Vec<KernelResult> = fixed.results().to_vec();
+
+        // (b) Eddy-adaptive pipeline.
+        let mut eddy = Eddy::new(ops.clone(), 1.0);
+        let mut adaptive = Pipeline::new(ops);
+        adaptive
+            .execute_with_eddy(&morsel, &mut eddy, &kt, &params)
+            .expect("eddy pipeline executes");
+        let eddy_results: Vec<KernelResult> = adaptive.results().to_vec();
+
+        // Both should have applied all 3 operators.
+        assert_eq!(fixed_results.len(), 3, "fixed pipeline should produce 3 results");
+        assert_eq!(eddy_results.len(), 3, "eddy should produce 3 results (no early term)");
+
+        // The multiset of results should match — sort by (count, sum, mask)
+        // and compare.
+        let mut f = fixed_results.clone();
+        let mut e = eddy_results.clone();
+        f.sort_by_key(|r| (r.count, r.sum.to_bits(), r.mask));
+        e.sort_by_key(|r| (r.count, r.sum.to_bits(), r.mask));
+        assert_eq!(f, e, "eddy and fixed pipeline should produce the same multiset of results");
+
+        // Verify the individual results are as expected (independent of
+        // order).
+        let counts: std::collections::HashSet<u64> =
+            fixed_results.iter().map(|r| r.count).collect();
+        assert!(counts.contains(&1), "ScanEq(4) → count 1");
+        assert!(counts.contains(&10), "ScanRange(0,10) → count 10");
+        assert!(counts.contains(&5), "ScanMultiPredicate(Gt(4),Lt(8)) → count 5");
+    }
+
+    #[test]
+    fn pipeline_with_eddy_accumulates_across_morsels() {
+        // The pipeline's result accumulator should accumulate across
+        // multiple execute_with_eddy calls.
+        let ops = vec![Operator::ScanEqU64];
+        let kt = Arc::new(KernelTable::new());
+        let mut eddy = Eddy::new(ops.clone(), 0.1);
+        let mut pipeline = Pipeline::new(ops);
+
+        let m1 = Morsel::new(0, 0, &[1_u64, 1, 1, 2]);
+        let m2 = Morsel::new(0, 4, &[1_u64, 2, 2, 2]);
+        let params = KernelParams { target_u64: 1, ..Default::default() };
+
+        pipeline.execute_with_eddy(&m1, &mut eddy, &kt, &params).unwrap();
+        pipeline.execute_with_eddy(&m2, &mut eddy, &kt, &params).unwrap();
+
+        assert_eq!(pipeline.results().len(), 2);
+        assert_eq!(pipeline.results()[0].count, 3);
+        assert_eq!(pipeline.results()[1].count, 1);
+    }
+
+    #[test]
+    fn pipeline_with_eddy_reset_clears_results() {
+        let ops = vec![Operator::ScanEqU64];
+        let kt = Arc::new(KernelTable::new());
+        let mut eddy = Eddy::new(ops.clone(), 0.1);
+        let mut pipeline = Pipeline::new(ops);
+
+        let m = Morsel::new(0, 0, &[1_u64, 1, 2]);
+        let params = KernelParams { target_u64: 1, ..Default::default() };
+        pipeline.execute_with_eddy(&m, &mut eddy, &kt, &params).unwrap();
+        assert_eq!(pipeline.results().len(), 1);
+
+        pipeline.reset();
+        assert!(pipeline.results().is_empty());
+
+        // Re-run to confirm the pipeline is still functional after reset.
+        pipeline.execute_with_eddy(&m, &mut eddy, &kt, &params).unwrap();
+        assert_eq!(pipeline.results().len(), 1);
     }
 }

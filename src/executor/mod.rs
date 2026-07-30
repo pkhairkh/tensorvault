@@ -18,15 +18,28 @@
 //! (used by `lib.rs`'s public API and existing integration tests), while the
 //! morsel-driven types are the v2 path that downstream waves will wire into
 //! the query planner.
+//!
+//! ## Wave 16: adaptive execution / eddies
+//!
+//! The [`eddy`] submodule implements adaptive tuple routing (Avnur &
+//! Hellerstein, SIGMOD 2000): per-morsel, the eddy picks the next operator
+//! based on observed selectivity (most selective first = principle of least
+//! work). The [`adaptive`] submodule implements runtime plan switching based
+//! on observed vs. estimated cardinality divergence. Both are alternative
+//! execution modes that coexist with the fixed-order [`Pipeline`].
 
+pub mod adaptive;
 pub mod dispatcher;
+pub mod eddy;
 pub mod morsel;
 pub mod pipeline;
 pub mod plan;
 pub mod scheduler;
 pub mod worker;
 
+pub use adaptive::AdaptiveExecutor;
 pub use dispatcher::MorselDispatcher;
+pub use eddy::{Eddy, EddyOperator, DEFAULT_LEARNING_RATE};
 pub use morsel::{Morsel, MORSEL_SIZE};
 pub use pipeline::{Pipeline, PipelineBreaker};
 pub use plan::{KernelInvocation, LogicalPlan, PlanNode};

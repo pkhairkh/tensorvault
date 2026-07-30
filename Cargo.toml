@@ -76,6 +76,11 @@ name = "bench_planner"
 harness = false
 path = "benches/bench_planner.rs"
 
+[[bench]]
+name = "bench_eddy"
+harness = false
+path = "benches/bench_eddy.rs"
+
 [profile.release]
 opt-level = 3
 lto = "fat"
