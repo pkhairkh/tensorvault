@@ -256,6 +256,7 @@ fn single_value(name: &str, value: u64) -> QueryResult {
 }
 
 fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
+    use crate::exec::flat_hash_table::{hash_group_by_flat, AggFunc};
     use std::collections::HashMap;
 
     // Filter rows
@@ -267,7 +268,101 @@ fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
         .map(|name| resolve_col_name(name, table))
         .collect::<Result<Vec<_>>>()?;
 
-    // Group by composite key (using u64 hash for multi-key)
+    // For single-key GROUP BY: use flat hash table (fast path)
+    if group_cols.len() == 1 {
+        let group_col = group_cols[0];
+        let keys: Vec<u64> = indices.iter().map(|&i| table.columns[group_col][i]).collect();
+
+        // Determine aggregate function and value column
+        for item in &query.select {
+            if let SelectItem::Aggregate { func, arg, alias } = item {
+                let name = alias.as_deref().unwrap_or(func.as_str());
+                let func_upper = func.to_uppercase();
+                let (agg_func, values) = match func_upper.as_str() {
+                    "COUNT" => {
+                        if arg == "*" {
+                            (AggFunc::Count, None)
+                        } else {
+                            let col_idx = resolve_col_name(arg, table)?;
+                            let vals: Vec<u64> = indices.iter().map(|&i| table.columns[col_idx][i]).collect();
+                            (AggFunc::Count, Some(vals))
+                        }
+                    }
+                    "SUM" => {
+                        let col_idx = resolve_col_name(arg, table)?;
+                        let vals: Vec<u64> = indices.iter().map(|&i| table.columns[col_idx][i]).collect();
+                        (AggFunc::Sum, Some(vals))
+                    }
+                    "AVG" => {
+                        let col_idx = resolve_col_name(arg, table)?;
+                        let vals: Vec<u64> = indices.iter().map(|&i| table.columns[col_idx][i]).collect();
+                        (AggFunc::Avg, Some(vals))
+                    }
+                    "MIN" => {
+                        let col_idx = resolve_col_name(arg, table)?;
+                        let vals: Vec<u64> = indices.iter().map(|&i| table.columns[col_idx][i]).collect();
+                        (AggFunc::Min, Some(vals))
+                    }
+                    "MAX" => {
+                        let col_idx = resolve_col_name(arg, table)?;
+                        let vals: Vec<u64> = indices.iter().map(|&i| table.columns[col_idx][i]).collect();
+                        (AggFunc::Max, Some(vals))
+                    }
+                    "COUNT_DISTINCT" => {
+                        let col_idx = resolve_col_name(arg, table)?;
+                        let vals: Vec<u64> = indices.iter().map(|&i| table.columns[col_idx][i]).collect();
+                        (AggFunc::CountDistinct, Some(vals))
+                    }
+                    _ => return Err(Error::Other(format!("unsupported agg: {func}"))),
+                };
+
+                let results = hash_group_by_flat(&keys, values.as_deref(), agg_func);
+
+                // Build result columns
+                let mut result_cols: Vec<ResultColumn> = Vec::new();
+                // GROUP BY column
+                let gb_name = &query.group_by[0];
+                let gb_values: Vec<u64> = results.iter().map(|(k, _)| *k).collect();
+                result_cols.push(ResultColumn { name: gb_name.clone(), values: gb_values });
+                // Aggregate column
+                let agg_values: Vec<u64> = results.iter().map(|(_, v)| *v).collect();
+                result_cols.push(ResultColumn { name: name.to_string(), values: agg_values });
+
+                let row_count = results.len();
+                let mut result = QueryResult { columns: result_cols, row_count, elapsed_us: 0 };
+
+                // Apply ORDER BY
+                if !query.order_by.is_empty() {
+                    let (col_name, ascending) = &query.order_by[0];
+                    let col_idx = result.columns.iter().position(|c| c.name == *col_name)
+                        .ok_or_else(|| Error::NotFound(format!("ORDER BY column '{}'", col_name)))?;
+                    let mut idx: Vec<usize> = (0..result.row_count).collect();
+                    idx.sort_by(|&a, &b| {
+                        let va = result.columns[col_idx].values[a];
+                        let vb = result.columns[col_idx].values[b];
+                        if *ascending { va.cmp(&vb) } else { vb.cmp(&va) }
+                    });
+                    let new_cols: Vec<ResultColumn> = result.columns.iter().map(|c| {
+                        let values: Vec<u64> = idx.iter().map(|&i| c.values[i]).collect();
+                        ResultColumn { name: c.name.clone(), values }
+                    }).collect();
+                    result = QueryResult { columns: new_cols, row_count: result.row_count, elapsed_us: result.elapsed_us };
+                }
+
+                // Apply LIMIT
+                if let Some(limit) = query.limit {
+                    if result.row_count > limit {
+                        for col in &mut result.columns { col.values.truncate(limit); }
+                        result.row_count = limit;
+                    }
+                }
+
+                return Ok(result);
+            }
+        }
+    }
+
+    // Multi-key GROUP BY: fall back to HashMap
     let mut groups: HashMap<u64, Vec<usize>> = HashMap::new();
     for &idx in &indices {
         let mut h = 0u64;
@@ -277,13 +372,9 @@ fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
         groups.entry(h).or_default().push(idx);
     }
 
-    // Build result columns
     let mut result_cols: Vec<ResultColumn> = Vec::new();
-
-    // GROUP BY columns
     for (i, col_name) in query.group_by.iter().enumerate() {
         let values: Vec<u64> = groups.keys().map(|h| {
-            // Recover the first value for this group
             if let Some(indices) = groups.get(h) {
                 if let Some(&first_idx) = indices.first() {
                     return table.columns[group_cols[i]][first_idx];
@@ -294,7 +385,6 @@ fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
         result_cols.push(ResultColumn { name: col_name.clone(), values });
     }
 
-    // Aggregate columns
     for item in &query.select {
         if let SelectItem::Aggregate { func, arg, alias } = item {
             let name = alias.as_deref().unwrap_or(func.as_str());
@@ -344,7 +434,6 @@ fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
     let row_count = groups.len();
     let mut result = QueryResult { columns: result_cols, row_count, elapsed_us: 0 };
 
-    // Apply ORDER BY
     if !query.order_by.is_empty() {
         let (col_name, ascending) = &query.order_by[0];
         let col_idx = result.columns.iter().position(|c| c.name == *col_name)
@@ -362,7 +451,6 @@ fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
         result = QueryResult { columns: new_cols, row_count: result.row_count, elapsed_us: result.elapsed_us };
     }
 
-    // Apply LIMIT
     if let Some(limit) = query.limit {
         if result.row_count > limit {
             for col in &mut result.columns { col.values.truncate(limit); }
