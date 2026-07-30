@@ -183,13 +183,17 @@ impl Parser {
     /// consume it and return `true`. Used for non-keyword reserved words
     /// (`LIMIT`, `ASC`, `DESC`).
     fn match_ident(&mut self, name: &str) -> bool {
-        if let Token::Ident(s) = self.peek() {
-            if s.eq_ignore_ascii_case(name) {
+        match self.peek() {
+            Token::Ident(s) if s.eq_ignore_ascii_case(name) => {
                 self.pos += 1;
-                return true;
+                true
             }
+            Token::Keyword(k) if k.eq_ignore_ascii_case(name) => {
+                self.pos += 1;
+                true
+            }
+            _ => false,
         }
-        false
     }
 
     // -----------------------------------------------------------------------
@@ -440,6 +444,20 @@ impl Parser {
                 return Ok(Expr::Binary { left: Box::new(left), op, right: Box::new(right) });
             }
         }
+        // LIKE keyword
+        if self.match_ident("LIKE") {
+            let right = self.parse_additive_expr()?;
+            return Ok(Expr::Binary { left: Box::new(left), op: "LIKE".to_string(), right: Box::new(right) });
+        }
+        // NOT LIKE
+        if self.match_keyword("NOT") {
+            if self.match_ident("LIKE") {
+                let right = self.parse_additive_expr()?;
+                return Ok(Expr::Binary { left: Box::new(left), op: "NOT LIKE".to_string(), right: Box::new(right) });
+            }
+            // NOT could be part of another construct; put it back
+            self.pos -= 1;
+        }
         Ok(left)
     }
 
@@ -492,6 +510,23 @@ impl Parser {
             Token::Hex(h) => {
                 self.next();
                 Ok(Expr::Literal(Value::Hex(h)))
+            }
+            Token::Keyword(kw) => {
+                let kw_upper = kw.to_uppercase();
+                if kw_upper == "DATE" {
+                    self.next();
+                    if let Token::String(s) = self.peek().clone() {
+                        self.next();
+                        if let Ok(d) = crate::types::Date::from_str(&s) {
+                            return Ok(Expr::Literal(Value::Int(d.0 as i64)));
+                        }
+                        return Ok(Expr::Literal(Value::String(s)));
+                    }
+                    return Ok(Expr::Column(kw));
+                }
+                // Other keywords treated as identifiers
+                self.next();
+                Ok(Expr::Column(kw))
             }
             Token::Ident(name) => {
                 self.next();

@@ -589,3 +589,86 @@ mod tests {
         assert!(elapsed.as_millis() < 5, "took {}ms", elapsed.as_millis());
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// Arithmetic expression evaluation (for sum(col * (1 - col2)) etc.)
+// ---------------------------------------------------------------------------
+
+/// Evaluate an arithmetic expression on a single row, returning u64.
+/// Supports: column refs, int literals, +, -, *, /
+fn eval_arith_row(
+    expr: &crate::sql::parser::Expr,
+    columns: &[Vec<u64>],
+    column_names: &[String],
+    row_idx: usize,
+) -> u64 {
+    use crate::sql::parser::{Expr, Value};
+    match expr {
+        Expr::Column(name) => {
+            let col_idx = resolve_col_name(name, &crate::datasource::table::Table {
+                name: String::new(),
+                columns: vec![],
+                column_names: column_names.to_vec(),
+                row_count: 0,
+            }).unwrap_or(0);
+            // Find column by name
+            if let Some(idx) = column_names.iter().position(|n| n == name || n == name.split('.').nth(1).unwrap_or(name)) {
+                return columns[idx][row_idx];
+            }
+            0
+        }
+        Expr::Literal(Value::Int(i)) => *i as u64,
+        Expr::Literal(Value::Float(f)) => f.to_bits(),
+        Expr::Binary { left, op, right } => {
+            let l = eval_arith_row(left, columns, column_names, row_idx);
+            let r = eval_arith_row(right, columns, column_names, row_idx);
+            match op.as_str() {
+                "+" => l.wrapping_add(r),
+                "-" => l.wrapping_sub(r),
+                "*" => l.wrapping_mul(r),
+                "/" => if r == 0 { 0 } else { l / r },
+                _ => 0,
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Sum an arithmetic expression over filtered rows.
+/// For: SELECT sum(col * (1 - col2)) FROM t WHERE ...
+pub fn sum_arithmetic(
+    expr: &crate::sql::parser::Expr,
+    columns: &[Vec<u64>],
+    column_names: &[String],
+    mask: &[bool],
+) -> u64 {
+    let mut sum: u64 = 0;
+    for i in 0..mask.len() {
+        if mask[i] {
+            sum = sum.wrapping_add(eval_arith_row(expr, columns, column_names, i));
+        }
+    }
+    (sum as f64).to_bits()
+}
+
+/// Evaluate CASE WHEN cond THEN val ELSE default END for a single row.
+fn eval_case_row(
+    whens: &[(crate::sql::parser::Expr, crate::sql::parser::Expr)],
+    else_expr: Option<&crate::sql::parser::Expr>,
+    columns: &[Vec<u64>],
+    column_names: &[String],
+    row_idx: usize,
+) -> u64 {
+    for (cond, result) in whens {
+        // Evaluate condition — if the row matches, return the result
+        let cond_val = eval_arith_row(cond, columns, column_names, row_idx);
+        if cond_val != 0 {
+            return eval_arith_row(result, columns, column_names, row_idx);
+        }
+    }
+    if let Some(e) = else_expr {
+        return eval_arith_row(e, columns, column_names, row_idx);
+    }
+    0
+}

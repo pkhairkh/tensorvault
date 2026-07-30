@@ -114,6 +114,26 @@ fn eval_where(
                         ">=" => filter_ge(col, val, mask),
                         _ => {}
                     }
+                } else if op_upper == "LIKE" || op_upper == "NOT LIKE" {
+                    // LIKE: compile pattern, match against u64 values as if they were string hashes
+                    if let (Some(col_idx), Some(pattern_str)) = extract_col_and_string(left, right, column_names) {
+                        // For u64 columns: compare against the hash of the pattern
+                        // This is an approximation — real string matching needs StringColumn
+                        let col = &columns[col_idx];
+                        for i in 0..col.len() {
+                            // Simple wildcard: % matches anything, so if pattern is %, match all
+                            if pattern_str == "%" {
+                                mask[i] = true;
+                            } else {
+                                // Hash the pattern and compare (works for exact match on hashed strings)
+                                let pattern_hash = xxhash_rust::xxh3::xxh3_64(pattern_str.as_bytes());
+                                mask[i] = col[i] == pattern_hash;
+                            }
+                        }
+                        if op_upper == "NOT LIKE" {
+                            for i in 0..mask.len() { mask[i] = !mask[i]; }
+                        }
+                    }
                 }
             }
         }
@@ -323,4 +343,24 @@ mod tests {
         // Should be under 5ms for 1M rows
         assert!(elapsed.as_millis() < 10, "filter_eq took {}ms", elapsed.as_millis());
     }
+}
+
+
+fn extract_col_and_string(
+    left: &crate::sql::parser::Expr,
+    right: &crate::sql::parser::Expr,
+    column_names: &[String],
+) -> (Option<usize>, Option<String>) {
+    use crate::sql::parser::Expr;
+    if let Expr::Column(name) = left {
+        if let Expr::Literal(crate::sql::parser::Value::String(s)) = right {
+            return (resolve_name(name, column_names), Some(s.clone()));
+        }
+    }
+    if let Expr::Column(name) = right {
+        if let Expr::Literal(crate::sql::parser::Value::String(s)) = left {
+            return (resolve_name(name, column_names), Some(s.clone()));
+        }
+    }
+    (None, None)
 }
