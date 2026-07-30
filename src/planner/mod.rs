@@ -28,6 +28,11 @@
 //!   and join-cost tail latency.
 //! - [`dpccp`] — left-deep DPccp join ordering for `n ≤ 15` relations
 //!   (ADR-019).
+//! - [`mcts`] — Monte Carlo Tree Search join ordering for `n > 15`
+//!   relations (ADR-019, Wave 15). Falls back from DPccp when the relation
+//!   count exceeds DPccp's `O(n²·2ⁿ)` budget.
+//! - [`graph_prune`] — connectivity-based pruning for MCTS: cuts the
+//!   branching factor from `n` down to the join-graph frontier degree.
 //! - [`agm`] — Atserias-Grohe-Marx fractional cover bound, the worst-case
 //!   size of a join result and the runtime bound of worst-case optimal join
 //!   algorithms.
@@ -67,20 +72,25 @@ pub mod agm;
 pub mod calibration;
 pub mod cardinality;
 pub mod dpccp;
+pub mod graph_prune;
 pub mod kingman;
 pub mod learned;
 pub mod lowerer;
+pub mod mcts;
 pub mod wcoj;
 
 pub use agm::{agm_bound, JoinHypergraph};
 pub use calibration::CalibrationLoop;
 pub use cardinality::CardinalityEstimator;
 pub use dpccp::{dpccp, JoinRelation, JoinTree};
+pub use graph_prune::GraphPruner;
 pub use kingman::KingmanPredictor;
 pub use learned::{Histogram, LearnedCardinality};
 pub use lowerer::PlanLowerer;
+pub use mcts::MctsJoinOrderer;
 pub use wcoj::{build_wcoj_plan, choose_join_algorithm, JoinAlgorithm, WcojPlan};
 
+use crate::error::Result;
 use crate::executor::plan::{LogicalPlan, PlanNode};
 use crate::kernel::Operator;
 use crate::memory::tier::MemoryTier;
@@ -366,6 +376,44 @@ fn child_cell_count(node: &PlanNode) -> usize {
         PlanNode::Aggregate { child, .. } => child_cell_count(child),
         PlanNode::Join { left, right, .. } => child_cell_count(left) + child_cell_count(right),
         PlanNode::Materialize { child, .. } => child_cell_count(child),
+    }
+}
+
+/// Pick a join order for `relations`, dispatching to DPccp or MCTS based on
+/// the relation count.
+///
+/// - **`n ≤ 15`**: uses [`dpccp`] (optimal, `O(n²·2ⁿ)`).
+/// - **`n > 15`**: uses [`MctsJoinOrderer`] (near-optimal, anytime).
+///
+/// This is the single entry point for join ordering in turboGP — callers do
+/// not need to know which algorithm is appropriate for their query size.
+/// The returned [`JoinTree`] is drop-in compatible with both planners.
+///
+/// # Errors
+///
+/// Propagates errors from the underlying planner:
+///
+/// - [`Error::InvalidArg`] if `relations` is empty.
+/// - [`Error::InvalidArg`] if `relations.len() > 64` (MCTS bitmask width).
+/// - [`Error::InvalidArg`] if the join graph is disconnected.
+///
+/// # Examples
+///
+/// ```
+/// use turbogp::planner::{order_joins, JoinRelation};
+///
+/// let relations = vec![
+///     JoinRelation { name: "A".into(), cardinality: 100, joins_with: vec![1] },
+///     JoinRelation { name: "B".into(), cardinality: 200, joins_with: vec![0] },
+/// ];
+/// let tree = order_joins(&relations).expect("2-table join should succeed");
+/// assert!(tree.cost() > 0.0);
+/// ```
+pub fn order_joins(relations: &[JoinRelation]) -> Result<JoinTree> {
+    if relations.len() <= 15 {
+        dpccp(relations)
+    } else {
+        MctsJoinOrderer::new().order(relations)
     }
 }
 
@@ -660,5 +708,130 @@ mod tests {
         assert_eq!(cm.simd_lanes, cm2.simd_lanes);
         assert!(cm.learned.is_none());
         assert!(cm2.learned.is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // Join-ordering dispatcher (Wave 15)
+    // -------------------------------------------------------------------------
+
+    /// `order_joins` for `n ≤ 15` uses DPccp: the cost matches
+    /// [`dpccp::dpccp`] exactly.
+    /// DoD: order_joins n≤15 uses DPccp, n>15 uses MCTS.
+    #[test]
+    fn order_joins_uses_dpccp_for_small_n() {
+        let relations = vec![
+            JoinRelation { name: "A".into(), cardinality: 100, joins_with: vec![1] },
+            JoinRelation { name: "B".into(), cardinality: 200, joins_with: vec![0, 2] },
+            JoinRelation { name: "C".into(), cardinality: 150, joins_with: vec![1, 3] },
+            JoinRelation { name: "D".into(), cardinality: 50, joins_with: vec![2, 4] },
+            JoinRelation { name: "E".into(), cardinality: 300, joins_with: vec![3] },
+        ];
+        let dispatcher_plan = order_joins(&relations).expect("order_joins n=5 should succeed");
+        let dpccp_plan = dpccp(&relations).expect("dpccp n=5 should succeed");
+        // For n ≤ 15, order_joins delegates to dpccp — same plan, same cost.
+        assert!(
+            (dispatcher_plan.cost() - dpccp_plan.cost()).abs() < 1e-9,
+            "order_joins cost {} should equal dpccp cost {} for n=5",
+            dispatcher_plan.cost(),
+            dpccp_plan.cost()
+        );
+    }
+
+    /// `order_joins` for `n > 15` uses MCTS: the call succeeds (DPccp
+    /// alone would error out for `n = 20`).
+    /// DoD: order_joins n≤15 uses DPccp, n>15 uses MCTS.
+    #[test]
+    fn order_joins_uses_mcts_for_large_n() {
+        // 20-relation chain: DPccp rejects, MCTS handles it.
+        let relations: Vec<JoinRelation> = (0..20)
+            .map(|i| JoinRelation {
+                name: format!("R{i}"),
+                cardinality: 100,
+                joins_with: {
+                    let mut v = Vec::new();
+                    if i > 0 {
+                        v.push(i - 1);
+                    }
+                    if i + 1 < 20 {
+                        v.push(i + 1);
+                    }
+                    v
+                },
+            })
+            .collect();
+        // Sanity check: DPccp alone rejects this.
+        assert!(dpccp(&relations).is_err(), "DPccp should reject n=20");
+        // The dispatcher succeeds by falling back to MCTS.
+        let plan = order_joins(&relations).expect("order_joins n=20 should succeed via MCTS");
+        // The plan should cover all 20 relations and have positive cost.
+        assert!(plan.cost() > 0.0, "MCTS plan cost should be positive");
+        // Count relations via the JoinTree (recursive walk).
+        fn count_tree(t: &JoinTree) -> usize {
+            match t {
+                JoinTree::Leaf(_) => 1,
+                JoinTree::Inner { left, right, .. } => count_tree(left) + count_tree(right),
+            }
+        }
+        assert_eq!(count_tree(&plan), 20, "plan should contain all 20 relations");
+    }
+
+    /// `order_joins` for `n = 15` (the DPccp boundary) still uses DPccp.
+    #[test]
+    fn order_joins_at_dpccp_boundary_uses_dpccp() {
+        let relations: Vec<JoinRelation> = (0..15)
+            .map(|i| JoinRelation {
+                name: format!("R{i}"),
+                cardinality: 100,
+                joins_with: {
+                    let mut v = Vec::new();
+                    if i > 0 {
+                        v.push(i - 1);
+                    }
+                    if i + 1 < 15 {
+                        v.push(i + 1);
+                    }
+                    v
+                },
+            })
+            .collect();
+        let dispatcher_plan =
+            order_joins(&relations).expect("order_joins n=15 should succeed via DPccp");
+        let dpccp_plan = dpccp(&relations).expect("dpccp n=15 should succeed");
+        assert!(
+            (dispatcher_plan.cost() - dpccp_plan.cost()).abs() < 1e-9,
+            "order_joins cost {} should equal dpccp cost {} at n=15 boundary",
+            dispatcher_plan.cost(),
+            dpccp_plan.cost()
+        );
+    }
+
+    /// `order_joins` for `n = 16` (just past the DPccp boundary) uses MCTS.
+    #[test]
+    fn order_joins_just_past_dpccp_boundary_uses_mcts() {
+        let relations: Vec<JoinRelation> = (0..16)
+            .map(|i| JoinRelation {
+                name: format!("R{i}"),
+                cardinality: 100,
+                joins_with: {
+                    let mut v = Vec::new();
+                    if i > 0 {
+                        v.push(i - 1);
+                    }
+                    if i + 1 < 16 {
+                        v.push(i + 1);
+                    }
+                    v
+                },
+            })
+            .collect();
+        assert!(dpccp(&relations).is_err(), "DPccp should reject n=16");
+        let plan = order_joins(&relations).expect("order_joins n=16 should succeed via MCTS");
+        assert!(plan.cost() > 0.0, "MCTS plan cost should be positive");
+    }
+
+    /// `order_joins` rejects an empty input.
+    #[test]
+    fn order_joins_rejects_empty_input() {
+        assert!(order_joins(&[]).is_err(), "order_joins should reject empty input");
     }
 }

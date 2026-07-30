@@ -34,6 +34,8 @@ raw-cpuid = "11.0"
 tracing = "0.1"
 # libc bindings for mmap/madvise (ADR-009 huge pages)
 libc = "0.2"
+# PRNG for MCTS join ordering (ADR-019 Wave 15)
+rand = "0.9"
 
 [dev-dependencies]
 tempfile = "3.10"
@@ -68,6 +70,11 @@ path = "benches/bench_wcoj.rs"
 name = "bench_cardinality"
 harness = false
 path = "benches/bench_cardinality.rs"
+
+[[bench]]
+name = "bench_planner"
+harness = false
+path = "benches/bench_planner.rs"
 
 [profile.release]
 opt-level = 3
