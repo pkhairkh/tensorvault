@@ -39,6 +39,9 @@ arrow = "55"
 libc = "0.2"
 # PRNG for MCTS join ordering (ADR-019 Wave 15)
 rand = "0.9"
+time = { version = "0.3", features = ["parsing", "formatting", "macros"] }
+regex = "1.10"
+rust_decimal = "1.36"
 
 [dev-dependencies]
 tempfile = "3.10"

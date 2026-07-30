@@ -27,10 +27,16 @@
 //! [`MemoryTier::Cxl`]: crate::memory::tier::MemoryTier::Cxl
 
 pub mod cxl_ref;
+pub mod datetime;
+pub mod null;
 pub mod raft_ref;
+pub mod string_col;
 
 #[cfg(test)]
 mod tests;
 
 pub use cxl_ref::CxlRef;
+pub use datetime::{Date, Interval, Time, Timestamp};
+pub use null::{NullBitmap, TriBool};
 pub use raft_ref::RaftRef;
+pub use string_col::{StringColumn, StringHeap};
