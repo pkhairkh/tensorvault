@@ -49,6 +49,11 @@ pub fn execute_select(
         return result;
     }
 
+    // JOIN support: materialize joined table, then dispatch on it.
+    if !query.joins.is_empty() {
+        return execute_with_join(query, extensions, catalog, kernel_table);
+    }
+
     // 2. Parse the WHERE clause
     let filter = parse_where(&query.where_clause, table)?;
 
@@ -717,4 +722,60 @@ fn filter_indices(where_clause: &WhereClause, table: &Table) -> Vec<usize> {
         return indices;
     }
     filter_indices_old(where_clause, table)
+}
+
+
+// ---------------------------------------------------------------------------
+// JOIN execution — materialize joined table, then dispatch.
+// ---------------------------------------------------------------------------
+
+fn execute_with_join(
+    query: &crate::sql::parser::SelectQuery,
+    _extensions: &crate::sql::extensions::QueryExtensions,
+    catalog: &crate::catalog::Catalog,
+    _kernel_table: &crate::kernel::KernelTable,
+) -> Result<QueryResult> {
+    use crate::exec::join::{hash_join, extract_join_keys, JoinType};
+
+    let base = catalog
+        .get(&query.from)
+        .ok_or_else(|| Error::NotFound(format!("table '{}'", query.from)))?;
+
+    let mut running = base.clone();
+
+    for join in &query.joins {
+        let right = catalog
+            .get(&join.table)
+            .ok_or_else(|| Error::NotFound(format!("table '{}'", join.table)))?;
+
+        let keys = extract_join_keys(&join.on, &running, right)?;
+        let result = hash_join(&running, right, &keys, JoinType::Inner)?;
+        running = result.into_table(&format!("__join_{}", join.table));
+    }
+
+    // Build a modified query without JOINs and dispatch on the joined table.
+    let mut modified = query.clone();
+    modified.joins.clear();
+    if let Some(result) = dispatch::execute_dispatched(&modified, &running) {
+        return result;
+    }
+
+    // Fallback to old executor path
+    let filter = parse_where(&modified.where_clause, &running)?;
+    let tier = crate::memory::tier::MemoryTier::L3;
+    if !modified.group_by.is_empty() {
+        execute_group_by(&modified, &filter, &running, tier, _kernel_table)
+    } else if modified.select.len() == 1 {
+        match &modified.select[0] {
+            crate::sql::parser::SelectItem::Aggregate { func, arg, alias } => {
+                execute_aggregate(func, arg, alias.as_deref(), &filter, &running, tier, _kernel_table)
+            }
+            crate::sql::parser::SelectItem::Star => execute_select_star(&filter, &running, modified.limit),
+            crate::sql::parser::SelectItem::Column(name) => {
+                execute_select_column(name, &filter, &running, modified.limit)
+            }
+        }
+    } else {
+        execute_select_multi(&modified.select, &filter, &running, &modified.order_by, modified.limit)
+    }
 }

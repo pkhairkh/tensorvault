@@ -32,6 +32,8 @@ pub struct SelectQuery {
     pub select: Vec<SelectItem>,
     /// The source table name.
     pub from: String,
+    /// Optional JOIN clauses.
+    pub joins: Vec<JoinClause>,
     /// Optional WHERE predicate.
     pub where_clause: Option<Expr>,
     /// GROUP BY column list (empty if no GROUP BY).
@@ -40,6 +42,15 @@ pub struct SelectQuery {
     pub order_by: Vec<(String, bool)>,
     /// Optional LIMIT row count.
     pub limit: Option<usize>,
+}
+
+/// A parsed JOIN clause.
+#[derive(Debug, Clone)]
+pub struct JoinClause {
+    /// The table to join.
+    pub table: String,
+    /// The join condition (ON clause).
+    pub on: Expr,
 }
 
 /// One item in the SELECT list.
@@ -191,6 +202,9 @@ impl Parser {
         self.expect_keyword("FROM")?;
         let from = self.parse_table_name()?;
 
+        // Parse optional JOIN clauses
+        let joins = self.parse_joins()?;
+
         let where_clause =
             if self.match_keyword("WHERE") { Some(self.parse_expr()?) } else { None };
 
@@ -210,7 +224,30 @@ impl Parser {
 
         let limit = if self.match_ident("LIMIT") { Some(self.parse_usize()?) } else { None };
 
-        Ok(SelectQuery { select, from, where_clause, group_by, order_by, limit })
+        Ok(SelectQuery { select, from, joins, where_clause, group_by, order_by, limit })
+    }
+
+    /// Parse zero or more JOIN clauses.
+    fn parse_joins(&mut self) -> Result<Vec<JoinClause>, String> {
+        let mut joins = Vec::new();
+        loop {
+            if self.match_keyword("JOIN") || (self.match_keyword("INNER") && self.expect_keyword("JOIN").is_ok()) {
+                let table = self.parse_table_name()?;
+                self.expect_keyword("ON")?;
+                let on = self.parse_expr()?;
+                joins.push(JoinClause { table, on });
+            } else if self.match_keyword("LEFT") {
+                let _ = self.match_keyword("OUTER");
+                self.expect_keyword("JOIN")?;
+                let table = self.parse_table_name()?;
+                self.expect_keyword("ON")?;
+                let on = self.parse_expr()?;
+                joins.push(JoinClause { table, on });
+            } else {
+                break;
+            }
+        }
+        Ok(joins)
     }
 
     fn parse_select_list(&mut self) -> Result<Vec<SelectItem>, String> {
