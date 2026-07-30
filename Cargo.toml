@@ -49,6 +49,10 @@ criterion = { version = "0.5", features = ["html_reports"] }
 # In-process DuckDB for benchmark baseline (Wave 2). `bundled` compiles libduckdb
 # statically so no system libduckdb is required.
 duckdb = { version = "1.1", features = ["bundled"] }
+# In-process ClickHouse for benchmark baseline (Wave 3). Native TCP client to a
+# running clickhouse-server — no CLI subprocess overhead.
+clickhouse = { version = "0.15", features = ["rustls-tls"] }
+tokio = { version = "1", features = ["full"] }
 
 [[bench]]
 name = "throughput"
