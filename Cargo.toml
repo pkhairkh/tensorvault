@@ -86,6 +86,11 @@ name = "bench_tensor"
 harness = false
 path = "benches/bench_tensor.rs"
 
+[[bench]]
+name = "bench_3x_proof"
+harness = false
+path = "benches/bench_3x_proof.rs"
+
 [profile.release]
 opt-level = 3
 lto = "fat"

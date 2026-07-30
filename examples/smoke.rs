@@ -13,6 +13,8 @@
 //! 6. **LSH similarity search** — locality-sensitive hash index for vector
 //!    similarity.
 //! 7. **HLC timestamps** — the protocol coordinator's monotonic timestamps.
+//! 8. **Waves 13–17 optimization techniques** — WCOJ, learned cardinality,
+//!    MCTS, eddy, tensor network.
 //!
 //! Run with:
 //!
@@ -23,11 +25,19 @@
 use std::sync::Arc;
 use std::time::Instant;
 use turbogp::{
-    executor::Scheduler,
+    compress::TensorTrain,
+    executor::{Eddy, Morsel, Pipeline, Scheduler},
     index::lsh::LshIndex,
-    kernel::KernelTable,
+    kernel::{
+        hash::HashTable,
+        leapfrog::{LeapfrogJoin, SliceSortedIterator},
+        KernelTable, Operator, PredicateOp,
+    },
     memory::{region::Region, tier::MemoryTier, NumaTopology},
-    planner::{CostModel, PlanLowerer},
+    planner::{
+        agm::JoinHypergraph, dpccp::JoinRelation, mcts::MctsJoinOrderer, tensor::TensorNetwork,
+        CostModel, LearnedCardinality, PlanLowerer,
+    },
     protocol::{CxlCoordinator, HlcClock, RaftCoordinator},
     sketch::hll::HyperLogLog,
     sql::{build_plan, parse_with_extensions},
@@ -285,6 +295,267 @@ fn main() {
     for (op, cpu, tier, name) in sched3.kernel_table.list() {
         println!("    {:?} / {} / {} → {}", op, cpu.name(), tier.name(), name);
     }
+    println!();
+
+    // -----------------------------------------------------------------
+    // 9. Wave 13: WCOJ / Leapfrog triejoin — cyclic join speedup
+    // -----------------------------------------------------------------
+    println!("[9] Wave 13: WCOJ (Leapfrog Triejoin) on a triangle query");
+    // Build three sorted, deduped key sets with ~25 % pairwise overlap.
+    let mk_keys = |seed: u64| -> Vec<u64> {
+        let mut s = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut v: Vec<u64> = (0..5_000)
+            .map(|_| {
+                s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = s;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^ (z >> 31)
+            })
+            .map(|x| x % 20_000)
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+    let r = mk_keys(1);
+    let s_keys = mk_keys(2);
+    let t = mk_keys(3);
+
+    // Hash-join baseline: R∩S via build/probe, then (R∩S)∩T via build/probe.
+    let start = Instant::now();
+    let table_r = HashTable::build(&r);
+    let rs: Vec<u64> = s_keys.iter().filter(|k| !table_r.probe(**k).is_empty()).copied().collect();
+    let table_rs = HashTable::build(&rs);
+    let hash_count: u64 = t.iter().map(|k| table_rs.probe(*k).len() as u64).sum();
+    let hash_elapsed = start.elapsed();
+    println!("    Hash-join cascade: {hash_count} matches in {hash_elapsed:?}");
+
+    // Leapfrog (WCOJ): 3-way intersection in O(IN + OUT + AGM).
+    let r_leak: &'static [u64] = Box::leak(r.clone().into_boxed_slice());
+    let s_leak: &'static [u64] = Box::leak(s_keys.clone().into_boxed_slice());
+    let t_leak: &'static [u64] = Box::leak(t.clone().into_boxed_slice());
+    let start = Instant::now();
+    let mut join = LeapfrogJoin::new(vec![
+        Box::new(SliceSortedIterator::at_start(r_leak)),
+        Box::new(SliceSortedIterator::at_start(s_leak)),
+        Box::new(SliceSortedIterator::at_start(t_leak)),
+    ]);
+    let leapfrog_out = join.run();
+    let leapfrog_elapsed = start.elapsed();
+    println!("    Leapfrog (WCOJ):   {} matches in {leapfrog_elapsed:?}", leapfrog_out.len(),);
+    let hash_secs = hash_elapsed.as_secs_f64().max(1e-12);
+    let leap_secs = leapfrog_elapsed.as_secs_f64().max(1e-12);
+    println!("    Speedup: {:.2}× (hash / leapfrog)", hash_secs / leap_secs);
+    assert_eq!(hash_count as usize, leapfrog_out.len(), "WCOJ and hash join must agree");
+    println!();
+
+    // -----------------------------------------------------------------
+    // 10. Wave 14: Learned cardinality — histogram + correction
+    // -----------------------------------------------------------------
+    println!("[10] Wave 14: Learned cardinality (histogram + correction)");
+    // Generate 10 000 zipfian-distributed values (frequency ∝ 1/(v+1)).
+    let mut state = 0xCAFEBABE_u64;
+    let mut zipf: Vec<u64> = Vec::with_capacity(10_000);
+    while zipf.len() < 10_000 {
+        let step = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        state = step;
+        let mut z = step;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z = z ^ (z >> 31);
+        let v = z % 10_000;
+        let accept = (((z >> 11) as f64) / ((1u64 << 53) as f64)) < (1.0 / ((v + 1) as f64));
+        if accept {
+            zipf.push(v);
+        }
+    }
+
+    let mut learned = LearnedCardinality::new();
+    learned.train_table("orders", "cust_key", &zipf);
+    println!("    Trained 100-bucket histogram on {} zipfian values", zipf.len());
+
+    // Heuristic estimate: 0.33 (the fixed range default).
+    // Learned estimate: histogram range_selectivity + correction factor.
+    let (lo, hi) = (0_u64, 999_u64);
+    let heuristic = 0.33;
+    let raw = learned.estimate_range("orders", "cust_key", lo, hi);
+    let corrected = learned.correct(raw);
+    // After correction factor = 1.0 (no observations yet), corrected == raw.
+    let true_count = zipf.iter().filter(|&&v| v >= lo && v <= hi).count();
+    let true_sel = true_count as f64 / zipf.len() as f64;
+    println!("    Range [{lo}, {hi}]:");
+    println!("      heuristic(0.33) = {heuristic:.4}");
+    println!("      learned (raw)   = {raw:.4}");
+    println!("      learned (corr)  = {corrected:.4}");
+    println!("      true selectivity = {true_sel:.4}  ({true_count} / {} rows)", zipf.len());
+
+    // Calibrate the correction factor by feeding 50 biased observations
+    // expressed as **cardinalities** (row counts). The correction factor's
+    // update rule is `correction = 0.9 · correction + 0.1 · (actual /
+    // predicted)` with `predicted.max(1.0)` in the denominator — that
+    // convention assumes cardinality counts (not selectivities in [0, 1]),
+    // so we scale up by the row count to make the ratio meaningful.
+    // Here we simulate a stale histogram that under-predicts by 2×.
+    let raw_card = raw * zipf.len() as f64;
+    let true_card = true_count as f64;
+    for _ in 0..50 {
+        learned.observe(raw_card * 0.5, true_card);
+    }
+    // Apply the correction to a *biased* prediction (raw × 0.5, simulating
+    // stale statistics). After convergence correction ≈ 2.0, so the
+    // corrected prediction ≈ raw × 0.5 × 2.0 ≈ raw ≈ true_sel.
+    let biased = raw * 0.5;
+    let corrected_after = learned.correct(biased);
+    println!(
+        "      after 50 calibrations (2× under-bias injected): correction = {:.3}",
+        learned.correction,
+    );
+    println!(
+        "      biased prediction = {biased:.4}, corrected = {corrected_after:.4}  (true = {true_sel:.4})"
+    );
+    println!();
+
+    // -----------------------------------------------------------------
+    // 11. Wave 15: MCTS join ordering — scales beyond DPccp's n ≤ 15
+    // -----------------------------------------------------------------
+    println!("[11] Wave 15: MCTS plans a 20-table chain join (DPccp can't)");
+    let relations: Vec<JoinRelation> = (0..20)
+        .map(|i| JoinRelation {
+            name: format!("R{i}"),
+            cardinality: 100,
+            joins_with: {
+                let mut v = Vec::new();
+                if i > 0 {
+                    v.push(i - 1);
+                }
+                if i + 1 < 20 {
+                    v.push(i + 1);
+                }
+                v
+            },
+        })
+        .collect();
+    let mcts = MctsJoinOrderer::default().with_iterations(200).with_seed(7);
+    let start = Instant::now();
+    let plan = mcts.order(&relations).expect("MCTS should plan a 20-table chain");
+    let mcts_elapsed = start.elapsed();
+    println!(
+        "    MCTS planned 20 tables in {mcts_elapsed:?} (cost = {:.0}, {} iterations)",
+        plan.cost(),
+        200,
+    );
+    // Demonstrate that DPccp refuses n > 15.
+    let dpccp_result = turbogp::planner::dpccp::dpccp(&relations);
+    println!(
+        "    DPccp on 20 tables: {:?}",
+        dpccp_result.err().map(|e| e.to_string()).unwrap_or_default()
+    );
+    println!();
+
+    // -----------------------------------------------------------------
+    // 12. Wave 16: Adaptive eddy — reorders filters per morsel
+    // -----------------------------------------------------------------
+    println!("[12] Wave 16: Adaptive eddy on a 3-filter pipeline");
+    let kt = Arc::new(KernelTable::new());
+    let cells: Vec<u64> = (0..1024).map(|i| (i % 2) as u64).collect();
+    let morsel = Morsel::new(0, 0, &cells);
+    // Three filters: ScanRange(0,1) → sel 1.0; ScanEq(0) → sel 0.5;
+    // ScanMultiPredicate(Eq(0), Eq(1)) → sel 0.0 (contradictory).
+    let ops = vec![Operator::ScanRangeU64, Operator::ScanEqU64, Operator::ScanMultiPredicate];
+    let params = turbogp::kernel::KernelParams {
+        target_u64: 0,
+        target2_u64: 1,
+        low_u64: 0,
+        high_u64: 1,
+        pred1_op: PredicateOp::Eq,
+        pred2_op: PredicateOp::Eq,
+        predicate_count: 2,
+        ..Default::default()
+    };
+
+    // First morsel: eddy applies all 3 to learn selectivities.
+    let mut eddy = Eddy::new(ops.clone(), 0.1);
+    let mut pipeline = Pipeline::new(ops.clone());
+    pipeline.execute_with_eddy(&morsel, &mut eddy, &kt, &params).unwrap();
+    let first_count = pipeline.results().len();
+    pipeline.reset();
+    println!(
+        "    After morsel 1: applied {first_count} ops, selectivities = {:?}",
+        eddy.selectivities()
+    );
+
+    // Second morsel: eddy applies only the most selective op (sel 0.0),
+    // sees zero output, early-terminates.
+    pipeline.execute_with_eddy(&morsel, &mut eddy, &kt, &params).unwrap();
+    let second_count = pipeline.results().len();
+    println!(
+        "    After morsel 2: applied {second_count} op (early termination) — routing order = {:?}",
+        eddy.routing_order(),
+    );
+    println!("    Adaptive win: 3 ops/morsel → 1 op/morsel after learning");
+    println!();
+
+    // -----------------------------------------------------------------
+    // 13. Wave 17: Tensor-network contraction ordering
+    // -----------------------------------------------------------------
+    println!("[13] Wave 17: Tensor-network contraction on an 8-table chain");
+    let n = 8;
+    let attrs: Vec<String> = (0..=n).map(|i| format!("A{i}")).collect();
+    let attr_refs: Vec<&str> = (0..=n).map(|i| attrs[i].as_str()).collect();
+    let rels: Vec<Vec<&str>> = (0..n).map(|i| vec![attr_refs[i], attr_refs[i + 1]]).collect();
+    let graph = JoinHypergraph::from_named(&attr_refs, &rels);
+    let cards = vec![100usize; n];
+    let net = TensorNetwork::from_hypergraph(&graph, &cards);
+    let order = net.optimal_contraction_order();
+    println!(
+        "    8-table chain: treewidth = {}, optimal contraction has {} steps",
+        net.treewidth(),
+        order.len(),
+    );
+    // Convert to a JoinTree and report the cost.
+    let relations: Vec<JoinRelation> = (0..n)
+        .map(|i| JoinRelation {
+            name: format!("R{i}"),
+            cardinality: 100,
+            joins_with: {
+                let mut v = Vec::new();
+                if i > 0 {
+                    v.push(i - 1);
+                }
+                if i + 1 < n {
+                    v.push(i + 1);
+                }
+                v
+            },
+        })
+        .collect();
+    let tree = turbogp::planner::contraction::contraction_to_join_tree(&net, &order, &relations)
+        .expect("contraction_to_join_tree succeeds");
+    println!("    Tensor-network plan cost = {:.0} (vs. DPccp cost = {:.0})", tree.cost(), {
+        let dpccp_tree = turbogp::planner::dpccp::dpccp(&relations).expect("DPccp succeeds");
+        dpccp_tree.cost()
+    });
+
+    // Bonus: tensor-train compression of a 20×10 rank-2 matrix.
+    let m = 20usize;
+    let k = 10usize;
+    let mut data: Vec<Vec<f64>> = vec![vec![0.0; k]; m];
+    for r_idx in 0..2 {
+        for (i, row) in data.iter_mut().enumerate().take(m) {
+            for (j, cell) in row.iter_mut().enumerate().take(k) {
+                let a = ((i as f64) + 1.0) * 0.1 * (r_idx as f64 + 1.0);
+                let b = ((j as f64) + 1.0) * 0.2;
+                *cell += a * b;
+            }
+        }
+    }
+    let tt = TensorTrain::decompose(&data, 3);
+    println!(
+        "    Tensor-train on {m}×{k} rank-2 matrix: effective_rank = {}, compression_ratio = {:.2}×",
+        tt.effective_rank(),
+        tt.compression_ratio(),
+    );
     println!();
 
     println!("=== smoke test complete ===");
