@@ -183,11 +183,13 @@ fn collect_keys(
                 return Ok(());
             }
             if op == "=" {
+                // Try: left expr in left table, right expr in right table
                 if let (Some(lk), Some(rk)) = (resolve_col(l, left), resolve_col(r, right)) {
                     keys.push(JoinKey { left: lk, right: rk });
                     return Ok(());
                 }
-                if let (Some(lk), Some(rk)) = (resolve_col(r, left), resolve_col(l, right)) {
+                // Try: left expr in right table, right expr in left table (swapped)
+                if let (Some(rk), Some(lk)) = (resolve_col(l, right), resolve_col(r, left)) {
                     keys.push(JoinKey { left: lk, right: rk });
                     return Ok(());
                 }
@@ -200,9 +202,24 @@ fn collect_keys(
 
 fn resolve_col(expr: &crate::sql::parser::Expr, table: &Table) -> Option<usize> {
     if let crate::sql::parser::Expr::Column(name) = expr {
+        // Direct match
         if let Some(idx) = table.column_idx(name) { return Some(idx); }
+        // Try stripping table prefix from query: l_orderkey -> look for lineitem.l_orderkey
         if let Some(bare) = name.split('.').nth(1) {
             if let Some(idx) = table.column_idx(bare) { return Some(idx); }
+        }
+        // Try matching bare name against qualified column names in the table
+        // e.g., name="l_orderkey", table has "lineitem.l_orderkey"
+        for (i, col_name) in table.column_names.iter().enumerate() {
+            if col_name.ends_with(&format!(".{}", name)) {
+                return Some(i);
+            }
+            // Also check if the bare part matches
+            if let Some(bare_col) = col_name.split('.').nth(1) {
+                if bare_col == name {
+                    return Some(i);
+                }
+            }
         }
     }
     None

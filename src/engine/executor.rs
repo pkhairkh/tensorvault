@@ -44,14 +44,14 @@ pub fn execute_select(
         .get(&query.from)
         .ok_or_else(|| Error::NotFound(format!("table '{}'", query.from)))?;
 
-    // Try kernel-direct dispatch first (10-30x faster than per-row evaluation).
-    if let Some(result) = dispatch::execute_dispatched(query, table) {
-        return result;
-    }
-
     // JOIN support: materialize joined table, then dispatch on it.
     if !query.joins.is_empty() {
         return execute_with_join(query, extensions, catalog, kernel_table);
+    }
+
+    // Try kernel-direct dispatch first (10-30x faster than per-row evaluation).
+    if let Some(result) = dispatch::execute_dispatched(query, table) {
+        return result;
     }
 
     // 2. Parse the WHERE clause
@@ -750,7 +750,23 @@ fn execute_with_join(
 
         let keys = extract_join_keys(&join.on, &running, right)?;
         let result = hash_join(&running, right, &keys, JoinType::Inner)?;
-        running = result.into_table(&format!("__join_{}", join.table));
+        let mut new_table = result.into_table(&format!("__join_{}", join.table));
+        // Rename columns from the right table to be qualified (table.col)
+        // so they can be resolved by qualified names like l_orderkey
+        let left_col_count = running.columns.len();
+        for i in left_col_count..new_table.column_names.len() {
+            let right_idx = i - left_col_count;
+            if let Some(right_name) = right.column_names.get(right_idx) {
+                new_table.column_names[i] = format!("{}.{}", join.table, right_name);
+            }
+        }
+        // Also prefix left columns with their source table
+        for i in 0..left_col_count {
+            if !new_table.column_names[i].contains('.') {
+                new_table.column_names[i] = format!("{}.{}", query.from, new_table.column_names[i]);
+            }
+        }
+        running = new_table;
     }
 
     // Build a modified query without JOINs and dispatch on the joined table.

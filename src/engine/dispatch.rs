@@ -238,11 +238,20 @@ fn resolve_col_name(name: &str, table: &Table) -> Result<usize> {
     if let Some(idx) = table.column_idx(name) {
         return Ok(idx);
     }
-    // Try stripping table prefix
+    // Try stripping table prefix from the query name (e.g. orders.o_orderkey -> o_orderkey)
     if let Some(bare) = name.split('.').nth(1) {
         if let Some(idx) = table.column_idx(bare) {
             return Ok(idx);
         }
+    }
+    // Try matching bare name against qualified column names in the table
+    // e.g. name="l_orderkey", table has "lineitem.l_orderkey"
+    for (i, col_name) in table.column_names.iter().enumerate() {
+        if col_name == name { return Ok(i); }
+        if let Some(bare_col) = col_name.split('.').nth(1) {
+            if bare_col == name { return Ok(i); }
+        }
+        if col_name.ends_with(&format!(".{}", name)) { return Ok(i); }
     }
     Err(Error::NotFound(format!("column '{}'", name)))
 }
