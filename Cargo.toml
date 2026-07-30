@@ -46,6 +46,9 @@ rust_decimal = "1.36"
 [dev-dependencies]
 tempfile = "3.10"
 criterion = { version = "0.5", features = ["html_reports"] }
+# In-process DuckDB for benchmark baseline (Wave 2). `bundled` compiles libduckdb
+# statically so no system libduckdb is required.
+duckdb = { version = "1.1", features = ["bundled"] }
 
 [[bench]]
 name = "throughput"
@@ -97,6 +100,11 @@ name = "bench_3x_proof"
 harness = false
 path = "benches/bench_3x_proof.rs"
 
+[[bench]]
+name = "bench_tpch_full"
+harness = false
+path = "benches/bench_tpch_full.rs"
+
 [profile.release]
 opt-level = 3
 lto = "fat"
@@ -107,8 +115,3 @@ strip = "symbols"
 [profile.bench]
 opt-level = 3
 lto = "thin"
-
-[[bench]]
-name = "bench_tpch_full"
-harness = false
-path = "benches/bench_tpch_full.rs"
