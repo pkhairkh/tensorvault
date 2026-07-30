@@ -43,6 +43,7 @@ pub mod compress;
 pub mod datasource;
 pub mod engine;
 pub mod executor;
+pub mod exec;
 pub mod index;
 pub mod kernel;
 pub mod memory;
