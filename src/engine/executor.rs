@@ -71,6 +71,17 @@ pub fn execute_select(
             }
             SelectItem::Star => execute_select_star(&filter, table, query.limit)?,
             SelectItem::Column(name) => execute_select_column(name, &filter, table, query.limit)?,
+            // `SELECT <int>` — emit a single-row, single-column literal.
+            SelectItem::Literal(v) => {
+                QueryResult {
+                    columns: vec![ResultColumn {
+                        name: v.to_string(),
+                        values: vec![*v],
+                    }],
+                    row_count: 1,
+                    elapsed_us: 0,
+                }
+            }
         }
     } else if query.select.len() > 1 {
         // Multi-column select (could be columns or column+aggregate without GROUP BY)
@@ -382,6 +393,9 @@ fn execute_aggregate_no_group(
             }
             SelectItem::Star => {
                 cols.push(ResultColumn { name: "count".into(), values: vec![indices.len() as u64] });
+            }
+            SelectItem::Literal(v) => {
+                cols.push(ResultColumn { name: v.to_string(), values: vec![*v] });
             }
         }
     }
@@ -789,6 +803,16 @@ fn execute_with_join(
             crate::sql::parser::SelectItem::Star => execute_select_star(&filter, &running, modified.limit),
             crate::sql::parser::SelectItem::Column(name) => {
                 execute_select_column(name, &filter, &running, modified.limit)
+            }
+            // Bare literal in a join-context SELECT — emit single row.
+            // Joins with literal SELECT items are not in the ClickBench /
+            // TPC-H query set, so this is a defensive default.
+            crate::sql::parser::SelectItem::Literal(v) => {
+                Ok(QueryResult {
+                    columns: vec![ResultColumn { name: v.to_string(), values: vec![*v] }],
+                    row_count: 1,
+                    elapsed_us: 0,
+                })
             }
         }
     } else {

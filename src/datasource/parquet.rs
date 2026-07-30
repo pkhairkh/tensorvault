@@ -27,7 +27,8 @@
 //! ClickBench/TPC-H datasets, which are dense.
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Float64Array, Int32Array, Int64Array, StringArray,
+    Array, ArrayRef, BooleanArray, Date32Array, Float64Array, Int16Array, Int32Array, Int64Array,
+    Int8Array, StringArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
 };
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
@@ -104,6 +105,14 @@ pub fn read_parquet(path: &str) -> Result<LoadedTable, Box<dyn Error>> {
     // captured from the first batch's schema.
     let mut col_cells: Vec<Vec<u64>> = Vec::new();
     let mut col_names: Vec<String> = Vec::new();
+    // Per-column string accumulator. Stays empty for non-string columns;
+    // grows to `total_rows` for Utf8/LargeUtf8 columns. We accumulate
+    // strings across batches and build a single `StringSearchColumn`
+    // at the end so that LIKE queries and string GROUP BY see the full
+    // column (previously `read_parquet` discarded the `string_search`
+    // returned by `convert_array_to_u64`, which silently broke LIKE
+    // filtering on any column loaded via this function).
+    let mut col_strings: Vec<Vec<String>> = Vec::new();
     let mut total_rows: usize = 0;
 
     for batch in reader {
@@ -115,13 +124,17 @@ pub fn read_parquet(path: &str) -> Result<LoadedTable, Box<dyn Error>> {
             for field in schema.fields() {
                 col_names.push(field.name().to_string());
                 col_cells.push(Vec::new());
+                col_strings.push(Vec::new());
             }
         }
 
         for (i, col) in batch.columns().iter().enumerate() {
             // Each batch must have one value per column for every row.
-            let (cells, _) = convert_array_to_u64(col);
+            let (cells, string_search) = convert_array_to_u64(col);
             col_cells[i].extend(cells);
+            if let Some(ss) = string_search {
+                col_strings[i].extend(ss.strings);
+            }
         }
         total_rows += batch.num_rows();
     }
@@ -144,11 +157,23 @@ pub fn read_parquet(path: &str) -> Result<LoadedTable, Box<dyn Error>> {
         }
     }
 
-    let columns = col_names
-        .into_iter()
-        .zip(col_cells)
-        .map(|(name, cells)| LoadedColumn { name, row_count: total_rows, cells, string_search: None })
-        .collect();
+    let mut columns: Vec<LoadedColumn> = Vec::with_capacity(col_cells.len());
+    for i in 0..col_cells.len() {
+        // Take ownership of the accumulated strings without cloning. For
+        // non-string columns `col_strings[i]` is empty → `string_search`
+        // stays `None`.
+        let string_search = if !col_strings[i].is_empty() {
+            Some(crate::exec::fm_index::StringSearchColumn::new(std::mem::take(&mut col_strings[i])))
+        } else {
+            None
+        };
+        columns.push(LoadedColumn {
+            name: col_names[i].clone(),
+            row_count: total_rows,
+            cells: std::mem::take(&mut col_cells[i]),
+            string_search,
+        });
+    }
 
     Ok(LoadedTable { name, columns, row_count: total_rows })
 }
@@ -179,16 +204,25 @@ pub fn read_parquet_column(path: &str, column_name: &str) -> Result<LoadedColumn
     let reader = builder.with_batch_size(8192).build()?;
 
     let mut cells: Vec<u64> = Vec::new();
+    let mut strings: Vec<String> = Vec::new();
     let mut row_count: usize = 0;
     for batch in reader {
         let batch: RecordBatch = batch?;
         let arr: &ArrayRef = batch.column(col_idx);
-        let (new_cells, _) = convert_array_to_u64(arr);
+        let (new_cells, string_search) = convert_array_to_u64(arr);
         cells.extend(new_cells);
+        if let Some(ss) = string_search {
+            strings.extend(ss.strings);
+        }
         row_count += batch.num_rows();
     }
 
-    Ok(LoadedColumn { name: column_name.to_string(), cells, row_count, string_search: None })
+    let string_search = if !strings.is_empty() {
+        Some(crate::exec::fm_index::StringSearchColumn::new(strings))
+    } else {
+        None
+    };
+    Ok(LoadedColumn { name: column_name.to_string(), cells, row_count, string_search })
 }
 
 /// Convert an Arrow [`ArrayRef`] into turboGP's `Vec<u64>` cell format.
@@ -207,6 +241,26 @@ fn convert_array_to_u64(array: &ArrayRef) -> (Vec<u64>, Option<crate::exec::fm_i
     let mut string_search: Option<crate::exec::fm_index::StringSearchColumn> = None;
 
     match array.data_type() {
+        // Int8/Int16/Int32 → `value as u64` (sign-extends negative
+        // values to large u64 — same bit pattern the kernel compares).
+        // Int8 and Int16 are common in ClickBench (TraficSourceID,
+        // SearchEngineID, etc.) and were previously dropped to 0 by
+        // the unsupported-type fallback, which silently broke GROUP BY
+        // and equality filters on those columns.
+        DataType::Int8 => {
+            if let Some(a) = array.as_any().downcast_ref::<Int8Array>() {
+                for i in 0..len {
+                    if a.is_null(i) { out.push(0); } else { out.push(a.value(i) as u64); }
+                }
+            }
+        }
+        DataType::Int16 => {
+            if let Some(a) = array.as_any().downcast_ref::<Int16Array>() {
+                for i in 0..len {
+                    if a.is_null(i) { out.push(0); } else { out.push(a.value(i) as u64); }
+                }
+            }
+        }
         // Int32 → `value as u64` (zero-extends; negative values
         // become large u64 — same bit pattern the kernel compares).
         DataType::Int32 => {
@@ -229,6 +283,35 @@ fn convert_array_to_u64(array: &ArrayRef) -> (Vec<u64>, Option<crate::exec::fm_i
                     } else {
                         out.push(a.value(i) as u64);
                     }
+                }
+            }
+        }
+        // UInt8/UInt16/UInt32/UInt64 → `value as u64` (zero-extends).
+        DataType::UInt8 => {
+            if let Some(a) = array.as_any().downcast_ref::<UInt8Array>() {
+                for i in 0..len {
+                    if a.is_null(i) { out.push(0); } else { out.push(a.value(i) as u64); }
+                }
+            }
+        }
+        DataType::UInt16 => {
+            if let Some(a) = array.as_any().downcast_ref::<UInt16Array>() {
+                for i in 0..len {
+                    if a.is_null(i) { out.push(0); } else { out.push(a.value(i) as u64); }
+                }
+            }
+        }
+        DataType::UInt32 => {
+            if let Some(a) = array.as_any().downcast_ref::<UInt32Array>() {
+                for i in 0..len {
+                    if a.is_null(i) { out.push(0); } else { out.push(a.value(i) as u64); }
+                }
+            }
+        }
+        DataType::UInt64 => {
+            if let Some(a) = array.as_any().downcast_ref::<UInt64Array>() {
+                for i in 0..len {
+                    if a.is_null(i) { out.push(0); } else { out.push(a.value(i)); }
                 }
             }
         }

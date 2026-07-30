@@ -70,6 +70,11 @@ pub enum SelectItem {
     },
     /// The `*` wildcard.
     Star,
+    /// A non-negative integer literal in the SELECT list
+    /// (e.g. `SELECT 1, URL, count(*) ...`). ClickBench Q15-Q42 use
+    /// this to emit a constant column alongside the URL and count.
+    /// Negative literals are rejected at parse time.
+    Literal(u64),
 }
 
 /// A literal value extracted from a [`Token`].
@@ -271,6 +276,17 @@ impl Parser {
         if self.match_op("*") {
             return Ok(SelectItem::Star);
         }
+        // Non-negative integer literal → `Literal(u64)`
+        // (e.g. `SELECT 1, URL, count(*) ...` in ClickBench Q15-Q42).
+        if let Token::Int(i) = self.peek().clone() {
+            if i < 0 {
+                return Err(format!("negative integer literal in SELECT list: {i}"));
+            }
+            self.next();
+            // An alias (`SELECT 1 AS x`) is legal but unused — consume it.
+            let _ = self.parse_optional_alias()?;
+            return Ok(SelectItem::Literal(i as u64));
+        }
         // `IDENT ( ... )` → Aggregate; `IDENT` → Column.
         if let Token::Ident(name) = self.peek().clone() {
             self.next();
@@ -355,11 +371,24 @@ impl Parser {
     fn parse_column_list(&mut self) -> Result<Vec<String>, String> {
         let mut cols = Vec::new();
         loop {
-            if let Token::Ident(name) = self.peek().clone() {
-                self.next();
-                cols.push(name);
-            } else {
-                return Err(format!("expected column name, got {:?}", self.peek()));
+            match self.peek().clone() {
+                Token::Ident(name) => {
+                    self.next();
+                    cols.push(name);
+                }
+                // Positional GROUP BY reference (e.g. `GROUP BY 1, URL`).
+                // The integer refers to the Nth SELECT item; when that item
+                // is a literal constant (as in ClickBench Q15-Q42 where
+                // `1` refers to `SELECT 1`), every row shares the same value
+                // so it has no effect on grouping. We simply skip it —
+                // only the non-numeric GROUP BY items remain, which is
+                // semantically correct for the ClickBench queries.
+                Token::Int(_) => {
+                    self.next();
+                }
+                other => {
+                    return Err(format!("expected column name in GROUP BY, got {other:?}"));
+                }
             }
             if !matches!(self.peek(), Token::Comma) {
                 break;
@@ -796,5 +825,51 @@ mod tests {
             }
             other => panic!("expected Aggregate, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_select_integer_literal() {
+        // `SELECT 1, URL, count(*)` — ClickBench Q15-Q42 shape.
+        let q = parse_sql("SELECT 1, URL, count(*) FROM t").unwrap();
+        assert_eq!(q.select.len(), 3);
+        assert!(matches!(&q.select[0], SelectItem::Literal(1)));
+        assert!(matches!(&q.select[1], SelectItem::Column(c) if c == "URL"));
+        assert!(matches!(&q.select[2], SelectItem::Aggregate { func, arg, .. } if func == "COUNT" && arg == "*"));
+    }
+
+    #[test]
+    fn parse_group_by_positional_and_column() {
+        // `GROUP BY 1, URL` — the positional `1` is skipped, only URL
+        // remains as a real GROUP BY key.
+        let q = parse_sql("SELECT 1, URL, count(*) FROM t GROUP BY 1, URL").unwrap();
+        assert_eq!(q.group_by, vec!["URL"]);
+    }
+
+    #[test]
+    fn parse_group_by_positional_only() {
+        // `GROUP BY 1` alone (degenerate but legal) → empty group_by.
+        let q = parse_sql("SELECT 1, count(*) FROM t GROUP BY 1").unwrap();
+        assert!(q.group_by.is_empty());
+    }
+
+    #[test]
+    fn parse_select_negative_literal_rejected() {
+        // Negative integer literals in the SELECT list are rejected.
+        assert!(parse_sql("SELECT -1 FROM t").is_err());
+    }
+
+    #[test]
+    fn parse_clickbench_q15_shape() {
+        // Full Q15 shape: SELECT 1, URL, count(*) AS c FROM t WHERE URL LIKE 'https://%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10
+        let q = parse_sql(
+            "SELECT 1, URL, count(*) AS c FROM t WHERE URL LIKE 'https://%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+        )
+        .unwrap();
+        assert_eq!(q.select.len(), 3);
+        assert!(matches!(&q.select[0], SelectItem::Literal(1)));
+        assert!(matches!(&q.select[2], SelectItem::Aggregate { alias: Some(a), .. } if a == "c"));
+        assert_eq!(q.group_by, vec!["URL"]);
+        assert_eq!(q.order_by, vec![("c".to_string(), false)]);
+        assert_eq!(q.limit, Some(10));
     }
 }

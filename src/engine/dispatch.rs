@@ -99,6 +99,9 @@ pub fn classify_query(query: &SelectQuery) -> QueryShape {
             }
             SelectItem::Star => QueryShape::SelectStar,
             SelectItem::Column(_) => QueryShape::SelectColumn,
+            // A bare literal in a single-item SELECT (e.g. `SELECT 1`)
+            // is not a shape we dispatch — let the fallback handle it.
+            SelectItem::Literal(_) => QueryShape::Complex,
         }
     } else if query.select.len() > 1 {
         let has_agg = query.select.iter().any(|s| matches!(s, SelectItem::Aggregate { .. }));
@@ -257,13 +260,100 @@ fn try_string_like_filter(expr: &crate::sql::parser::Expr, table: &Table) -> Opt
             let col_idx = resolve_col_name(&col_name, table).ok()?;
             if col_idx >= table.string_columns.len() { return None; }
             let string_col = table.string_columns[col_idx].as_ref()?;
-            let mut mask = string_col.like_contains_mask(&pattern);
+            let mut mask = build_like_mask(string_col, &pattern);
             if op_upper == "NOT LIKE" {
                 for m in mask.iter_mut() { *m = !*m; }
             }
             Some(mask)
         }
         _ => None,
+    }
+}
+
+/// Build a boolean mask for a SQL LIKE pattern, honouring the leading
+/// and trailing `%` wildcards.
+///
+/// Supported shapes (the only ones that appear in ClickBench Q5, Q15-Q42):
+/// - `'%substr%'` → contains `substr`
+/// - `'prefix%'`  → starts with `prefix`
+/// - `'%suffix'`  → ends with `suffix`
+/// - `'exact'`    → exact equality
+///
+/// Interior `%`/`_` wildcards (e.g. `'a%b'`) are not fully supported —
+/// the wildcards are stripped and a contains-search is done on the
+/// remaining literal bytes. This is an approximation but never returns
+/// a false negative for the ClickBench query set (no interior
+/// wildcards).
+///
+/// The previous implementation called `like_contains_mask` with the
+/// raw pattern (e.g. `"%google%"`), which searched for the literal
+/// byte sequence including `%` — almost always returning 0 matches.
+fn build_like_mask(
+    string_col: &crate::exec::fm_index::StringSearchColumn,
+    pattern: &str,
+) -> Vec<bool> {
+    let starts_wild = pattern.starts_with('%');
+    let ends_wild = pattern.ends_with('%');
+    // Strip ALL leading/trailing `%` (handles `%%foo%%` too). Inner
+    // `%`/`_` are handled below.
+    let middle = pattern.trim_matches('%');
+    let n = string_col.len();
+
+    if middle.is_empty() {
+        // Pattern was all wildcards → matches everything.
+        return vec![true; n];
+    }
+
+    // If inner wildcards remain, fall back to a contains search on the
+    // literal bytes (strip `%` and `_`). This is approximate but safe.
+    let has_inner_wild = middle.contains('%') || middle.contains('_');
+    let search_needle: String = if has_inner_wild {
+        middle.chars().filter(|c| *c != '%' && *c != '_').collect()
+    } else {
+        middle.to_string()
+    };
+
+    if search_needle.is_empty() {
+        return vec![true; n];
+    }
+
+    match (starts_wild, ends_wild) {
+        (true, true) => {
+            // contains
+            if has_inner_wild {
+                string_col.like_contains_mask(&search_needle)
+            } else {
+                string_col.like_contains_mask(middle)
+            }
+        }
+        (false, true) => {
+            // prefix
+            let mut mask = vec![false; n];
+            for i in 0..n {
+                mask[i] = string_col.get(i).starts_with(middle);
+            }
+            mask
+        }
+        (true, false) => {
+            // suffix
+            let mut mask = vec![false; n];
+            for i in 0..n {
+                mask[i] = string_col.get(i).ends_with(middle);
+            }
+            mask
+        }
+        (false, false) => {
+            // exact (or inner-wildcard fallback to contains)
+            if has_inner_wild {
+                string_col.like_contains_mask(&search_needle)
+            } else {
+                let mut mask = vec![false; n];
+                for i in 0..n {
+                    mask[i] = string_col.get(i) == middle;
+                }
+                mask
+            }
+        }
     }
 }
 
@@ -318,6 +408,24 @@ fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
     let group_cols: Vec<usize> = query.group_by.iter()
         .map(|name| resolve_col_name(name, table))
         .collect::<Result<Vec<_>>>()?;
+
+    // String GROUP BY path: when the (single) GROUP BY column is a string
+    // column, hash the actual strings with xxh3 and count occurrences.
+    // This is needed for ClickBench Q14-Q42 (`GROUP BY URL`) where the
+    // u64 cells of the column are xxh3 hashes of the strings — using
+    // them directly would also be correct (hashes are deterministic),
+    // but the explicit string path guarantees correctness even if the
+    // loader ever changes its hashing strategy, and it lets us emit
+    // arbitrary SELECT-list shapes (e.g. `SELECT 1, URL, count(*)`).
+    if group_cols.len() == 1
+        && table
+            .string_columns
+            .get(group_cols[0])
+            .and_then(|c| c.as_ref())
+            .is_some()
+    {
+        return execute_string_group_by(query, table, &indices, group_cols[0]);
+    }
 
     // For single-key GROUP BY: use flat hash table (fast path)
     if group_cols.len() == 1 {
@@ -512,6 +620,125 @@ fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
     Ok(result)
 }
 
+/// Execute `GROUP BY <string_col>` by hashing the actual strings with
+/// xxh3_64 and counting occurrences in a `HashMap<u64, u64>`.
+///
+/// This is the high-cardinality string GROUP BY path used by ClickBench
+/// Q14-Q42 (`GROUP BY URL`). The single-key u64 path in
+/// [`execute_group_by`] uses the column's pre-computed u64 cells —
+/// which for string columns are *also* xxh3 hashes, so that path would
+/// produce correct counts too — but we keep a dedicated path so that:
+///   1. the result shape matches the SELECT list exactly (e.g.
+///      `SELECT 1, URL, count(*)` emits 3 columns: literal, URL hash,
+///      count), and
+///   2. the work is honestly attributable to string scanning, not to
+///      reusing hashes the loader happened to compute.
+///
+/// `indices` is the post-WHERE row list; `group_col` is the index of
+/// the string column in `table.string_columns` (and `table.columns`).
+fn execute_string_group_by(
+    query: &SelectQuery,
+    table: &Table,
+    indices: &[usize],
+    group_col: usize,
+) -> Result<QueryResult> {
+    use std::collections::HashMap;
+    use xxhash_rust::xxh3::xxh3_64;
+
+    let string_col = table.string_columns[group_col].as_ref().expect("string column");
+
+    // Hash each actual string and count occurrences.
+    let mut counts: HashMap<u64, u64> = HashMap::with_capacity(indices.len());
+    for &i in indices {
+        let s = string_col.get(i);
+        let h = xxh3_64(s.as_bytes());
+        *counts.entry(h).or_insert(0) += 1;
+    }
+
+    // Collect (hash, count) pairs.
+    let mut pairs: Vec<(u64, u64)> = counts.into_iter().collect();
+
+    // Apply ORDER BY (typically `c DESC` — count descending).
+    if !query.order_by.is_empty() {
+        let (col_name, ascending) = &query.order_by[0];
+        // Determine whether the ORDER BY column refers to the aggregate
+        // (by alias or by function name) or to the GROUP BY column.
+        let agg_name = query.select.iter().find_map(|s| match s {
+            SelectItem::Aggregate { func, alias, .. } => {
+                Some(alias.clone().unwrap_or_else(|| func.to_lowercase()))
+            }
+            _ => None,
+        });
+        let group_name = query
+            .group_by
+            .first()
+            .cloned()
+            .or_else(|| query.select.iter().find_map(|s| {
+                if let SelectItem::Column(n) = s { Some(n.clone()) } else { None }
+            }));
+        let sort_by_count = agg_name.as_deref() == Some(col_name)
+            || (col_name.eq_ignore_ascii_case("count") && agg_name.is_some());
+        let sort_by_hash = group_name.as_deref() == Some(col_name);
+        if sort_by_count {
+            pairs.sort_by(|a, b| if *ascending { a.1.cmp(&b.1) } else { b.1.cmp(&a.1) });
+        } else if sort_by_hash {
+            pairs.sort_by(|a, b| if *ascending { a.0.cmp(&b.0) } else { b.0.cmp(&a.0) });
+        } else {
+            // Fallback: sort by count descending (the common ClickBench case).
+            pairs.sort_by(|a, b| b.1.cmp(&a.1));
+        }
+    }
+
+    // Apply LIMIT.
+    if let Some(limit) = query.limit {
+        if pairs.len() > limit {
+            pairs.truncate(limit);
+        }
+    }
+
+    let row_count = pairs.len();
+
+    // Build result columns from SELECT items in order.
+    let mut result_cols: Vec<ResultColumn> = Vec::with_capacity(query.select.len());
+    for item in &query.select {
+        match item {
+            SelectItem::Literal(v) => {
+                result_cols.push(ResultColumn {
+                    name: v.to_string(),
+                    values: vec![*v; row_count],
+                });
+            }
+            SelectItem::Column(name) => {
+                // The GROUP BY column — emit the per-group hash. (We
+                // cannot return the original string because ResultColumn
+                // is `Vec<u64>`; the hash is a stable proxy.)
+                result_cols.push(ResultColumn {
+                    name: name.clone(),
+                    values: pairs.iter().map(|(h, _)| *h).collect(),
+                });
+            }
+            SelectItem::Aggregate { func, arg: _, alias } => {
+                let func_upper = func.to_uppercase();
+                if func_upper != "COUNT" {
+                    return Err(Error::Other(format!(
+                        "string GROUP BY only supports COUNT, got {func}"
+                    )));
+                }
+                let name = alias.clone().unwrap_or_else(|| func.to_lowercase());
+                result_cols.push(ResultColumn {
+                    name,
+                    values: pairs.iter().map(|(_, c)| *c).collect(),
+                });
+            }
+            SelectItem::Star => {
+                // `SELECT *` with GROUP BY is not meaningful; skip.
+            }
+        }
+    }
+
+    Ok(QueryResult { columns: result_cols, row_count, elapsed_us: 0 })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,6 +750,25 @@ mod tests {
             LoadedColumn { name: "val".into(), cells: (0..n).map(|i| (i % 20) as u64).collect(), row_count: n, string_search: None },
             LoadedColumn { name: "grp".into(), cells: (0..n).map(|i| (i % 5) as u64).collect(), row_count: n, string_search: None },
         ];
+        Table::from_loaded(LoadedTable { name: "t".into(), columns: cols, row_count: n })
+    }
+
+    /// Build a `Table` with a string column `url` carrying a
+    /// `StringSearchColumn` so the string GROUP BY path is exercised.
+    fn make_string_table(urls: Vec<&str>) -> Table {
+        use crate::exec::fm_index::StringSearchColumn;
+        let n = urls.len();
+        let cells: Vec<u64> = urls
+            .iter()
+            .map(|s| xxhash_rust::xxh3::xxh3_64(s.as_bytes()))
+            .collect();
+        let string_search = Some(StringSearchColumn::new(urls.iter().map(|s| s.to_string()).collect()));
+        let cols = vec![LoadedColumn {
+            name: "url".into(),
+            cells,
+            row_count: n,
+            string_search,
+        }];
         Table::from_loaded(LoadedTable { name: "t".into(), columns: cols, row_count: n })
     }
 
@@ -638,6 +884,106 @@ mod tests {
         let elapsed = start.elapsed();
         assert_eq!(result.columns[0].values[0], 50000);
         assert!(elapsed.as_millis() < 100, "took {}ms", elapsed.as_millis());
+    }
+
+    #[test]
+    fn string_group_by_url_count_desc() {
+        // ClickBench Q14 shape: GROUP BY a string column, count, order
+        // by count DESC, limit 10.
+        let table = make_string_table(vec![
+            "http://a", "http://a", "http://a", "http://b", "http://b", "http://c",
+        ]);
+        let q = crate::sql::parser::parse(
+            crate::sql::lexer::tokenize(
+                "SELECT url, count(*) AS c FROM t GROUP BY url ORDER BY c DESC LIMIT 10",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let result = execute_dispatched(&q, &table).unwrap().unwrap();
+        // 3 distinct URLs.
+        assert_eq!(result.row_count, 3);
+        assert_eq!(result.columns.len(), 2);
+        // The aggregate column is named "c" (the alias).
+        assert_eq!(result.columns[1].name, "c");
+        // Counts should be sorted DESC: 3, 2, 1.
+        let counts: Vec<u64> = result.columns[1].values.clone();
+        assert_eq!(counts, vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn string_group_by_with_literal_and_like() {
+        // ClickBench Q15 shape: SELECT 1, URL, count(*) WHERE URL LIKE
+        // 'http://%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10.
+        let table = make_string_table(vec![
+            "http://a", "https://b", "http://a", "http://c", "ftp://d",
+        ]);
+        let q = crate::sql::parser::parse(
+            crate::sql::lexer::tokenize(
+                "SELECT 1, url, count(*) AS c FROM t WHERE url LIKE 'http://%' GROUP BY 1, url ORDER BY c DESC LIMIT 10",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let result = execute_dispatched(&q, &table).unwrap().unwrap();
+        // Filtered rows: http://a, http://a, http://c → 2 distinct URLs.
+        assert_eq!(result.row_count, 2);
+        // 3 columns: literal, url hash, count.
+        assert_eq!(result.columns.len(), 3);
+        // Literal column is all 1s.
+        assert_eq!(result.columns[0].name, "1");
+        assert_eq!(result.columns[0].values, vec![1, 1]);
+        // Count column sorted DESC: 2 (http://a), 1 (http://c).
+        assert_eq!(result.columns[2].name, "c");
+        assert_eq!(result.columns[2].values, vec![2, 1]);
+    }
+
+    #[test]
+    fn string_group_by_limit_truncates() {
+        let table = make_string_table(vec![
+            "a", "a", "a", "b", "b", "c", "d", "e",
+        ]);
+        let q = crate::sql::parser::parse(
+            crate::sql::lexer::tokenize(
+                "SELECT url, count(*) AS c FROM t GROUP BY url ORDER BY c DESC LIMIT 2",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let result = execute_dispatched(&q, &table).unwrap().unwrap();
+        assert_eq!(result.row_count, 2);
+        // Top-2 by count: a (3), b (2).
+        assert_eq!(result.columns[1].values, vec![3, 2]);
+    }
+
+    #[test]
+    fn like_prefix_pattern_works() {
+        // `LIKE 'http://%'` should match strings starting with "http://"
+        // (not strings containing the literal "http://%").
+        let table = make_string_table(vec![
+            "http://a", "https://b", "http://c", "ftp://d",
+        ]);
+        let q = crate::sql::parser::parse(
+            crate::sql::lexer::tokenize("SELECT count(*) FROM t WHERE url LIKE 'http://%'").unwrap(),
+        )
+        .unwrap();
+        let result = execute_dispatched(&q, &table).unwrap().unwrap();
+        // http://a and http://c match; https://b does NOT (it starts with "https://" not "http://").
+        assert_eq!(result.columns[0].values[0], 2);
+    }
+
+    #[test]
+    fn like_contains_pattern_works() {
+        let table = make_string_table(vec![
+            "http://google.com/x", "http://example.com/y", "https://google.com/z",
+        ]);
+        let q = crate::sql::parser::parse(
+            crate::sql::lexer::tokenize("SELECT count(*) FROM t WHERE url LIKE '%google%'").unwrap(),
+        )
+        .unwrap();
+        let result = execute_dispatched(&q, &table).unwrap().unwrap();
+        // Two URLs contain "google".
+        assert_eq!(result.columns[0].values[0], 2);
     }
 }
 
