@@ -104,3 +104,8 @@ strip = "symbols"
 [profile.bench]
 opt-level = 3
 lto = "thin"
+
+[[bench]]
+name = "bench_tpch_full"
+harness = false
+path = "benches/bench_tpch_full.rs"
