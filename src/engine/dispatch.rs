@@ -620,6 +620,7 @@ fn eval_arith_row(
                 columns: vec![],
                 column_names: column_names.to_vec(),
                 row_count: 0,
+                string_columns: vec![],
             }).unwrap_or(0);
             // Find column by name
             if let Some(idx) = column_names.iter().position(|n| n == name || n == name.split('.').nth(1).unwrap_or(name)) {

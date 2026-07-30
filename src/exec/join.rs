@@ -37,6 +37,7 @@ impl JoinResult {
             columns: self.columns,
             column_names: self.column_names,
             row_count: self.row_count,
+            string_columns: vec![],
         }
     }
 }
@@ -237,6 +238,7 @@ mod tests {
             columns: cols.iter().map(|(_, v)| v.clone()).collect(),
             column_names: cols.iter().map(|(n, _)| n.to_string()).collect(),
             row_count,
+            string_columns: vec![],
         }
     }
 

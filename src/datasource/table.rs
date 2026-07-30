@@ -32,6 +32,8 @@ pub struct Table {
     pub column_names: Vec<String>,
     /// Number of rows. Equal to every column's length.
     pub row_count: usize,
+    /// String column data (parallel to columns; None for non-string).
+    pub string_columns: Vec<Option<crate::exec::fm_index::StringSearchColumn>>,
 }
 
 impl Table {
@@ -43,7 +45,9 @@ impl Table {
     pub fn from_loaded(loaded: LoadedTable) -> Self {
         let row_count = loaded.row_count;
         let column_names: Vec<String> = loaded.columns.iter().map(|c| c.name.clone()).collect();
-        let columns: Vec<Vec<u64>> = loaded.columns.into_iter().map(|c| c.cells).collect();
+        let columns: Vec<Vec<u64>> = loaded.columns.iter().map(|c| c.cells.clone()).collect();
+        let string_columns: Vec<Option<crate::exec::fm_index::StringSearchColumn>> =
+            loaded.columns.iter().map(|c| c.string_search.clone()).collect();
 
         // Defensive invariant check: every column should match
         // `row_count`. If a caller hand-built a bad `LoadedTable`,
@@ -52,7 +56,7 @@ impl Table {
         let actual_min = columns.iter().map(|c| c.len()).min().unwrap_or(0);
         let row_count = row_count.min(actual_min);
 
-        Table { name: loaded.name, columns, column_names, row_count }
+        Table { name: loaded.name, columns, column_names, row_count, string_columns }
     }
 
     /// Look up a column by name, returning a slice over its cells.
