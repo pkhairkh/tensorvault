@@ -210,7 +210,7 @@ fn row_matches(where_clause: &WhereClause, row: &[u64], table: &Table) -> bool {
     }
 }
 
-fn filter_indices(where_clause: &WhereClause, table: &Table) -> Vec<usize> {
+fn filter_indices_old(where_clause: &WhereClause, table: &Table) -> Vec<usize> {
     match where_clause {
         WhereClause::None => (0..table.row_count).collect(),
         _ => {
@@ -643,4 +643,72 @@ fn apply_order_by(result: QueryResult, order_by: &[(String, bool)], _table: &Tab
     }).collect();
 
     Ok(QueryResult { columns: new_cols, row_count: result.row_count, elapsed_us: result.elapsed_us })
+}
+
+// ---------------------------------------------------------------------------
+// Vectorized batch path (P0 fix) — replaces per-row ScalarValue boxing
+// ---------------------------------------------------------------------------
+
+/// Try to evaluate the WHERE clause using the vectorized batch path.
+fn filter_indices_batch(where_clause: &WhereClause, table: &Table) -> Option<Vec<usize>> {
+    match where_clause {
+        WhereClause::Single(f) => {
+            let expr = filter_to_expr(f);
+            Some(crate::exec::vectorized::filter_rows(&table.columns, table.row_count, &expr))
+        }
+        WhereClause::And(l, r) => {
+            let left_expr = where_clause_to_expr(l);
+            let right_expr = where_clause_to_expr(r);
+            let expr = crate::sql::parser::Expr::Binary {
+                left: Box::new(left_expr),
+                op: String::from("AND"),
+                right: Box::new(right_expr),
+            };
+            Some(crate::exec::vectorized::filter_rows(&table.columns, table.row_count, &expr))
+        }
+        WhereClause::Or(l, r) => {
+            let left_expr = where_clause_to_expr(l);
+            let right_expr = where_clause_to_expr(r);
+            let expr = crate::sql::parser::Expr::Binary {
+                left: Box::new(left_expr),
+                op: String::from("OR"),
+                right: Box::new(right_expr),
+            };
+            Some(crate::exec::vectorized::filter_rows(&table.columns, table.row_count, &expr))
+        }
+        WhereClause::None => Some((0..table.row_count).collect()),
+    }
+}
+
+fn filter_to_expr(f: &Filter) -> crate::sql::parser::Expr {
+    crate::sql::parser::Expr::Binary {
+        left: Box::new(crate::sql::parser::Expr::Column(f.col_idx.to_string())),
+        op: f.op.clone(),
+        right: Box::new(crate::sql::parser::Expr::Literal(crate::sql::parser::Value::Int(f.value as i64))),
+    }
+}
+
+fn where_clause_to_expr(wc: &WhereClause) -> crate::sql::parser::Expr {
+    match wc {
+        WhereClause::Single(f) => filter_to_expr(f),
+        WhereClause::And(l, r) => crate::sql::parser::Expr::Binary {
+            left: Box::new(where_clause_to_expr(l)),
+            op: String::from("AND"),
+            right: Box::new(where_clause_to_expr(r)),
+        },
+        WhereClause::Or(l, r) => crate::sql::parser::Expr::Binary {
+            left: Box::new(where_clause_to_expr(l)),
+            op: String::from("OR"),
+            right: Box::new(where_clause_to_expr(r)),
+        },
+        WhereClause::None => crate::sql::parser::Expr::Literal(crate::sql::parser::Value::Int(1)),
+    }
+}
+
+/// New filter_indices: tries vectorized batch path first, falls back to per-row.
+fn filter_indices(where_clause: &WhereClause, table: &Table) -> Vec<usize> {
+    if let Some(indices) = filter_indices_batch(where_clause, table) {
+        return indices;
+    }
+    filter_indices_old(where_clause, table)
 }
