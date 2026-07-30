@@ -235,13 +235,37 @@ impl Parser {
             self.next();
             if matches!(self.peek(), Token::LParen) {
                 self.next(); // consume (
-                let arg = self.parse_agg_arg()?;
+
+                // Detect `func(DISTINCT col)` and normalise to
+                // `Aggregate { func: "FUNC_DISTINCT", arg: "col" }`. The
+                // `DISTINCT` token is not in `KEYWORDS` (it is rarely used
+                // outside aggregates), so it arrives here as `Ident("DISTINCT")`.
+                // `match_ident` does a case-insensitive compare, matching
+                // `distinct`, `Distinct`, etc.
+                let (func, arg) = if self.match_ident("DISTINCT") {
+                    let col = match self.peek().clone() {
+                        Token::Ident(s) => {
+                            self.next();
+                            s
+                        }
+                        other => {
+                            return Err(format!(
+                                "expected column name after DISTINCT, got {other:?}"
+                            ));
+                        }
+                    };
+                    (format!("{}_DISTINCT", name.to_uppercase()), col)
+                } else {
+                    let arg = self.parse_agg_arg()?;
+                    (name.to_uppercase(), arg)
+                };
+
                 if !matches!(self.peek(), Token::RParen) {
                     return Err(format!("expected ) after aggregate arg, got {:?}", self.peek()));
                 }
                 self.next(); // consume )
                 let alias = self.parse_optional_alias()?;
-                return Ok(SelectItem::Aggregate { func: name.to_uppercase(), arg, alias });
+                return Ok(SelectItem::Aggregate { func, arg, alias });
             }
             let _ = self.parse_optional_alias()?;
             return Ok(SelectItem::Column(name));
@@ -652,5 +676,53 @@ mod tests {
     fn parse_invalid_trailing_garbage() {
         let r = parse_sql("SELECT * FROM t WHERE x = 5 garbage");
         assert!(r.is_err(), "expected error for trailing garbage");
+    }
+
+    #[test]
+    fn parse_count_distinct_keyword() {
+        // `COUNT(DISTINCT col)` is normalised to
+        // `Aggregate { func: "COUNT_DISTINCT", arg: "col" }`.
+        let q = parse_sql("SELECT COUNT(DISTINCT user_id) FROM events").unwrap();
+        match &q.select[0] {
+            SelectItem::Aggregate { func, arg, alias } => {
+                assert_eq!(func, "COUNT_DISTINCT");
+                assert_eq!(arg, "user_id");
+                assert_eq!(*alias, None);
+            }
+            other => panic!("expected Aggregate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_count_distinct_case_insensitive() {
+        // `count(distinct col)` should normalise the same way.
+        let q = parse_sql("SELECT count(distinct x) FROM t").unwrap();
+        match &q.select[0] {
+            SelectItem::Aggregate { func, arg, .. } => {
+                assert_eq!(func, "COUNT_DISTINCT");
+                assert_eq!(arg, "x");
+            }
+            other => panic!("expected Aggregate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_count_distinct_requires_column() {
+        // `COUNT(DISTINCT)` with no column should error.
+        let r = parse_sql("SELECT COUNT(DISTINCT) FROM t");
+        assert!(r.is_err(), "expected error for COUNT(DISTINCT) without column");
+    }
+
+    #[test]
+    fn parse_sum_distinct_keyword() {
+        // `SUM(DISTINCT col)` works the same way (produces SUM_DISTINCT).
+        let q = parse_sql("SELECT SUM(DISTINCT price) FROM sales").unwrap();
+        match &q.select[0] {
+            SelectItem::Aggregate { func, arg, .. } => {
+                assert_eq!(func, "SUM_DISTINCT");
+                assert_eq!(arg, "price");
+            }
+            other => panic!("expected Aggregate, got {other:?}"),
+        }
     }
 }

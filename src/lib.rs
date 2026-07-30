@@ -30,6 +30,9 @@
 //!   engine's `Vec<u64>` cell format. Wave 19.
 //! - [`catalog`] — in-memory table registry: name → [`datasource::Table`].
 //!   Wave 19.
+//! - [`engine`] — the end-to-end SQL surface: [`engine::QueryEngine`]
+//!   ties together the parser, catalog, kernel table, and cost model.
+//!   Hand it a SQL string, get back a [`engine::QueryResult`]. Wave 20.
 //! - [`types`] — linear/affine memory handles (`CxlRef`, `RaftRef`) that
 //!   enforce protocol boundaries at compile time (ADR-013).
 
@@ -38,6 +41,7 @@
 pub mod catalog;
 pub mod compress;
 pub mod datasource;
+pub mod engine;
 pub mod executor;
 pub mod index;
 pub mod kernel;
