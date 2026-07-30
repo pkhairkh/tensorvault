@@ -35,6 +35,13 @@
 //!   picks between hash join and leapfrog based on the AGM bound.
 //! - [`cardinality`] — simple per-table row-count and selectivity estimates
 //!   used by the cost model and the join reorderer.
+//! - [`learned`] — learned cardinality estimator: per-(table, column)
+//!   equi-width histograms + an exponentially-weighted correction factor
+//!   that augments the simple [`CardinalityEstimator`] with data-driven
+//!   selectivity estimates.
+//! - [`calibration`] — online calibration loop for [`learned`]: records
+//!   `(predicted, actual)` cardinality pairs, updates the correction factor,
+//!   and tracks the running MAPE.
 //! - [`lowerer`] — cost-aware lowering of a `LogicalPlan` into a sequence of
 //!   `KernelInvocation`s, picking the cheapest tier per operator and
 //!   dispatching each join to either `HashProbe` or `LeapfrogJoin` via
@@ -57,16 +64,20 @@
 //! [`estimate_cost`]).
 
 pub mod agm;
+pub mod calibration;
 pub mod cardinality;
 pub mod dpccp;
 pub mod kingman;
+pub mod learned;
 pub mod lowerer;
 pub mod wcoj;
 
 pub use agm::{agm_bound, JoinHypergraph};
+pub use calibration::CalibrationLoop;
 pub use cardinality::CardinalityEstimator;
 pub use dpccp::{dpccp, JoinRelation, JoinTree};
 pub use kingman::KingmanPredictor;
+pub use learned::{Histogram, LearnedCardinality};
 pub use lowerer::PlanLowerer;
 pub use wcoj::{build_wcoj_plan, choose_join_algorithm, JoinAlgorithm, WcojPlan};
 
@@ -84,7 +95,16 @@ use crate::memory::tier::MemoryTier;
 /// The default values are calibrated to a Zen 5 core running AVX-512 u64
 /// kernels (8 lanes, 3 GHz, 40 GB/s DRAM). Override them for other CPUs or
 /// for hypothetical what-if analysis.
-#[derive(Debug, Clone, Copy)]
+///
+/// ## Learned cardinality
+///
+/// Since Wave 14, a [`LearnedCardinality`] estimator may optionally be
+/// attached via [`Self::with_learned`]. When present, the cost model
+/// delegates equality and range selectivity lookups to the learned
+/// estimator (per-(table, column) histograms + global correction factor)
+/// instead of falling back to the fixed `0.1` / `0.33` analytic defaults
+/// from [`CardinalityEstimator`].
+#[derive(Debug, Clone)]
 pub struct CostModel {
     /// CPU clock frequency in Hz (e.g. `3.0e9` for 3 GHz).
     pub cpu_freq_hz: f64,
@@ -94,6 +114,11 @@ pub struct CostModel {
     pub memory_bandwidth_bps: f64,
     /// Cell size in bytes (always 8 — turbogp is a u64-word engine, ADR-001).
     pub cell_size: usize,
+    /// Optional learned cardinality estimator (Wave 14). When `Some`,
+    /// selectivity lookups are served from per-(table, column) histograms
+    /// with a globally-corrected prior; when `None`, the cost model falls
+    /// back to the analytic `0.1` / `0.33` defaults.
+    pub learned: Option<LearnedCardinality>,
 }
 
 impl CostModel {
@@ -162,15 +187,108 @@ impl CostModel {
         }
         n_cells as f64 / throughput
     }
+
+    /// Attach a [`LearnedCardinality`] estimator to this cost model.
+    ///
+    /// When the learned estimator is present, [`Self::estimate_selectivity`]
+    /// and [`Self::estimate_range`] delegate to it (per-(table, column)
+    /// histograms + global correction factor). When absent, they fall back
+    /// to the analytic defaults (`0.1` for equality, `0.33` for range).
+    ///
+    /// Consumes `self` and returns a new `CostModel` with the estimator
+    /// attached. The hardware parameters are preserved.
+    #[must_use]
+    pub fn with_learned(mut self, learned: LearnedCardinality) -> Self {
+        self.learned = Some(learned);
+        self
+    }
+
+    /// Borrow the attached [`LearnedCardinality`] estimator, if any.
+    #[must_use]
+    pub fn learned(&self) -> Option<&LearnedCardinality> {
+        self.learned.as_ref()
+    }
+
+    /// Take ownership of the attached [`LearnedCardinality`] estimator,
+    /// leaving `None` in its place.
+    pub fn take_learned(&mut self) -> Option<LearnedCardinality> {
+        self.learned.take()
+    }
+
+    /// Estimate the equality selectivity of `column = value` on `table`.
+    ///
+    /// When a [`LearnedCardinality`] estimator is attached, this delegates
+    /// to [`LearnedCardinality::estimate_selectivity`] (histogram bucket
+    /// density). Otherwise it falls back to the analytic default `0.1`
+    /// (matching [`CardinalityEstimator::estimate_selectivity`] for
+    /// equality predicates).
+    #[must_use]
+    pub fn estimate_selectivity(&self, table: &str, column: &str, value: u64) -> f64 {
+        match &self.learned {
+            Some(l) => l.estimate_selectivity(table, column, value),
+            None => 0.1,
+        }
+    }
+
+    /// Estimate the range selectivity of `low <= column <= high` on
+    /// `table`.
+    ///
+    /// When a [`LearnedCardinality`] estimator is attached, this delegates
+    /// to [`LearnedCardinality::estimate_range`] (sum of overlapping
+    /// histogram buckets). Otherwise it falls back to the analytic default
+    /// `0.33` (matching [`CardinalityEstimator::estimate_selectivity`] for
+    /// range predicates).
+    #[must_use]
+    pub fn estimate_range(&self, table: &str, column: &str, low: u64, high: u64) -> f64 {
+        match &self.learned {
+            Some(l) => l.estimate_range(table, column, low, high),
+            None => 0.33,
+        }
+    }
+
+    /// Estimate the cardinality of an equi-join
+    /// `left_table.left_col = right_table.right_col`.
+    ///
+    /// When a [`LearnedCardinality`] estimator is attached, this delegates
+    /// to [`LearnedCardinality::estimate_join`] (per-bucket histogram
+    /// overlap if both columns are trained, else FK assumption).
+    /// Otherwise it falls back to the FK assumption
+    /// `min(left_rows, right_rows)`.
+    #[must_use]
+    pub fn estimate_join(
+        &self,
+        left_table: &str,
+        right_table: &str,
+        left_col: &str,
+        right_col: &str,
+        left_rows: usize,
+        right_rows: usize,
+    ) -> f64 {
+        match &self.learned {
+            Some(l) => {
+                l.estimate_join(left_table, right_table, left_col, right_col, left_rows, right_rows)
+            }
+            None => (left_rows.min(right_rows)) as f64,
+        }
+    }
 }
 
 impl Default for CostModel {
-    /// Zen 5 defaults: 3 GHz, 8 AVX-512 lanes, 40 GB/s DRAM, 8-byte cells.
+    /// Zen 5 defaults: 3 GHz, 8 AVX-512 lanes, 40 GB/s DRAM, 8-byte cells,
+    /// no learned estimator.
     ///
     /// These match the measured throughputs in ADR-023 (24 G cells/sec L3,
-    /// 5 G cells/sec DRAM) to within 5%.
+    /// 5 G cells/sec DRAM) to within 5%. The `learned` field defaults to
+    /// `None` — callers opt in to learned cardinality by calling
+    /// [`CostModel::with_learned`].
     fn default() -> Self {
-        Self { cpu_freq_hz: 3.0e9, simd_lanes: 8, memory_bandwidth_bps: 40.0e9, cell_size: 8 }
+        Self {
+            cpu_freq_hz: 3.0e9,
+            simd_lanes: 8,
+            memory_bandwidth_bps: 40.0e9,
+            cell_size: 8,
+            learned: None,
+        }
     }
 }
 
@@ -428,5 +546,119 @@ mod tests {
         assert_eq!(cm.simd_lanes, 8);
         assert!((cm.memory_bandwidth_bps - 40.0e9).abs() < 1.0);
         assert_eq!(cm.cell_size, 8);
+        // Default has no learned estimator attached.
+        assert!(cm.learned.is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // Learned-cardinality integration (Wave 14)
+    // -------------------------------------------------------------------------
+
+    /// `CostModel::estimate_selectivity` falls back to `0.1` when no
+    /// learned estimator is attached (matching `CardinalityEstimator`).
+    #[test]
+    fn cost_model_estimate_selectivity_without_learned_returns_default() {
+        let cm = CostModel::default();
+        let sel = cm.estimate_selectivity("orders", "id", 42);
+        assert!((sel - 0.1).abs() < 1e-9, "no-learned selectivity = {sel}, expected 0.1");
+    }
+
+    /// `CostModel::estimate_range` falls back to `0.33` when no learned
+    /// estimator is attached.
+    #[test]
+    fn cost_model_estimate_range_without_learned_returns_default() {
+        let cm = CostModel::default();
+        let sel = cm.estimate_range("orders", "id", 10, 20);
+        assert!((sel - 0.33).abs() < 1e-9, "no-learned range = {sel}, expected 0.33");
+    }
+
+    /// `CostModel::estimate_join` falls back to the FK assumption when no
+    /// learned estimator is attached.
+    #[test]
+    fn cost_model_estimate_join_without_learned_uses_fk_assumption() {
+        let cm = CostModel::default();
+        let join = cm.estimate_join("orders", "customers", "cust_id", "id", 1_000, 100);
+        assert!(
+            (join - 100.0).abs() < 1e-9,
+            "no-learned join = {join}, expected min(1000,100)=100"
+        );
+    }
+
+    /// `CostModel::with_learned` attaches a learned estimator, and the
+    /// selectivity lookup is delegated to the histogram.
+    #[test]
+    fn cost_model_with_learned_delegates_to_histogram() {
+        let mut learned = LearnedCardinality::new();
+        // 1000 uniform values in [0, 999] → 100 buckets of width 10,
+        // 10 rows per bucket.
+        let values: Vec<u64> = (0..1000).collect();
+        learned.train_table("orders", "id", &values);
+
+        let cm = CostModel::default().with_learned(learned);
+        assert!(cm.learned.is_some());
+
+        // Value 50 lands in bucket 5 ([50, 60)), density = 10/1000 = 0.01.
+        let sel = cm.estimate_selectivity("orders", "id", 50);
+        assert!((sel - 0.01).abs() < 1e-9, "learned selectivity = {sel}, expected 0.01");
+
+        // Range [25, 45] spans 3 buckets ([20,30), [30,40), [40,50)) → 0.03.
+        let rsel = cm.estimate_range("orders", "id", 25, 45);
+        assert!((rsel - 0.03).abs() < 1e-9, "learned range = {rsel}, expected 0.03");
+    }
+
+    /// `CostModel::with_learned` preserves the hardware parameters.
+    #[test]
+    fn cost_model_with_learned_preserves_hardware_params() {
+        let cm = CostModel::default().with_learned(LearnedCardinality::new());
+        assert!((cm.cpu_freq_hz - 3.0e9).abs() < 1.0);
+        assert_eq!(cm.simd_lanes, 8);
+        assert!((cm.memory_bandwidth_bps - 40.0e9).abs() < 1.0);
+        assert_eq!(cm.cell_size, 8);
+        assert!(cm.learned.is_some());
+    }
+
+    /// `CostModel::take_learned` removes the learned estimator.
+    #[test]
+    fn cost_model_take_learned_removes_estimator() {
+        let mut cm = CostModel::default().with_learned(LearnedCardinality::new());
+        assert!(cm.learned.is_some());
+        let taken = cm.take_learned();
+        assert!(taken.is_some());
+        assert!(cm.learned.is_none());
+        // After taking, selectivity falls back to the default.
+        assert!((cm.estimate_selectivity("t", "c", 1) - 0.1).abs() < 1e-9);
+    }
+
+    /// `CostModel::estimate_join` with a learned estimator uses histogram
+    /// overlap when both columns are trained.
+    #[test]
+    fn cost_model_estimate_join_with_learned_uses_histogram_overlap() {
+        let mut learned = LearnedCardinality::new();
+        let left: Vec<u64> = (0..100).collect();
+        learned.train_table("L", "k", &left);
+        let right: Vec<u64> = (0..100).collect();
+        learned.train_table("R", "k", &right);
+        let cm = CostModel::default().with_learned(learned);
+        // Both columns have identical histograms covering [0, 100) with
+        // 100 buckets of 1 row each. Every bucket overlaps, so the join
+        // estimate = Σ min(1, 1) = 100.
+        let join = cm.estimate_join("L", "R", "k", "k", 100, 100);
+        assert!(
+            (join - 100.0).abs() < 1e-9,
+            "histogram-overlap join = {join}, expected 100 (full overlap)"
+        );
+    }
+
+    /// `CostModel` is `Clone` (so callers can snapshot it before attaching
+    /// a learned estimator and restore the analytic baseline if calibration
+    /// goes wrong).
+    #[test]
+    fn cost_model_is_clone() {
+        let cm = CostModel::default();
+        let cm2 = cm.clone();
+        assert!((cm.cpu_freq_hz - cm2.cpu_freq_hz).abs() < 1e-9);
+        assert_eq!(cm.simd_lanes, cm2.simd_lanes);
+        assert!(cm.learned.is_none());
+        assert!(cm2.learned.is_none());
     }
 }

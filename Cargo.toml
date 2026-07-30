@@ -64,6 +64,11 @@ name = "bench_wcoj"
 harness = false
 path = "benches/bench_wcoj.rs"
 
+[[bench]]
+name = "bench_cardinality"
+harness = false
+path = "benches/bench_cardinality.rs"
+
 [profile.release]
 opt-level = 3
 lto = "fat"

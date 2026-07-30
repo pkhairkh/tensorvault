@@ -59,10 +59,12 @@ use crate::planner::CostModel;
 /// of [`KernelInvocation`]s, picking the best kernel per (operator, tier)
 /// using the [`CostModel`].
 ///
-/// Created with a [`CostModel`] (hardware parameters) and a [`KernelTable`]
-/// (the available kernels). The lowerer is `Send + Sync` because both fields
-/// are thread-safe (`CostModel` is `Copy`, `KernelTable` is behind an
-/// `Arc` and uses internal locking).
+/// Created with a [`CostModel`] (hardware parameters, optionally with a
+/// [`LearnedCardinality`](crate::planner::learned::LearnedCardinality)
+/// estimator attached) and a [`KernelTable`] (the available kernels). The
+/// lowerer is `Send + Sync` because both fields are thread-safe
+/// (`CostModel` is `Clone` and contains only `Send + Sync` fields;
+/// `KernelTable` is behind an `Arc` and uses internal locking).
 pub struct PlanLowerer {
     /// The cost model used to estimate per-tier compute costs.
     cost_model: CostModel,
