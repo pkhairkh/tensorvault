@@ -216,12 +216,54 @@ fn build_filter_mask(query: &SelectQuery, table: &Table) -> Result<Vec<bool>> {
     match &query.where_clause {
         None => Ok(vec![true; table.row_count]),
         Some(expr) => {
-            // filter_rows returns Vec<usize> (indices), convert to mask
+            // Check for LIKE on a string column first
+            if let Some(mask) = try_string_like_filter(expr, table) {
+                return Ok(mask);
+            }
+            // Fall back to vectorized u64 filter
             let indices = vectorized::filter_rows(&table.columns, &table.column_names, table.row_count, expr);
             let mut mask = vec![false; table.row_count];
             for i in indices { mask[i] = true; }
             Ok(mask)
         }
+    }
+}
+
+/// Check if the WHERE clause is a LIKE on a string column.
+/// If so, use StringSearchColumn for real string matching.
+fn try_string_like_filter(expr: &crate::sql::parser::Expr, table: &Table) -> Option<Vec<bool>> {
+    use crate::sql::parser::{Expr as PExpr, Value};
+    match expr {
+        PExpr::Binary { left, op, right } => {
+            let op_upper = op.to_uppercase();
+            if op_upper != "LIKE" && op_upper != "NOT LIKE" {
+                if op_upper == "AND" {
+                    let left_mask = try_string_like_filter(left, table)?;
+                    let right_mask = try_string_like_filter(right, table)?;
+                    return Some(left_mask.iter().zip(right_mask.iter()).map(|(&a, &b)| a && b).collect());
+                }
+                if op_upper == "OR" {
+                    let left_mask = try_string_like_filter(left, table)?;
+                    let right_mask = try_string_like_filter(right, table)?;
+                    return Some(left_mask.iter().zip(right_mask.iter()).map(|(&a, &b)| a || b).collect());
+                }
+                return None;
+            }
+            let (col_name, pattern) = match (left.as_ref(), right.as_ref()) {
+                (PExpr::Column(name), PExpr::Literal(Value::String(s))) => (name.clone(), s.clone()),
+                (PExpr::Literal(Value::String(s)), PExpr::Column(name)) => (name.clone(), s.clone()),
+                _ => return None,
+            };
+            let col_idx = resolve_col_name(&col_name, table).ok()?;
+            if col_idx >= table.string_columns.len() { return None; }
+            let string_col = table.string_columns[col_idx].as_ref()?;
+            let mut mask = string_col.like_contains_mask(&pattern);
+            if op_upper == "NOT LIKE" {
+                for m in mask.iter_mut() { *m = !*m; }
+            }
+            Some(mask)
+        }
+        _ => None,
     }
 }
 
