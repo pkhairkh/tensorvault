@@ -9,10 +9,10 @@ fn main() {
 
     // Create lineitem-like table
     let mut li = vec![
-        LoadedColumn { name: "l_orderkey".into(), cells: Vec::with_capacity(n), row_count: n },
-        LoadedColumn { name: "l_partkey".into(), cells: Vec::with_capacity(n), row_count: n },
-        LoadedColumn { name: "l_quantity".into(), cells: Vec::with_capacity(n), row_count: n },
-        LoadedColumn { name: "l_extendedprice".into(), cells: Vec::with_capacity(n), row_count: n },
+        LoadedColumn { name: "l_orderkey".into(), cells: Vec::with_capacity(n), row_count: n, string_search: None },
+        LoadedColumn { name: "l_partkey".into(), cells: Vec::with_capacity(n), row_count: n, string_search: None },
+        LoadedColumn { name: "l_quantity".into(), cells: Vec::with_capacity(n), row_count: n, string_search: None },
+        LoadedColumn { name: "l_extendedprice".into(), cells: Vec::with_capacity(n), row_count: n, string_search: None },
     ];
     for i in 0..n {
         li[0].cells.push((i / 5) as u64);
@@ -25,9 +25,9 @@ fn main() {
     // Create orders-like table (n/5 rows)
     let on = n / 5;
     let mut ord = vec![
-        LoadedColumn { name: "o_orderkey".into(), cells: Vec::with_capacity(on), row_count: on },
-        LoadedColumn { name: "o_orderdate".into(), cells: Vec::with_capacity(on), row_count: on },
-        LoadedColumn { name: "o_totalprice".into(), cells: Vec::with_capacity(on), row_count: on },
+        LoadedColumn { name: "o_orderkey".into(), cells: Vec::with_capacity(on), row_count: on, string_search: None },
+        LoadedColumn { name: "o_orderdate".into(), cells: Vec::with_capacity(on), row_count: on, string_search: None },
+        LoadedColumn { name: "o_totalprice".into(), cells: Vec::with_capacity(on), row_count: on, string_search: None },
     ];
     for i in 0..on {
         ord[0].cells.push(i as u64);
@@ -39,8 +39,8 @@ fn main() {
     // Create customer table (1500 rows)
     let cn = 1500;
     let mut cust = vec![
-        LoadedColumn { name: "c_custkey".into(), cells: Vec::with_capacity(cn), row_count: cn },
-        LoadedColumn { name: "c_nationkey".into(), cells: Vec::with_capacity(cn), row_count: cn },
+        LoadedColumn { name: "c_custkey".into(), cells: Vec::with_capacity(cn), row_count: cn, string_search: None },
+        LoadedColumn { name: "c_nationkey".into(), cells: Vec::with_capacity(cn), row_count: cn, string_search: None },
     ];
     for i in 0..cn {
         cust[0].cells.push(i as u64);

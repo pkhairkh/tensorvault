@@ -6,10 +6,10 @@ use std::time::Instant;
 fn main() {
     let n = 1_000_000;
     let mut cols = vec![
-        LoadedColumn { name: "id".into(), cells: Vec::with_capacity(n), row_count: n },
-        LoadedColumn { name: "EventDate".into(), cells: Vec::with_capacity(n), row_count: n },
-        LoadedColumn { name: "AdvEngineID".into(), cells: Vec::with_capacity(n), row_count: n },
-        LoadedColumn { name: "RegionID".into(), cells: Vec::with_capacity(n), row_count: n },
+        LoadedColumn { name: "id".into(), cells: Vec::with_capacity(n), row_count: n, string_search: None },
+        LoadedColumn { name: "EventDate".into(), cells: Vec::with_capacity(n), row_count: n, string_search: None },
+        LoadedColumn { name: "AdvEngineID".into(), cells: Vec::with_capacity(n), row_count: n, string_search: None },
+        LoadedColumn { name: "RegionID".into(), cells: Vec::with_capacity(n), row_count: n, string_search: None },
     ];
     for i in 0..n {
         cols[0].cells.push(i as u64);

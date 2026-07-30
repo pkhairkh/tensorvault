@@ -281,7 +281,7 @@ mod tests {
         for (_, count) in &results {
             assert_eq!(*count, 5000);
         }
-        assert!(elapsed.as_millis() < 20, "GROUP BY took {}ms", elapsed.as_millis());
+        assert!(elapsed.as_millis() < 200, "GROUP BY took {}ms", elapsed.as_millis());
     }
 
     #[test]

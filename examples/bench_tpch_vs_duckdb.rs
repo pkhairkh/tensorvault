@@ -16,7 +16,7 @@ fn generate_lineitem(n: usize) -> Table {
         cols[2].push((i % 10) as u64);
         cols[3].push((i % 365) as u64);
     }
-    Table { name: "lineitem".into(), columns: cols, column_names: names, row_count: n }
+    Table { name: "lineitem".into(), columns: cols, column_names: names, row_count: n, string_columns: vec![None; 4] }
 }
 
 fn run_duckdb(sql: &str, db_path: &str) -> Option<String> {
