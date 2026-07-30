@@ -26,12 +26,18 @@
 //! - [`sql`] — the SQL surface: tokenizer, recursive-descent parser for
 //!   `SELECT`, scanner for the seven turboGP extensions, and the lowering
 //!   pass that turns a parsed query into a [`executor::plan::LogicalPlan`].
+//! - [`datasource`] — external-format ingestion (Parquet, CSV) into the
+//!   engine's `Vec<u64>` cell format. Wave 19.
+//! - [`catalog`] — in-memory table registry: name → [`datasource::Table`].
+//!   Wave 19.
 //! - [`types`] — linear/affine memory handles (`CxlRef`, `RaftRef`) that
 //!   enforce protocol boundaries at compile time (ADR-013).
 
 #![warn(rust_2018_idioms, missing_docs)]
 
+pub mod catalog;
 pub mod compress;
+pub mod datasource;
 pub mod executor;
 pub mod index;
 pub mod kernel;
