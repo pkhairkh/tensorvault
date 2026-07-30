@@ -31,6 +31,7 @@
 
 #![warn(rust_2018_idioms, missing_docs)]
 
+pub mod compress;
 pub mod executor;
 pub mod index;
 pub mod kernel;

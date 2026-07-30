@@ -51,6 +51,13 @@
 //!   `KernelInvocation`s, picking the cheapest tier per operator and
 //!   dispatching each join to either `HashProbe` or `LeapfrogJoin` via
 //!   [`wcoj::choose_join_algorithm`].
+//! - [`tensor`] — tensor-network model of a relational join (Wave 17).
+//!   Models the join as a tensor-network contraction (arXiv:2209.12332),
+//!   giving polynomial-time optimal ordering for acyclic queries via tree
+//!   decomposition. The treewidth of the network equals the AGM bound
+//!   exponent.
+//! - [`contraction`] — converts a tensor contraction order into a
+//!   [`JoinTree`] compatible with DPccp and MCTS (Wave 17).
 //!
 //! ## Calibration
 //!
@@ -71,26 +78,30 @@
 pub mod agm;
 pub mod calibration;
 pub mod cardinality;
+pub mod contraction;
 pub mod dpccp;
 pub mod graph_prune;
 pub mod kingman;
 pub mod learned;
 pub mod lowerer;
 pub mod mcts;
+pub mod tensor;
 pub mod wcoj;
 
 pub use agm::{agm_bound, JoinHypergraph};
 pub use calibration::CalibrationLoop;
 pub use cardinality::CardinalityEstimator;
+pub use contraction::contraction_to_join_tree;
 pub use dpccp::{dpccp, JoinRelation, JoinTree};
 pub use graph_prune::GraphPruner;
 pub use kingman::KingmanPredictor;
 pub use learned::{Histogram, LearnedCardinality};
 pub use lowerer::PlanLowerer;
 pub use mcts::MctsJoinOrderer;
+pub use tensor::TensorNetwork;
 pub use wcoj::{build_wcoj_plan, choose_join_algorithm, JoinAlgorithm, WcojPlan};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::executor::plan::{LogicalPlan, PlanNode};
 use crate::kernel::Operator;
 use crate::memory::tier::MemoryTier;
@@ -415,6 +426,88 @@ pub fn order_joins(relations: &[JoinRelation]) -> Result<JoinTree> {
     } else {
         MctsJoinOrderer::new().order(relations)
     }
+}
+
+/// Plan a join using the tensor-network contraction model (Wave 17).
+///
+/// This is the third join-ordering entry point in turboGP, alongside
+/// [`order_joins`] (DPccp + MCTS) and [`dpccp`] (DPccp only). It models
+/// the join as a tensor-network contraction (arXiv:2209.12332) and
+/// finds the optimal contraction order for acyclic queries in
+/// polynomial time via tree decomposition.
+///
+/// # Algorithm
+///
+/// 1. Build a [`TensorNetwork`] from the join hypergraph + per-relation
+///    cardinalities.
+/// 2. Find the optimal contraction order via
+///    [`TensorNetwork::optimal_contraction_order`] (greedy minimum-cost
+///    contraction — polynomial-time, optimal for acyclic queries).
+/// 3. Convert the contraction order into a [`JoinTree`] via
+///    [`contraction_to_join_tree`].
+///
+/// The resulting [`JoinTree`] uses the same cost formula as DPccp
+/// (`cost(left) + cost(right) + |left| · |right|`), so its [`JoinTree::cost`]
+/// is directly comparable to a DPccp plan's cost.
+///
+/// # When to use this vs. [`order_joins`]
+///
+/// - For **acyclic queries** with a known hypergraph (e.g., compiled
+///   from SQL with explicit join predicates), `plan_with_tensor_network`
+///   finds the optimal contraction in `O(n³)` time — faster than
+///   DPccp's `O(n² · 2ⁿ)` for `n ≥ 10`.
+/// - For **cyclic queries** (e.g., triangle, 4-clique), the greedy
+///   contraction order is no longer guaranteed optimal — DPccp or MCTS
+///   may find a better plan. The tensor-network plan is still a valid
+///   starting point.
+///
+/// # Errors
+///
+/// - [`Error::InvalidArg`] if `relations` is empty.
+/// - [`Error::InvalidArg`] if `relations.len() != graph.relations.len()`.
+/// - [`Error::InvalidArg`] if `cardinalities.len() != relations.len()`.
+/// - Propagates errors from [`contraction_to_join_tree`] if the
+///   contraction order is incomplete or invalid.
+///
+/// # Examples
+///
+/// ```
+/// use turbogp::planner::{plan_with_tensor_network, JoinHypergraph, JoinRelation};
+///
+/// let relations = vec![
+///     JoinRelation { name: "R".into(), cardinality: 100, joins_with: vec![1] },
+///     JoinRelation { name: "S".into(), cardinality: 200, joins_with: vec![0] },
+/// ];
+/// let graph = JoinHypergraph::from_named(&["A", "B"], &[vec!["A", "B"], vec!["A", "B"]]);
+/// let tree = plan_with_tensor_network(&relations, &graph, &[100, 200])
+///     .expect("tensor-network plan should succeed");
+/// assert!(tree.cost() > 0.0);
+/// ```
+pub fn plan_with_tensor_network(
+    relations: &[JoinRelation],
+    graph: &JoinHypergraph,
+    cardinalities: &[usize],
+) -> Result<JoinTree> {
+    if relations.is_empty() {
+        return Err(Error::InvalidArg("plan_with_tensor_network: no relations provided".into()));
+    }
+    if relations.len() != graph.relations.len() {
+        return Err(Error::InvalidArg(format!(
+            "plan_with_tensor_network: {} relations but hypergraph has {} edges",
+            relations.len(),
+            graph.relations.len(),
+        )));
+    }
+    if cardinalities.len() != relations.len() {
+        return Err(Error::InvalidArg(format!(
+            "plan_with_tensor_network: {} relations but {} cardinalities",
+            relations.len(),
+            cardinalities.len(),
+        )));
+    }
+    let network = TensorNetwork::from_hypergraph(graph, cardinalities);
+    let order = network.optimal_contraction_order();
+    contraction_to_join_tree(&network, &order, relations)
 }
 
 #[cfg(test)]
@@ -833,5 +926,87 @@ mod tests {
     #[test]
     fn order_joins_rejects_empty_input() {
         assert!(order_joins(&[]).is_err(), "order_joins should reject empty input");
+    }
+
+    /// Test 17-8: `plan_with_tensor_network` produces a valid plan for a
+    /// 3-table join (triangle).
+    #[test]
+    fn plan_with_tensor_network_three_table_join() {
+        let relations = vec![
+            JoinRelation { name: "R".into(), cardinality: 100, joins_with: vec![1, 2] },
+            JoinRelation { name: "S".into(), cardinality: 100, joins_with: vec![0, 2] },
+            JoinRelation { name: "T".into(), cardinality: 100, joins_with: vec![0, 1] },
+        ];
+        let graph = JoinHypergraph::from_named(
+            &["A", "B", "C"],
+            &[vec!["A", "B"], vec!["B", "C"], vec!["A", "C"]],
+        );
+        let tree = plan_with_tensor_network(&relations, &graph, &[100, 100, 100])
+            .expect("tensor-network plan should succeed");
+        // Cost should match the dpccp plan on the same triangle (the cost
+        // formula is identical: cost(S ⋈ j) = cost(S) + cost(j) + |S|·|j|).
+        // Triangle has 3 relations → 2 joins → cost = 100*100 + 100*100 = 20000.
+        assert!(
+            (tree.cost() - 20_000.0).abs() < 1e-6,
+            "tensor-network plan cost = {}, expected 20000",
+            tree.cost()
+        );
+        assert_eq!(tree.cardinality(), 100);
+    }
+
+    /// `plan_with_tensor_network` on a 5-relation star query produces a
+    /// valid tree. The hypergraph has 5 relations on 6 attributes
+    /// (center B, leaves A/C/D/E/F).
+    #[test]
+    fn plan_with_tensor_network_five_relation_star() {
+        let relations = vec![
+            JoinRelation { name: "R0".into(), cardinality: 100, joins_with: vec![1, 2, 3, 4] },
+            JoinRelation { name: "R1".into(), cardinality: 200, joins_with: vec![0] },
+            JoinRelation { name: "R2".into(), cardinality: 150, joins_with: vec![0] },
+            JoinRelation { name: "R3".into(), cardinality: 50, joins_with: vec![0] },
+            JoinRelation { name: "R4".into(), cardinality: 300, joins_with: vec![0] },
+        ];
+        // R0(A,B), R1(B,C), R2(B,D), R3(B,E), R4(B,F) — 5 relations on 6 attrs.
+        let graph = JoinHypergraph::from_named(
+            &["A", "B", "C", "D", "E", "F"],
+            &[vec!["A", "B"], vec!["B", "C"], vec!["B", "D"], vec!["B", "E"], vec!["B", "F"]],
+        );
+        let tree = plan_with_tensor_network(&relations, &graph, &[100, 200, 150, 50, 300])
+            .expect("tensor-network plan should succeed");
+        assert!(tree.cost() > 0.0, "cost should be positive");
+        assert!(tree.cardinality() > 0, "cardinality should be positive");
+    }
+
+    /// `plan_with_tensor_network` rejects an empty input.
+    #[test]
+    fn plan_with_tensor_network_rejects_empty_input() {
+        let result = plan_with_tensor_network(
+            &[],
+            &JoinHypergraph { relations: vec![], attributes: vec![] },
+            &[],
+        );
+        assert!(result.is_err(), "should reject empty input");
+    }
+
+    /// `plan_with_tensor_network` rejects mismatched lengths.
+    #[test]
+    fn plan_with_tensor_network_rejects_mismatched_lengths() {
+        let relations =
+            vec![JoinRelation { name: "R".into(), cardinality: 100, joins_with: vec![] }];
+        let graph = JoinHypergraph::from_named(&["A"], &[vec!["A"], vec!["A"]]);
+        let result = plan_with_tensor_network(&relations, &graph, &[100]);
+        assert!(result.is_err(), "should reject mismatched relations/graph lengths");
+    }
+
+    /// `plan_with_tensor_network` rejects mismatched cardinalities.
+    #[test]
+    fn plan_with_tensor_network_rejects_mismatched_cardinalities() {
+        let relations = vec![
+            JoinRelation { name: "R".into(), cardinality: 100, joins_with: vec![1] },
+            JoinRelation { name: "S".into(), cardinality: 200, joins_with: vec![0] },
+        ];
+        let graph = JoinHypergraph::from_named(&["A", "B"], &[vec!["A", "B"], vec!["A", "B"]]);
+        let result = plan_with_tensor_network(&relations, &graph, &[100]);
+        assert!(result.is_err(), "should reject mismatched cardinalities length");
     }
 }

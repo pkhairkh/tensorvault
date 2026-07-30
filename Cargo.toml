@@ -81,6 +81,11 @@ name = "bench_eddy"
 harness = false
 path = "benches/bench_eddy.rs"
 
+[[bench]]
+name = "bench_tensor"
+harness = false
+path = "benches/bench_tensor.rs"
+
 [profile.release]
 opt-level = 3
 lto = "fat"
