@@ -70,16 +70,18 @@ pub fn or_mask(left: &[bool], right: &[bool], out: &mut [bool]) {
 /// OP can be: =, !=, <, >, <=, >=
 pub fn filter_rows(
     columns: &[Vec<u64>],
+    column_names: &[String],
     row_count: usize,
     where_expr: &crate::sql::parser::Expr,
 ) -> Vec<usize> {
     let mut mask = vec![true; row_count];
-    eval_where(columns, row_count, where_expr, &mut mask);
+    eval_where(columns, column_names, row_count, where_expr, &mut mask);
     (0..row_count).filter(|&i| mask[i]).collect()
 }
 
 fn eval_where(
     columns: &[Vec<u64>],
+    column_names: &[String],
     row_count: usize,
     expr: &crate::sql::parser::Expr,
     mask: &mut [bool],
@@ -88,20 +90,20 @@ fn eval_where(
         crate::sql::parser::Expr::Binary { left, op, right } => {
             let op_upper = op.to_uppercase();
             if op_upper == "AND" {
-                eval_where(columns, row_count, left, mask);
+                eval_where(columns, column_names, row_count, left, mask);
                 let mut right_mask = vec![true; row_count];
-                eval_where(columns, row_count, right, &mut right_mask);
+                eval_where(columns, column_names, row_count, right, &mut right_mask);
                 let left_mask = mask.to_vec();
                 and_mask(&left_mask, &right_mask, mask);
             } else if op_upper == "OR" {
                 let mut left_mask = vec![true; row_count];
                 let mut right_mask = vec![true; row_count];
-                eval_where(columns, row_count, left, &mut left_mask);
-                eval_where(columns, row_count, right, &mut right_mask);
+                eval_where(columns, column_names, row_count, left, &mut left_mask);
+                eval_where(columns, column_names, row_count, right, &mut right_mask);
                 or_mask(&left_mask, &right_mask, mask);
             } else {
                 // col OP literal
-                if let (Some(col_idx), Some(val)) = extract_col_and_value_batch(left, right) {
+                if let (Some(col_idx), Some(val)) = extract_col_and_value_batch(left, right, column_names) {
                     let col = &columns[col_idx];
                     match op_upper.as_str() {
                         "=" => filter_eq(col, val, mask),
@@ -122,21 +124,40 @@ fn eval_where(
 fn extract_col_and_value_batch(
     left: &crate::sql::parser::Expr,
     right: &crate::sql::parser::Expr,
+    column_names: &[String],
 ) -> (Option<usize>, Option<u64>) {
     use crate::sql::parser::{Expr, Value};
     // Try left=column, right=literal
     if let Expr::Column(name) = left {
         if let Expr::Literal(val) = right {
-            return (name.parse::<usize>().ok(), value_to_u64(val));
+            // Look up column name
+            let idx = resolve_name(name, column_names);
+            return (idx, value_to_u64(val));
         }
     }
     // Try right=column, left=literal
     if let Expr::Column(name) = right {
         if let Expr::Literal(val) = left {
-            return (name.parse::<usize>().ok(), value_to_u64(val));
+            let idx = resolve_name(name, column_names);
+            return (idx, value_to_u64(val));
         }
     }
     (None, None)
+}
+
+fn resolve_name(name: &str, column_names: &[String]) -> Option<usize> {
+    // Direct lookup
+    if let Some(idx) = column_names.iter().position(|n| n == name) {
+        return Some(idx);
+    }
+    // Try stripping table prefix (table.col -> col)
+    if let Some(bare) = name.split('.').nth(1) {
+        if let Some(idx) = column_names.iter().position(|n| n == bare) {
+            return Some(idx);
+        }
+    }
+    // Try parsing as index (backward compat)
+    name.parse::<usize>().ok()
 }
 
 fn value_to_u64(val: &crate::sql::parser::Value) -> Option<u64> {

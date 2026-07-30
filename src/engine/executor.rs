@@ -26,6 +26,7 @@ use crate::memory::tier::MemoryTier;
 use crate::sql::parser::{Expr, SelectItem, SelectQuery, Value};
 use crate::sql::extensions::QueryExtensions;
 use crate::Error;
+use crate::engine::dispatch;
 use std::collections::HashMap;
 
 type Result<T> = std::result::Result<T, Error>;
@@ -42,6 +43,11 @@ pub fn execute_select(
     let table = catalog
         .get(&query.from)
         .ok_or_else(|| Error::NotFound(format!("table '{}'", query.from)))?;
+
+    // Try kernel-direct dispatch first (10-30x faster than per-row evaluation).
+    if let Some(result) = dispatch::execute_dispatched(query, table) {
+        return result;
+    }
 
     // 2. Parse the WHERE clause
     let filter = parse_where(&query.where_clause, table)?;
@@ -654,7 +660,7 @@ fn filter_indices_batch(where_clause: &WhereClause, table: &Table) -> Option<Vec
     match where_clause {
         WhereClause::Single(f) => {
             let expr = filter_to_expr(f);
-            Some(crate::exec::vectorized::filter_rows(&table.columns, table.row_count, &expr))
+            Some(crate::exec::vectorized::filter_rows(&table.columns, &table.column_names, table.row_count, &expr))
         }
         WhereClause::And(l, r) => {
             let left_expr = where_clause_to_expr(l);
@@ -664,7 +670,7 @@ fn filter_indices_batch(where_clause: &WhereClause, table: &Table) -> Option<Vec
                 op: String::from("AND"),
                 right: Box::new(right_expr),
             };
-            Some(crate::exec::vectorized::filter_rows(&table.columns, table.row_count, &expr))
+            Some(crate::exec::vectorized::filter_rows(&table.columns, &table.column_names, table.row_count, &expr))
         }
         WhereClause::Or(l, r) => {
             let left_expr = where_clause_to_expr(l);
@@ -674,7 +680,7 @@ fn filter_indices_batch(where_clause: &WhereClause, table: &Table) -> Option<Vec
                 op: String::from("OR"),
                 right: Box::new(right_expr),
             };
-            Some(crate::exec::vectorized::filter_rows(&table.columns, table.row_count, &expr))
+            Some(crate::exec::vectorized::filter_rows(&table.columns, &table.column_names, table.row_count, &expr))
         }
         WhereClause::None => Some((0..table.row_count).collect()),
     }

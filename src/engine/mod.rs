@@ -565,3 +565,4 @@ mod tests {
         assert_eq!(r.column("v"), Some(&[3u64][..]));
     }
 }
+pub mod dispatch;
