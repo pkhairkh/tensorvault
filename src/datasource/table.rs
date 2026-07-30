@@ -96,8 +96,8 @@ mod tests {
         LoadedTable {
             name: "t".into(),
             columns: vec![
-                LoadedColumn { name: "id".into(), cells: vec![1, 2, 3], row_count: 3 },
-                LoadedColumn { name: "v".into(), cells: vec![10, 20, 30], row_count: 3 },
+                LoadedColumn { name: "id".into(), cells: vec![1, 2, 3], row_count: 3, string_search: None },
+                LoadedColumn { name: "v".into(), cells: vec![10, 20, 30], row_count: 3, string_search: None },
             ],
             row_count: 3,
         }
@@ -147,8 +147,8 @@ mod tests {
         let loaded = LoadedTable {
             name: "bad".into(),
             columns: vec![
-                LoadedColumn { name: "a".into(), cells: vec![1, 2, 3], row_count: 3 },
-                LoadedColumn { name: "b".into(), cells: vec![10, 20], row_count: 2 },
+                LoadedColumn { name: "a".into(), cells: vec![1, 2, 3], row_count: 3, string_search: None },
+                LoadedColumn { name: "b".into(), cells: vec![10, 20], row_count: 2, string_search: None },
             ],
             row_count: 5, // lie about row count
         };

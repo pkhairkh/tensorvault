@@ -130,7 +130,7 @@ pub fn read_csv(path: &str, has_header: bool) -> Result<LoadedTable, Box<dyn Err
             parsed_rows.iter().map(|row| xxh3::xxh3_64(row[col_idx].as_bytes())).collect()
         };
 
-        columns.push(LoadedColumn { name: name.clone(), cells, row_count });
+        columns.push(LoadedColumn { name: name.clone(), cells, row_count, string_search: None });
     }
 
     Ok(LoadedTable { name: LoadedTable::name_from_path(path), columns, row_count })

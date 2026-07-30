@@ -51,6 +51,8 @@ pub struct LoadedColumn {
     pub cells: Vec<u64>,
     /// Number of rows. Always equal to `cells.len()`.
     pub row_count: usize,
+    /// For string columns: actual string data for LIKE queries.
+    pub string_search: Option<crate::exec::fm_index::StringSearchColumn>,
 }
 
 /// A table loaded from Parquet — a name plus a `Vec<LoadedColumn>`.
@@ -117,8 +119,8 @@ pub fn read_parquet(path: &str) -> Result<LoadedTable, Box<dyn Error>> {
         }
 
         for (i, col) in batch.columns().iter().enumerate() {
-            let cells = convert_array_to_u64(col);
             // Each batch must have one value per column for every row.
+            let (cells, _) = convert_array_to_u64(col);
             col_cells[i].extend(cells);
         }
         total_rows += batch.num_rows();
@@ -145,7 +147,7 @@ pub fn read_parquet(path: &str) -> Result<LoadedTable, Box<dyn Error>> {
     let columns = col_names
         .into_iter()
         .zip(col_cells)
-        .map(|(name, cells)| LoadedColumn { name, row_count: total_rows, cells })
+        .map(|(name, cells)| LoadedColumn { name, row_count: total_rows, cells, string_search: None })
         .collect();
 
     Ok(LoadedTable { name, columns, row_count: total_rows })
@@ -181,11 +183,12 @@ pub fn read_parquet_column(path: &str, column_name: &str) -> Result<LoadedColumn
     for batch in reader {
         let batch: RecordBatch = batch?;
         let arr: &ArrayRef = batch.column(col_idx);
-        cells.extend(convert_array_to_u64(arr));
+        let (new_cells, _) = convert_array_to_u64(arr);
+        cells.extend(new_cells);
         row_count += batch.num_rows();
     }
 
-    Ok(LoadedColumn { name: column_name.to_string(), cells, row_count })
+    Ok(LoadedColumn { name: column_name.to_string(), cells, row_count, string_search: None })
 }
 
 /// Convert an Arrow [`ArrayRef`] into turboGP's `Vec<u64>` cell format.
@@ -198,9 +201,10 @@ pub fn read_parquet_column(path: &str, column_name: &str) -> Result<LoadedColumn
 ///
 /// Null values are encoded as `0u64` (the sentinel — see the module
 /// docs).
-fn convert_array_to_u64(array: &ArrayRef) -> Vec<u64> {
+fn convert_array_to_u64(array: &ArrayRef) -> (Vec<u64>, Option<crate::exec::fm_index::StringSearchColumn>) {
     let len = array.len();
     let mut out = Vec::with_capacity(len);
+    let mut string_search: Option<crate::exec::fm_index::StringSearchColumn> = None;
 
     match array.data_type() {
         // Int32 → `value as u64` (zero-extends; negative values
@@ -245,26 +249,36 @@ fn convert_array_to_u64(array: &ArrayRef) -> Vec<u64> {
         // string. Full string support deferred to a future wave.
         DataType::Utf8 => {
             if let Some(a) = array.as_any().downcast_ref::<StringArray>() {
+                let mut strings: Vec<String> = Vec::with_capacity(len);
                 for i in 0..len {
                     if a.is_null(i) {
                         out.push(0);
+                        strings.push(String::new());
                     } else {
-                        out.push(xxh3::xxh3_64(a.value(i).as_bytes()));
+                        let val = a.value(i);
+                        out.push(xxh3::xxh3_64(val.as_bytes()));
+                        strings.push(val.to_string());
                     }
                 }
+                string_search = Some(crate::exec::fm_index::StringSearchColumn::new(strings));
             }
         }
         // LargeUtf8 — same as Utf8; the only difference is the offset
         // width, which StringArray hides behind `value(i)`.
         DataType::LargeUtf8 => {
             if let Some(a) = array.as_any().downcast_ref::<StringArray>() {
+                let mut strings: Vec<String> = Vec::with_capacity(len);
                 for i in 0..len {
                     if a.is_null(i) {
                         out.push(0);
+                        strings.push(String::new());
                     } else {
-                        out.push(xxh3::xxh3_64(a.value(i).as_bytes()));
+                        let val = a.value(i);
+                        out.push(xxh3::xxh3_64(val.as_bytes()));
+                        strings.push(val.to_string());
                     }
                 }
+                string_search = Some(crate::exec::fm_index::StringSearchColumn::new(strings));
             }
         }
         // Boolean → 0u64 / 1u64.
@@ -305,7 +319,7 @@ fn convert_array_to_u64(array: &ArrayRef) -> Vec<u64> {
         out.resize(len, 0);
     }
 
-    out
+    (out, string_search)
 }
 
 /// Write a `RecordBatch` to a Parquet file at `path`. Used by tests
@@ -444,7 +458,7 @@ mod tests {
     /// the original for re-loads.
     #[test]
     fn loaded_types_are_clone() {
-        let col = LoadedColumn { name: "x".into(), cells: vec![1, 2, 3], row_count: 3 };
+        let col = LoadedColumn { name: "x".into(), cells: vec![1, 2, 3], row_count: 3, string_search: None };
         let col2 = col.clone();
         assert_eq!(col.cells, col2.cells);
 

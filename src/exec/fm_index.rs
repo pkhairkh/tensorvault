@@ -258,6 +258,7 @@ fn compute_bwt(text: &[u8]) -> Vec<u8> {
 /// A simpler string column that stores actual strings and does
 /// vectorized LIKE matching. This is the pragmatic approach:
 /// store strings, scan with SIMD-accelerated substring search.
+#[derive(Clone)]
 pub struct StringSearchColumn {
     /// Original strings, stored contiguously.
     pub strings: Vec<String>,
@@ -265,6 +266,12 @@ pub struct StringSearchColumn {
     pub offsets: Vec<usize>,
     /// Concatenated bytes (for SIMD scanning).
     pub bytes: Vec<u8>,
+}
+
+impl std::fmt::Debug for StringSearchColumn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "StringSearchColumn({} strings, {} bytes)", self.strings.len(), self.bytes.len())
+    }
 }
 
 impl StringSearchColumn {
