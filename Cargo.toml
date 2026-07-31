@@ -114,7 +114,8 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
-strip = "symbols"
+strip = "none"
+debug = "line-tables-only"
 
 [profile.bench]
 opt-level = 3
