@@ -1624,7 +1624,73 @@ impl<'a> TpchExec<'a> {
     }
 
     /// Find equi-join keys between two tables from a list of conjuncts.
+    /// Also handles OR of conjunctive groups (e.g. Q19): if all OR branches
+    /// share the same equi-join key, it is extracted and used for the join.
+    /// The OR is then applied as a post-join filter.
     fn find_join_keys(&self, left: &ExecTable, right: &ExecTable, conjuncts: &[Expr2]) -> Vec<JoinKey2> {
+        let mut keys = Vec::new();
+        for conj in conjuncts {
+            if let Expr2::BinOp { op: BinOp2::Eq, left: l, right: r } = conj {
+                if let (Some(lk), Some(rk)) = (self.col_in(l, left), self.col_in(r, right)) {
+                    keys.push(JoinKey2 { left: lk, right: rk });
+                } else if let (Some(rk), Some(lk)) = (self.col_in(l, right), self.col_in(r, left)) {
+                    keys.push(JoinKey2 { left: lk, right: rk });
+                }
+            }
+            // Handle OR: extract common equi-join keys from all branches.
+            // E.g. Q19: (p_partkey = l_partkey AND ...) OR (p_partkey = l_partkey AND ...) OR ...
+            // The common key p_partkey = l_partkey is used for the join.
+            if let Expr2::BinOp { op: BinOp2::Or, .. } = conj {
+                let or_keys = self.find_or_common_keys(conj, left, right);
+                keys.extend(or_keys);
+            }
+        }
+        keys
+    }
+
+    /// Find equi-join keys common to ALL branches of an OR expression.
+    /// Collects all OR branches, finds equi-join keys in each, and returns
+    /// the intersection.
+    fn find_or_common_keys(&self, or_expr: &Expr2, left: &ExecTable, right: &ExecTable) -> Vec<JoinKey2> {
+        // Collect all OR branches (flatten nested ORs)
+        let mut branches: Vec<&Expr2> = Vec::new();
+        self.collect_or_branches(or_expr, &mut branches);
+        if branches.is_empty() { return Vec::new(); }
+        // For each branch, split into AND-conjuncts and find equi-join keys
+        let mut branch_keys: Vec<Vec<JoinKey2>> = Vec::new();
+        for branch in &branches {
+            let conjuncts = self.split_conjuncts_for_or(branch);
+            let keys = self.find_join_keys_direct(left, right, &conjuncts);
+            branch_keys.push(keys);
+        }
+        // Intersect: a key must appear in ALL branches (by left,right indices)
+        let mut result = Vec::new();
+        for key in &branch_keys[0] {
+            if branch_keys.iter().all(|bk| bk.contains(key)) {
+                result.push(*key);
+            }
+        }
+        result
+    }
+
+    fn collect_or_branches<'b>(&self, expr: &'b Expr2, out: &mut Vec<&'b Expr2>) {
+        match expr {
+            Expr2::BinOp { op: BinOp2::Or, left, right } => {
+                self.collect_or_branches(left, out);
+                self.collect_or_branches(right, out);
+            }
+            _ => out.push(expr),
+        }
+    }
+
+    fn split_conjuncts_for_or(&self, expr: &Expr2) -> Vec<Expr2> {
+        let mut result = Vec::new();
+        self.collect_conjuncts(expr, &mut result);
+        result
+    }
+
+    /// Direct equi-join key finder (no OR handling, used by find_or_common_keys).
+    fn find_join_keys_direct(&self, left: &ExecTable, right: &ExecTable, conjuncts: &[Expr2]) -> Vec<JoinKey2> {
         let mut keys = Vec::new();
         for conj in conjuncts {
             if let Expr2::BinOp { op: BinOp2::Eq, left: l, right: r } = conj {
@@ -3853,7 +3919,7 @@ impl<'a> TpchExec<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct JoinKey2 { left: usize, right: usize }
 
 // =========================================================================
