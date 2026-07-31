@@ -1996,12 +1996,222 @@ impl<'a> TpchExec<'a> {
 
     // --- GROUP BY + aggregates ---
 
-    fn execute_grouped(&self, query: &SelectQuery2, t: &ExecTable, mask: &[bool]) -> Result<QueryResult, Error> {
-        let indices: Vec<usize> = (0..t.row_count).filter(|&i| mask[i]).collect();
+    /// Low-cardinality GROUP BY fast path using FixedAccumulator.
+    /// For <=256 groups: single pass, no HashMap, no Vec<Vec<usize>>.
+    /// Returns None if the query is too complex for this path.
+    fn try_low_card_grouped(
+        &self, query: &SelectQuery2, t: &ExecTable, mask: &[bool],
+    ) -> Result<Option<QueryResult>, Error> {
+        use crate::exec::fixed_agg::{FixedAccumulator, MAX_FIXED_GROUPS};
 
+        if query.having.is_some() { return Ok(None); }
+
+        let gb_cols: Vec<Option<usize>> = query.group_by.iter()
+            .map(|gb| self.col_in(gb, t))
+            .collect();
+        if gb_cols.iter().any(|c| c.is_none()) { return Ok(None); }
+        let gb_cols: Vec<usize> = gb_cols.iter().map(|c| c.unwrap()).collect();
+
+        #[derive(Clone)]
+        enum LcAgg {
+            GroupByCol(usize),
+            CountAll,
+            SumCol(usize),
+            SumColCol(usize, usize),
+            SumColSubOne(usize, usize),
+            SumColSubOneAddOne(usize, usize, usize),
+            AvgCol(usize),
+            MinCol(usize),
+            MaxCol(usize),
+        }
+
+        let mut plans: Vec<Option<LcAgg>> = Vec::with_capacity(query.select.len());
+        for item in &query.select {
+            let plan = match &item.expr {
+                Expr2::CountStar => Some(LcAgg::CountAll),
+                Expr2::Agg { func, arg, distinct: false } => {
+                    match func {
+                        AggFunc::Count => Some(LcAgg::CountAll),
+                        AggFunc::Sum => {
+                            if let Some(a) = self.col_in(arg, t) {
+                                if t.col_types[a] == ColType::Float { Some(LcAgg::SumCol(a)) } else { None }
+                            } else if let Expr2::BinOp { op: BinOp2::Mul, left, right } = arg.as_ref() {
+                                if let (Some(a), Some(b)) = (self.col_in(left, t), self.col_in(right, t)) {
+                                    if t.col_types[a] == ColType::Float && t.col_types[b] == ColType::Float {
+                                        Some(LcAgg::SumColCol(a, b))
+                                    } else { None }
+                                } else if let (Some(a), Some(b)) = (self.col_in(left, t), self.col_in_sub_one_right(right, t)) {
+                                    if t.col_types[a] == ColType::Float && t.col_types[b] == ColType::Float {
+                                        Some(LcAgg::SumColSubOne(a, b))
+                                    } else { None }
+                                } else if let (Some(b), Some(a)) = (self.col_in(right, t), self.col_in_sub_one_right(left, t)) {
+                                    if t.col_types[a] == ColType::Float && t.col_types[b] == ColType::Float {
+                                        Some(LcAgg::SumColSubOne(a, b))
+                                    } else { None }
+                                } else { None }
+                            } else { None }
+                        }
+                        AggFunc::Avg => {
+                            if let Expr2::Col(name) = arg.as_ref() {
+                                if let Some(idx) = t.lookup_col(name) {
+                                    if t.col_types[idx] == ColType::Float { Some(LcAgg::AvgCol(idx)) } else { None }
+                                } else { None }
+                            } else { None }
+                        }
+                        AggFunc::Min => {
+                            if let Expr2::Col(name) = arg.as_ref() {
+                                if let Some(idx) = t.lookup_col(name) { Some(LcAgg::MinCol(idx)) } else { None }
+                            } else { None }
+                        }
+                        AggFunc::Max => {
+                            if let Expr2::Col(name) = arg.as_ref() {
+                                if let Some(idx) = t.lookup_col(name) { Some(LcAgg::MaxCol(idx)) } else { None }
+                            } else { None }
+                        }
+                        _ => None,
+                    }
+                }
+                Expr2::Col(name) => {
+                    if let Some(idx) = t.lookup_col(name) { Some(LcAgg::GroupByCol(idx)) } else { None }
+                }
+                _ => None,
+            };
+            plans.push(plan);
+        }
+
+        for (i, item) in query.select.iter().enumerate() {
+            if plans[i].is_some() { continue; }
+            if let Expr2::Agg { func: AggFunc::Sum, arg, distinct: false } = &item.expr {
+                if let Expr2::BinOp { op: BinOp2::Mul, left, right } = arg.as_ref() {
+                    // Try: (Col * (1 - Col2)) * (1 + Col3)
+                    if let Some((a, b)) = self.col_in_mul_sub_one(left, t) {
+                        if let Some(c) = self.col_in_add_one_right(right, t) {
+                            if t.col_types[a] == ColType::Float && t.col_types[b] == ColType::Float && t.col_types[c] == ColType::Float {
+                                plans[i] = Some(LcAgg::SumColSubOneAddOne(a, b, c));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if plans.iter().any(|p| p.is_none()) { return Ok(None); }
+
+        let agg_indices: Vec<usize> = plans.iter().enumerate()
+            .filter_map(|(i, p)| match p {
+                Some(LcAgg::SumCol(_)) | Some(LcAgg::SumColCol(_, _)) |
+                Some(LcAgg::SumColSubOne(_, _)) | Some(LcAgg::SumColSubOneAddOne(_, _, _)) |
+                Some(LcAgg::AvgCol(_)) | Some(LcAgg::MinCol(_)) | Some(LcAgg::MaxCol(_)) => Some(i),
+                _ => None,
+            })
+            .collect();
+        let num_aggs = agg_indices.len();
+        if num_aggs == 0 { return Ok(None); }
+
+        let mut acc = FixedAccumulator::new(num_aggs);
+        let n = t.row_count;
+
+        for i in 0..n {
+            if !mask[i] { continue; }
+            let mut key_hash: u64 = 0;
+            for &ci in &gb_cols {
+                key_hash = key_hash.wrapping_mul(0x517cc1b727220a95).wrapping_add(t.columns[ci][i]);
+            }
+            let slot = acc.get_or_create_slot(key_hash);
+            if acc.num_active > MAX_FIXED_GROUPS - 4 {
+                return Ok(None);
+            }
+            acc.inc_count(slot);
+            for (agg_idx, &item_idx) in agg_indices.iter().enumerate() {
+                match plans[item_idx].as_ref().unwrap() {
+                    LcAgg::SumCol(a) => {
+                        acc.add_sum(agg_idx, slot, f64::from_bits(t.columns[*a][i]));
+                    }
+                    LcAgg::SumColCol(a, b) => {
+                        acc.add_sum(agg_idx, slot, f64::from_bits(t.columns[*a][i]) * f64::from_bits(t.columns[*b][i]));
+                    }
+                    LcAgg::SumColSubOne(a, b) => {
+                        acc.add_sum(agg_idx, slot, f64::from_bits(t.columns[*a][i]) * (1.0 - f64::from_bits(t.columns[*b][i])));
+                    }
+                    LcAgg::SumColSubOneAddOne(a, b, c) => {
+                        acc.add_sum(agg_idx, slot,
+                            f64::from_bits(t.columns[*a][i]) * (1.0 - f64::from_bits(t.columns[*b][i])) * (1.0 + f64::from_bits(t.columns[*c][i])));
+                    }
+                    LcAgg::AvgCol(a) => {
+                        acc.add_sum(agg_idx, slot, f64::from_bits(t.columns[*a][i]));
+                    }
+                    LcAgg::MinCol(a) => {
+                        acc.update_min(agg_idx, slot, f64::from_bits(t.columns[*a][i]));
+                    }
+                    LcAgg::MaxCol(a) => {
+                        acc.update_max(agg_idx, slot, f64::from_bits(t.columns[*a][i]));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let finalized = acc.finalize();
+        let mut cols: Vec<ResultColumn> = Vec::with_capacity(query.select.len());
+
+        for (item_idx, item) in query.select.iter().enumerate() {
+            let name = item.alias.clone().unwrap_or_else(|| self.expr_name(&item.expr));
+            let values: Vec<u64> = match plans[item_idx].as_ref().unwrap() {
+                LcAgg::GroupByCol(_) => {
+                    finalized.iter().map(|(key, _, _, _, _)| *key).collect()
+                }
+                LcAgg::CountAll => {
+                    finalized.iter().map(|(_, _, count, _, _)| *count).collect()
+                }
+                LcAgg::SumCol(_) | LcAgg::SumColCol(_, _) | LcAgg::SumColSubOne(_, _) | LcAgg::SumColSubOneAddOne(_, _, _) => {
+                    let agg_idx = agg_indices.iter().position(|&idx| idx == item_idx).unwrap();
+                    finalized.iter().map(|(_, sums, _, _, _)| sums[agg_idx].to_bits()).collect()
+                }
+                LcAgg::AvgCol(_) => {
+                    let agg_idx = agg_indices.iter().position(|&idx| idx == item_idx).unwrap();
+                    finalized.iter().map(|(_, sums, count, _, _)| {
+                        if *count == 0 { 0u64 } else { (sums[agg_idx] / *count as f64).to_bits() }
+                    }).collect()
+                }
+                LcAgg::MinCol(_) => {
+                    let agg_idx = agg_indices.iter().position(|&idx| idx == item_idx).unwrap();
+                    finalized.iter().map(|(_, _, _, mins, _)| mins[agg_idx].to_bits()).collect()
+                }
+                LcAgg::MaxCol(_) => {
+                    let agg_idx = agg_indices.iter().position(|&idx| idx == item_idx).unwrap();
+                    finalized.iter().map(|(_, _, _, _, maxs)| maxs[agg_idx].to_bits()).collect()
+                }
+            };
+            cols.push(ResultColumn { name, values });
+        }
+
+        let mut result = QueryResult { columns: cols, row_count: finalized.len(), elapsed_us: 0 };
+
+        if !query.order_by.is_empty() {
+            result = self.apply_order_by_grouped(result, &query.order_by)?;
+        }
+        if let Some(limit) = query.limit {
+            if result.row_count > limit {
+                for col in &mut result.columns { col.values.truncate(limit); }
+                result.row_count = limit;
+            }
+        }
+        Ok(Some(result))
+    }
+
+    fn execute_grouped(&self, query: &SelectQuery2, t: &ExecTable, mask: &[bool]) -> Result<QueryResult, Error> {
         if query.group_by.is_empty() {
+            let indices: Vec<usize> = (0..t.row_count).filter(|&i| mask[i]).collect();
             return self.execute_scalar_agg(query, t, &indices);
         }
+
+        // Low-cardinality fast path (Q1: 4 groups, Q13: ~40 groups)
+        if let Some(result) = self.try_low_card_grouped(query, t, mask)? {
+            return Ok(result);
+        }
+
+        // Fallback: HashMap-based grouping for high cardinality
+        let indices: Vec<usize> = (0..t.row_count).filter(|&i| mask[i]).collect();
 
         // Group rows — optimized: pre-resolve column indices, read u64 directly,
         // use single u64 hash key instead of Vec<u64>.
