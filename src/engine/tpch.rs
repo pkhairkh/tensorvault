@@ -26,6 +26,20 @@ pub enum ColType {
     String,
 }
 
+/// Swap comparison operands (for Literal op Col → Col swap_op(op) Literal).
+fn swap_op(op: BinOp2) -> BinOp2 {
+    match op {
+        BinOp2::Lt => BinOp2::Gt,
+        BinOp2::Le => BinOp2::Ge,
+        BinOp2::Gt => BinOp2::Lt,
+        BinOp2::Ge => BinOp2::Le,
+        BinOp2::Eq => BinOp2::Eq,
+        BinOp2::Ne => BinOp2::Ne,
+        other => other,
+    }
+}
+
+
 pub fn tpch_col_types(table_name: &str) -> Vec<ColType> {
     tpch_schema(table_name)
         .unwrap_or_default()
@@ -641,6 +655,14 @@ impl Value2 {
     fn as_str(&self) -> Option<&str> {
         match self { Value2::Str(s) => Some(s), _ => None }
     }
+    fn as_u64(&self) -> Option<u64> {
+        match self {
+            Value2::Int(i) => Some(*i as u64),
+            Value2::Float(f) => Some(*f as u64),
+            Value2::Date(d) => Some(*d as u64),
+            _ => None,
+        }
+    }
     fn to_u64(&self) -> u64 {
         match self {
             Value2::Int(i) => *i as u64,
@@ -753,44 +775,155 @@ impl<'a> TpchExec<'a> {
         Ok(joined)
     }
 
-    fn hash_join_with_keys(&self, left: ExecTable, right: ExecTable, keys: &[JoinKey2], jt: JoinType2) -> Result<ExecTable, Error> {
-        let mut build: HashMap<Vec<u64>, Vec<usize>> = HashMap::new();
-        for r in 0..right.row_count {
-            let key: Vec<u64> = keys.iter().map(|k| right.columns[k.right][r]).collect();
-            build.entry(key).or_default().push(r);
-        }
+    fn hash_join_with_keys(
+        &self,
+        left: ExecTable,
+        right: ExecTable,
+        keys: &[JoinKey2],
+        jt: JoinType2,
+    ) -> Result<ExecTable, Error> {
+        use xxhash_rust::xxh3::xxh3_64;
+
+        // Decide which side to build the hash table on (smaller side).
+        // For INNER joins, we can swap freely. For LEFT joins, we must
+        // keep left as the probe side (to preserve unmatched left rows).
+        let can_swap = jt == JoinType2::Inner;
+        let (build_side, probe_side, build_keys, probe_keys, swapped) =
+            if can_swap && left.row_count < right.row_count {
+                // Build on left, probe with right — swap the key indices.
+                let bk: Vec<JoinKey2> = keys.iter().map(|k| JoinKey2 { left: k.left, right: k.left }).collect();
+                let pk: Vec<JoinKey2> = keys.iter().map(|k| JoinKey2 { left: k.right, right: k.right }).collect();
+                (&left, &right, bk, pk, true)
+            } else {
+                // Build on right (original behavior), probe with left.
+                let bk: Vec<JoinKey2> = keys.iter().map(|k| JoinKey2 { left: k.right, right: k.right }).collect();
+                let pk: Vec<JoinKey2> = keys.iter().map(|k| JoinKey2 { left: k.left, right: k.left }).collect();
+                (&right, &left, bk, pk, false)
+            };
+
         let ncol = left.columns.len() + right.columns.len();
-        let mut out_cols: Vec<Vec<u64>> = (0..ncol).map(|_| Vec::new()).collect();
+
+        // --- Build phase: construct hash table ---
+        // Single-key fast path: HashMap<u64, Vec<usize>> (no per-row Vec alloc).
+        // Multi-key path: pack keys into a single u64 via xxh3.
+        let build_hash: HashMap<u64, Vec<usize>> = if keys.len() == 1 {
+            let bk0 = build_keys[0].left; // column index in build_side
+            let mut map: HashMap<u64, Vec<usize>> = HashMap::with_capacity(build_side.row_count);
+            for r in 0..build_side.row_count {
+                let key = build_side.columns[bk0][r];
+                map.entry(key).or_default().push(r);
+            }
+            map
+        } else {
+            // Multi-key: hash all key columns into a single u64.
+            let bk_cols: Vec<usize> = build_keys.iter().map(|k| k.left).collect();
+            let mut map: HashMap<u64, Vec<usize>> = HashMap::with_capacity(build_side.row_count);
+            for r in 0..build_side.row_count {
+                // Pack keys: concatenate bytes and hash. For up to 8 bytes of
+                // key data we can pack directly; for more, use xxh3 on a stack buffer.
+                let mut buf = [0u8; 64];
+                let mut off = 0;
+                for &kc in &bk_cols {
+                    let v = build_side.columns[kc][r];
+                    let bytes = v.to_le_bytes();
+                    if off + 8 <= 64 {
+                        buf[off..off + 8].copy_from_slice(&bytes);
+                        off += 8;
+                    }
+                }
+                let key = xxh3_64(&buf[..off]);
+                map.entry(key).or_default().push(r);
+            }
+            map
+        };
+
+        // --- Probe phase ---
+        // Pre-allocate output. Estimate: probe_rows * avg_selectivity.
+        // For equi-joins, average matches per probe ≈ build_rows / unique_keys.
+        // Conservative estimate: min(probe_rows * 4, build_rows * 4).
+        let est_output = std::cmp::max(probe_side.row_count, build_side.row_count).min(4_000_000);
+        let mut out_cols: Vec<Vec<u64>> = (0..ncol).map(|_| Vec::with_capacity(est_output)).collect();
         let mut out_types = left.col_types.clone();
         out_types.extend(right.col_types.iter().copied());
         let mut out_strings = left.string_columns.clone();
         out_strings.extend(right.string_columns.iter().cloned());
         let mut out_names = left.column_names.clone();
         out_names.extend(right.column_names.clone());
-        let mut row_count = 0;
-        for l in 0..left.row_count {
-            let key: Vec<u64> = keys.iter().map(|k| left.columns[k.left][l]).collect();
-            let matches = build.get(&key).cloned().unwrap_or_default();
-            if matches.is_empty() {
-                if jt == JoinType2::Left {
-                    for (c, col) in left.columns.iter().enumerate() { out_cols[c].push(col[l]); }
-                    for c in 0..right.columns.len() { out_cols[left.columns.len() + c].push(0); }
-                    row_count += 1;
-                }
+        let mut row_count = 0usize;
+
+        let left_ncol = left.columns.len();
+
+        // Helper: emit one output row from (probe_row, build_row)
+        // If swapped: probe_side=right, build_side=left → left cols come from build, right cols from probe
+        // If not swapped: probe_side=left, build_side=right → left cols from probe, right cols from build
+        let pk_cols: Vec<usize> = probe_keys.iter().map(|k| k.left).collect();
+
+        for p in 0..probe_side.row_count {
+            // Compute probe key
+            let probe_key = if keys.len() == 1 {
+                probe_side.columns[pk_cols[0]][p]
             } else {
-                for r in &matches {
-                    for (c, col) in left.columns.iter().enumerate() { out_cols[c].push(col[l]); }
-                    for (c, col) in right.columns.iter().enumerate() { out_cols[left.columns.len() + c].push(col[*r]); }
-                    row_count += 1;
+                let mut buf = [0u8; 64];
+                let mut off = 0;
+                for &kc in &pk_cols {
+                    let v = probe_side.columns[kc][p];
+                    let bytes = v.to_le_bytes();
+                    if off + 8 <= 64 {
+                        buf[off..off + 8].copy_from_slice(&bytes);
+                        off += 8;
+                    }
+                }
+                xxh3_64(&buf[..off])
+            };
+
+            let matches = build_hash.get(&probe_key);
+            match matches {
+                None => {
+                    // No match — only emit for LEFT join (and only if probe is the left side)
+                    if jt == JoinType2::Left && !swapped {
+                        for (c, col) in left.columns.iter().enumerate() { out_cols[c].push(col[p]); }
+                        for c in 0..right.columns.len() { out_cols[left_ncol + c].push(0); }
+                        row_count += 1;
+                    }
+                    // If swapped (probe=right, build=left), this is a right-outer scenario
+                    // which we don't support — skip.
+                }
+                Some(matched_rows) => {
+                    for &b in matched_rows {
+                        if !swapped {
+                            // probe=left, build=right: left cols from probe, right cols from build
+                            for (c, col) in left.columns.iter().enumerate() { out_cols[c].push(col[p]); }
+                            for (c, col) in right.columns.iter().enumerate() { out_cols[left_ncol + c].push(col[b]); }
+                        } else {
+                            // probe=right, build=left: left cols from build, right cols from probe
+                            for (c, col) in left.columns.iter().enumerate() { out_cols[c].push(col[b]); }
+                            for (c, col) in right.columns.iter().enumerate() { out_cols[left_ncol + c].push(col[p]); }
+                        }
+                        row_count += 1;
+                    }
                 }
             }
         }
+
         let mut col_map = HashMap::new();
-        for (i, name) in out_names.iter().enumerate() { col_map.entry(name.to_lowercase()).or_insert(i); }
-        for (k, v) in &left.col_map { col_map.insert(k.clone(), *v); }
+        for (i, name) in out_names.iter().enumerate() {
+            col_map.entry(name.to_lowercase()).or_insert(i);
+        }
+        for (k, v) in &left.col_map {
+            col_map.insert(k.clone(), *v);
+        }
         let off = left.columns.len();
-        for (k, v) in &right.col_map { col_map.insert(k.clone(), *v + off); }
-        Ok(ExecTable { columns: out_cols, column_names: out_names, col_types: out_types, string_columns: out_strings, row_count, col_map })
+        for (k, v) in &right.col_map {
+            col_map.insert(k.clone(), *v + off);
+        }
+        Ok(ExecTable {
+            columns: out_cols,
+            column_names: out_names,
+            col_types: out_types,
+            string_columns: out_strings,
+            row_count,
+            col_map,
+        })
     }
 
     fn filter_table(&self, table: &ExecTable, indices: &[usize]) -> ExecTable {
@@ -1098,9 +1231,290 @@ impl<'a> TpchExec<'a> {
     // --- WHERE ---
 
     fn build_mask(&self, expr: &Expr2, table: &ExecTable) -> Result<Vec<bool>, Error> {
+        // Try vectorized fast path first; fall back to per-row eval.
         let mut mask = vec![true; table.row_count];
-        self.eval_bool_mask(expr, table, &mut mask)?;
+        self.eval_bool_mask_vec(expr, table, &mut mask)?;
         Ok(mask)
+    }
+
+    /// Vectorized boolean mask evaluation. Resolves column indices once,
+    /// then loops over rows with direct array access. Falls back to
+    /// per-row eval() for expression shapes it doesn't recognize.
+    fn eval_bool_mask_vec(&self, expr: &Expr2, t: &ExecTable, mask: &mut [bool]) -> Result<(), Error> {
+        match expr {
+            Expr2::BinOp { op: BinOp2::And, left, right } => {
+                self.eval_bool_mask_vec(left, t, mask)?;
+                let mut rmask = vec![true; t.row_count];
+                self.eval_bool_mask_vec(right, t, &mut rmask)?;
+                for i in 0..t.row_count { mask[i] = mask[i] && rmask[i]; }
+                Ok(())
+            }
+            Expr2::BinOp { op: BinOp2::Or, left, right } => {
+                let mut lmask = vec![true; t.row_count];
+                self.eval_bool_mask_vec(left, t, &mut lmask)?;
+                let mut rmask = vec![true; t.row_count];
+                self.eval_bool_mask_vec(right, t, &mut rmask)?;
+                for i in 0..t.row_count { mask[i] = lmask[i] || rmask[i]; }
+                Ok(())
+            }
+            Expr2::BinOp { op, left, right } => {
+                // Try to evaluate as Col op Literal or Literal op Col
+                self.eval_comparison_vec(*op, left, right, t, mask)?;
+                Ok(())
+            }
+            Expr2::Between { expr, low, high, negated } => {
+                // Vectorized BETWEEN: Col >= low AND Col <= high
+                if let Some(col_idx) = self.col_in(expr, t) {
+                    let lo_val = self.eval_const(low, t)?;
+                    let hi_val = self.eval_const(high, t)?;
+                    let col = &t.columns[col_idx];
+                    let is_float = t.col_types[col_idx] == ColType::Float;
+                    for i in 0..t.row_count {
+                        if !mask[i] { continue; }
+                        let v = col[i];
+                        let in_range = if is_float {
+                            let fv = f64::from_bits(v);
+                            let flo = lo_val.as_f64().unwrap_or(f64::NEG_INFINITY);
+                            let fhi = hi_val.as_f64().unwrap_or(f64::INFINITY);
+                            fv >= flo && fv <= fhi
+                        } else {
+                            v >= lo_val.as_u64().unwrap_or(0) && v <= hi_val.as_u64().unwrap_or(u64::MAX)
+                        };
+                        mask[i] = mask[i] && (*negated != in_range);
+                    }
+                    Ok(())
+                } else {
+                    // Fallback: per-row eval
+                    for i in 0..t.row_count {
+                        if !mask[i] { continue; }
+                        let v = self.eval(expr, t, i)?;
+                        let lo = self.eval(low, t, i)?;
+                        let hi = self.eval(high, t, i)?;
+                        let in_range = self.cmp_le(&lo, &v) && self.cmp_le(&v, &hi);
+                        mask[i] = mask[i] && (*negated != in_range);
+                    }
+                    Ok(())
+                }
+            }
+            Expr2::InList { expr, list, negated } => {
+                if let Some(col_idx) = self.col_in(expr, t) {
+                    let vals: Vec<u64> = list.iter().filter_map(|e| {
+                        if let Some(ci) = self.col_in(e, t) { Some(t.columns[ci][0]) }
+                        else { self.eval_const(e, t).ok().and_then(|v| v.as_u64()) }
+                    }).collect();
+                    let col = &t.columns[col_idx];
+                    for i in 0..t.row_count {
+                        if !mask[i] { continue; }
+                        let v = col[i];
+                        let found = vals.iter().any(|&x| x == v);
+                        mask[i] = mask[i] && (*negated != found);
+                    }
+                    Ok(())
+                } else {
+                    for i in 0..t.row_count {
+                        if !mask[i] { continue; }
+                        let v = self.eval(expr, t, i)?;
+                        let mut found = false;
+                        for item in list {
+                            let iv = self.eval(item, t, i)?;
+                            if self.cmp_eq(&v, &iv) { found = true; break; }
+                        }
+                        mask[i] = mask[i] && (*negated != found);
+                    }
+                    Ok(())
+                }
+            }
+            Expr2::Like { expr, pattern, negated } => {
+                // For LIKE on string columns, use StringSearchColumn if available
+                if let Some(col_idx) = self.col_in(expr, t) {
+                    if col_idx < t.string_columns.len() {
+                        if let Some(ref sc) = t.string_columns[col_idx] {
+                            // Get pattern as string
+                            let pat = if let Expr2::Str(s) = pattern.as_ref() { s.clone() }
+                                else { self.eval(pattern, t, 0).ok().and_then(|v| v.as_str().map(|s| s.to_string())).unwrap_or_default() };
+                            if !pat.is_empty() {
+                                let like_mask = self.like_mask(sc, &pat);
+                                for i in 0..t.row_count {
+                                    if *negated { mask[i] = mask[i] && !like_mask[i]; }
+                                    else { mask[i] = mask[i] && like_mask[i]; }
+                                }
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                // Fallback: per-row eval
+                for i in 0..t.row_count {
+                    if !mask[i] { continue; }
+                    let v = self.eval(expr, t, i)?;
+                    let pv = self.eval(pattern, t, i)?;
+                    let r = match (&v, &pv) {
+                        (Value2::Str(s), Value2::Str(p)) => self.like(s, p),
+                        _ => false,
+                    };
+                    mask[i] = mask[i] && (*negated != r);
+                }
+                Ok(())
+            }
+            _ => {
+                // Fallback: per-row eval for unrecognized shapes
+                for i in 0..t.row_count {
+                    if !mask[i] { continue; }
+                    let v = self.eval(expr, t, i)?;
+                    mask[i] = mask[i] && self.truthy(&v);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Evaluate a constant expression (literal or column-independent).
+    fn eval_const(&self, expr: &Expr2, t: &ExecTable) -> Result<Value2, Error> {
+        match expr {
+            Expr2::Int(i) => Ok(Value2::Int(*i)),
+            Expr2::Float(f) => Ok(Value2::Float(*f)),
+            Expr2::Str(s) => Ok(Value2::Str(s.clone())),
+            Expr2::Date(d) => Ok(Value2::Date(*d)),
+            Expr2::Neg(e) => {
+                let v = self.eval_const(e, t)?;
+                Ok(match v { Value2::Int(i) => Value2::Int(-i), Value2::Float(f) => Value2::Float(-f), _ => Value2::Null })
+            }
+            _ => self.eval(expr, t, 0),
+        }
+    }
+
+    /// Build a LIKE mask for a string column. Handles % wildcards.
+    fn like_mask(&self, sc: &crate::exec::fm_index::StringSearchColumn, pattern: &str) -> Vec<bool> {
+        let n = sc.len();
+        let mut mask = vec![false; n];
+        if pattern.is_empty() { mask.fill(true); return mask; }
+        let pb = pattern.as_bytes();
+        if pb[0] == b'%' && !pb[1..].contains(&b'%') && !pattern.contains('_') {
+            // Suffix match: %suffix
+            let suffix = &pattern[1..];
+            for i in 0..n {
+                mask[i] = sc.get(i).ends_with(suffix);
+            }
+        } else if !pattern.contains('%') && !pattern.contains('_') {
+            // Exact match
+            for i in 0..n {
+                mask[i] = sc.get(i) == pattern;
+            }
+        } else {
+            // General LIKE
+            for i in 0..n {
+                mask[i] = self.like(sc.get(i), pattern);
+            }
+        }
+        mask
+    }
+
+    /// Vectorized comparison: Col op Literal (or Literal op Col).
+    /// Resolves column index once, then loops.
+    /// Falls back to per-row eval for Col op Col or complex expressions.
+    fn eval_comparison_vec(&self, op: BinOp2, left: &Expr2, right: &Expr2, t: &ExecTable, mask: &mut [bool]) -> Result<(), Error> {
+        // Try Col op Const (right side must NOT have column refs)
+        if let Some(col_idx) = self.col_in(left, t) {
+            if !self.expr_has_col(right) {
+                let rval = self.eval_const(right, t)?;
+                self.apply_comparison(op, col_idx, &rval, t, mask, false)?;
+                return Ok(());
+            }
+        }
+        // Try Const op Col (left side must NOT have column refs)
+        if let Some(col_idx) = self.col_in(right, t) {
+            if !self.expr_has_col(left) {
+                let lval = self.eval_const(left, t)?;
+                self.apply_comparison(swap_op(op), col_idx, &lval, t, mask, false)?;
+                return Ok(());
+            }
+        }
+        // Fallback: per-row eval for Col op Col or complex expressions
+        for i in 0..t.row_count {
+            if !mask[i] { continue; }
+            let lv = self.eval(left, t, i)?;
+            let rv = self.eval(right, t, i)?;
+            let result = self.binop(op, &lv, &rv);
+            mask[i] = mask[i] && self.truthy(&result);
+        }
+        Ok(())
+    }
+
+    /// Apply a comparison (Col op Value) to the mask vectorized.
+    fn apply_comparison(&self, op: BinOp2, col_idx: usize, val: &Value2, t: &ExecTable, mask: &mut [bool], _negated: bool) -> Result<(), Error> {
+        let col = &t.columns[col_idx];
+        let col_type = t.col_types[col_idx];
+        let n = t.row_count;
+        match (col_type, val) {
+            (ColType::Int, Value2::Int(ival)) => {
+                let target = *ival as u64;
+                match op {
+                    BinOp2::Eq => for i in 0..n { mask[i] = mask[i] && col[i] == target; }
+                    BinOp2::Ne => for i in 0..n { mask[i] = mask[i] && col[i] != target; }
+                    BinOp2::Lt => for i in 0..n { mask[i] = mask[i] && (col[i] as i64) < *ival; }
+                    BinOp2::Le => for i in 0..n { mask[i] = mask[i] && (col[i] as i64) <= *ival; }
+                    BinOp2::Gt => for i in 0..n { mask[i] = mask[i] && (col[i] as i64) > *ival; }
+                    BinOp2::Ge => for i in 0..n { mask[i] = mask[i] && (col[i] as i64) >= *ival; }
+                    _ => {}
+                }
+            }
+            (ColType::Date, Value2::Date(dval)) => {
+                let target = *dval as u64;
+                match op {
+                    BinOp2::Eq => for i in 0..n { mask[i] = mask[i] && col[i] == target; }
+                    BinOp2::Ne => for i in 0..n { mask[i] = mask[i] && col[i] != target; }
+                    BinOp2::Lt => for i in 0..n { mask[i] = mask[i] && col[i] < target; }
+                    BinOp2::Le => for i in 0..n { mask[i] = mask[i] && col[i] <= target; }
+                    BinOp2::Gt => for i in 0..n { mask[i] = mask[i] && col[i] > target; }
+                    BinOp2::Ge => for i in 0..n { mask[i] = mask[i] && col[i] >= target; }
+                    _ => {}
+                }
+            }
+            (ColType::Float, Value2::Float(fval)) => {
+                let target = fval.to_bits();
+                match op {
+                    BinOp2::Eq => for i in 0..n { mask[i] = mask[i] && col[i] == target; }
+                    BinOp2::Ne => for i in 0..n { mask[i] = mask[i] && col[i] != target; }
+                    BinOp2::Lt => for i in 0..n { mask[i] = mask[i] && f64::from_bits(col[i]) < *fval; }
+                    BinOp2::Le => for i in 0..n { mask[i] = mask[i] && f64::from_bits(col[i]) <= *fval; }
+                    BinOp2::Gt => for i in 0..n { mask[i] = mask[i] && f64::from_bits(col[i]) > *fval; }
+                    BinOp2::Ge => for i in 0..n { mask[i] = mask[i] && f64::from_bits(col[i]) >= *fval; }
+                    _ => {}
+                }
+            }
+            (ColType::Float, Value2::Int(ival)) => {
+                // Comparing float column to int literal (e.g., l_quantity < 24)
+                let fval = *ival as f64;
+                match op {
+                    BinOp2::Eq => for i in 0..n { mask[i] = mask[i] && f64::from_bits(col[i]) == fval; }
+                    BinOp2::Ne => for i in 0..n { mask[i] = mask[i] && f64::from_bits(col[i]) != fval; }
+                    BinOp2::Lt => for i in 0..n { mask[i] = mask[i] && f64::from_bits(col[i]) < fval; }
+                    BinOp2::Le => for i in 0..n { mask[i] = mask[i] && f64::from_bits(col[i]) <= fval; }
+                    BinOp2::Gt => for i in 0..n { mask[i] = mask[i] && f64::from_bits(col[i]) > fval; }
+                    BinOp2::Ge => for i in 0..n { mask[i] = mask[i] && f64::from_bits(col[i]) >= fval; }
+                    _ => {}
+                }
+            }
+            (ColType::String, Value2::Str(sval)) => {
+                // String equality via hash comparison
+                let target_hash = xxhash_rust::xxh3::xxh3_64(sval.as_bytes());
+                match op {
+                    BinOp2::Eq => for i in 0..n { mask[i] = mask[i] && col[i] == target_hash; }
+                    BinOp2::Ne => for i in 0..n { mask[i] = mask[i] && col[i] != target_hash; }
+                    _ => {} // < > on strings not common in TPC-H
+                }
+            }
+            _ => {
+                // Fallback: per-row eval
+                for i in 0..n {
+                    if !mask[i] { continue; }
+                    let cv = self.eval(&Expr2::Col(String::new()), t, i).unwrap_or(Value2::Null);
+                    let result = self.binop(op, &cv, val);
+                    mask[i] = mask[i] && self.truthy(&result);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn eval_bool_mask(&self, expr: &Expr2, table: &ExecTable, mask: &mut [bool]) -> Result<(), Error> {
@@ -1432,10 +1846,10 @@ impl<'a> TpchExec<'a> {
         match expr {
             Expr2::CountStar => Ok(Value2::Int(indices.len() as i64)),
             Expr2::Agg { func, arg, distinct } => {
-                let mut values: Vec<Value2> = Vec::with_capacity(indices.len());
-                for &idx in indices { values.push(self.eval(arg, t, idx)?); }
-
                 if *distinct {
+                    // Distinct requires materializing values — use slow path
+                    let mut values: Vec<Value2> = Vec::with_capacity(indices.len());
+                    for &idx in indices { values.push(self.eval(arg, t, idx)?); }
                     let mut seen = HashSet::new();
                     values.retain(|v| {
                         let key = match v {
@@ -1446,52 +1860,62 @@ impl<'a> TpchExec<'a> {
                         };
                         seen.insert(key)
                     });
+                    return Ok(match func {
+                        AggFunc::Count => Value2::Int(values.len() as i64),
+                        AggFunc::CountDistinct => Value2::Int(values.len() as i64),
+                        AggFunc::Sum => self.sum_values(&values),
+                        AggFunc::Avg => self.avg_values(&values),
+                        AggFunc::Min => self.min_values(&values),
+                        AggFunc::Max => self.max_values(&values),
+                    });
                 }
 
-                Ok(match func {
-                    AggFunc::Count => Value2::Int(values.len() as i64),
-                    AggFunc::CountDistinct => {
-                        let mut seen = HashSet::new();
-                        for v in &values {
-                            let key = match v {
-                                Value2::Int(i) => format!("i{}", i),
-                                Value2::Float(f) => format!("f{}", f.to_bits()),
-                                Value2::Str(s) => format!("s{}", s),
-                                _ => "null".to_string(),
-                            };
-                            seen.insert(key);
+                // Vectorized fast paths for common aggregate patterns.
+                // These avoid per-row eval() and Value2 allocation entirely.
+                match func {
+                    AggFunc::Count => {
+                        // Count(Col) = count non-null
+                        if let Expr2::Col(name) = arg.as_ref() {
+                            if let Some(idx) = t.lookup_col(name) {
+                                let col = &t.columns[idx];
+                                let mut cnt = 0i64;
+                                for &i in indices { if col[i] != 0 { cnt += 1; } }
+                                return Ok(Value2::Int(cnt));
+                            }
                         }
-                        Value2::Int(seen.len() as i64)
+                        // Fallback
+                        return Ok(Value2::Int(indices.len() as i64));
+                    }
+                    AggFunc::CountDistinct => {
+                        if let Expr2::Col(name) = arg.as_ref() {
+                            if let Some(idx) = t.lookup_col(name) {
+                                let col = &t.columns[idx];
+                                let mut seen = HashSet::new();
+                                for &i in indices { seen.insert(col[i]); }
+                                return Ok(Value2::Int(seen.len() as i64));
+                            }
+                        }
+                        let mut seen = HashSet::new();
+                        for &i in indices { let v = self.eval(arg, t, i)?; seen.insert(format!("{:?}", v)); }
+                        return Ok(Value2::Int(seen.len() as i64));
                     }
                     AggFunc::Sum => {
-                        let mut sum = 0.0f64;
-                        let mut all_int = true;
-                        for v in &values {
-                            if !matches!(v, Value2::Int(_)) { all_int = false; }
-                            if let Some(f) = v.as_f64() { sum += f; }
-                        }
-                        if all_int {
-                            let mut isum = 0i64;
-                            for v in &values { if let Some(i) = v.as_i64() { isum = isum.wrapping_add(i); } }
-                            Value2::Int(isum)
-                        } else { Value2::Float(sum) }
+                        return self.sum_vec(arg, t, indices);
                     }
                     AggFunc::Avg => {
-                        let mut sum = 0.0f64; let mut cnt = 0u64;
-                        for v in &values { if let Some(f) = v.as_f64() { sum += f; cnt += 1; } }
-                        if cnt == 0 { Value2::Null } else { Value2::Float(sum / cnt as f64) }
+                        let sum = self.sum_vec(arg, t, indices)?;
+                        let cnt = indices.len() as f64;
+                        if cnt == 0.0 { return Ok(Value2::Null); }
+                        let sf = sum.as_f64().unwrap_or(0.0);
+                        return Ok(Value2::Float(sf / cnt));
                     }
                     AggFunc::Min => {
-                        let mut min: Option<f64> = None;
-                        for v in &values { if let Some(f) = v.as_f64() { min = Some(min.map_or(f, |m| m.min(f))); } }
-                        min.map(Value2::Float).unwrap_or(Value2::Null)
+                        return self.minmax_vec(arg, t, indices, true);
                     }
                     AggFunc::Max => {
-                        let mut max: Option<f64> = None;
-                        for v in &values { if let Some(f) = v.as_f64() { max = Some(max.map_or(f, |m| m.max(f))); } }
-                        max.map(Value2::Float).unwrap_or(Value2::Null)
+                        return self.minmax_vec(arg, t, indices, false);
                     }
-                })
+                }
             }
             // Non-agg expr in grouped context — eval on first row of group
             Expr2::BinOp { op, left, right } => {
@@ -1622,6 +2046,294 @@ impl<'a> TpchExec<'a> {
             ResultColumn { name: c.name.clone(), values }
         }).collect();
         Ok(QueryResult { columns: new_cols, row_count: result.row_count, elapsed_us: 0 })
+    }
+
+
+    /// Check if an expression contains any column references.
+    fn expr_has_col(&self, e: &Expr2) -> bool {
+        match e {
+            Expr2::Col(_) => true,
+            Expr2::BinOp { left, right, .. } => self.expr_has_col(left) || self.expr_has_col(right),
+            Expr2::Case { whens, else_ } => {
+                whens.iter().any(|(c, r)| self.expr_has_col(c) || self.expr_has_col(r))
+                    || else_.as_ref().map(|e| self.expr_has_col(e)).unwrap_or(false)
+            }
+            Expr2::Neg(e) | Expr2::Not(e) | Expr2::Extract { expr: e, .. } => self.expr_has_col(e),
+            Expr2::Like { expr, pattern, .. } => self.expr_has_col(expr) || self.expr_has_col(pattern),
+            Expr2::Between { expr, low, high, .. } => self.expr_has_col(expr) || self.expr_has_col(low) || self.expr_has_col(high),
+            Expr2::InList { expr, list, .. } => self.expr_has_col(expr) || list.iter().any(|e| self.expr_has_col(e)),
+            Expr2::Substr { expr, start, len } => self.expr_has_col(expr) || self.expr_has_col(start) || self.expr_has_col(len),
+            _ => false,
+        }
+    }
+
+    /// Vectorized sum: evaluates an expression for all indices and sums.
+    /// Fast paths for Col, Col*Col, Col*(1-Col), Col*literal.
+    fn sum_vec(&self, expr: &Expr2, t: &ExecTable, indices: &[usize]) -> Result<Value2, Error> {
+        match expr {
+            Expr2::Col(name) => {
+                if let Some(idx) = t.lookup_col(name) {
+                    let col = &t.columns[idx];
+                    return Ok(match t.col_types[idx] {
+                        ColType::Float => {
+                            let mut sum = 0.0f64;
+                            for &i in indices { sum += f64::from_bits(col[i]); }
+                            Value2::Float(sum)
+                        }
+                        ColType::Int => {
+                            let mut isum = 0i64;
+                            for &i in indices { isum = isum.wrapping_add(col[i] as i64); }
+                            Value2::Int(isum)
+                        }
+                        _ => Value2::Int(0),
+                    });
+                }
+                Err(Error::NotFound(format!("column '{}'", name)))
+            }
+            Expr2::BinOp { op: BinOp2::Mul, left, right } => {
+                // Col * Col  or  Col * Literal  or  Literal * Col
+                let li = self.col_in(left, t);
+                let ri = self.col_in(right, t);
+                match (li, ri) {
+                    (Some(a), Some(b)) => {
+                        // Col * Col — both float columns
+                        let ca = &t.columns[a];
+                        let cb = &t.columns[b];
+                        let mut sum = 0.0f64;
+                        if t.col_types[a] == ColType::Float && t.col_types[b] == ColType::Float {
+                            for &i in indices {
+                                sum += f64::from_bits(ca[i]) * f64::from_bits(cb[i]);
+                            }
+                        } else {
+                            for &i in indices {
+                                sum += ca[i] as f64 * cb[i] as f64;
+                            }
+                        }
+                        Ok(Value2::Float(sum))
+                    }
+                    (Some(a), None) => {
+                        if self.expr_has_col(right) {
+                            // Right side has column refs — can't treat as constant.
+                            // Per-row eval: eval right for each row, multiply by left col.
+                            let ca = &t.columns[a];
+                            let mut sum = 0.0f64;
+                            if t.col_types[a] == ColType::Float {
+                                for &i in indices {
+                                    let rf = self.eval(right, t, i)?.as_f64().unwrap_or(0.0);
+                                    sum += f64::from_bits(ca[i]) * rf;
+                                }
+                            } else {
+                                for &i in indices {
+                                    let rf = self.eval(right, t, i)?.as_f64().unwrap_or(0.0);
+                                    sum += ca[i] as f64 * rf;
+                                }
+                            }
+                            Ok(Value2::Float(sum))
+                        } else {
+                            // Right is truly constant
+                            let rval = self.eval_const(right, t)?;
+                            let factor = rval.as_f64().unwrap_or(0.0);
+                            let col = &t.columns[a];
+                            let mut sum = 0.0f64;
+                            if t.col_types[a] == ColType::Float {
+                                for &i in indices { sum += f64::from_bits(col[i]) * factor; }
+                            } else {
+                                for &i in indices { sum += col[i] as f64 * factor; }
+                            }
+                            Ok(Value2::Float(sum))
+                        }
+                    }
+                    (None, Some(b)) => {
+                        if self.expr_has_col(left) {
+                            let cb = &t.columns[b];
+                            let mut sum = 0.0f64;
+                            if t.col_types[b] == ColType::Float {
+                                for &i in indices {
+                                    let lf = self.eval(left, t, i)?.as_f64().unwrap_or(0.0);
+                                    sum += lf * f64::from_bits(cb[i]);
+                                }
+                            } else {
+                                for &i in indices {
+                                    let lf = self.eval(left, t, i)?.as_f64().unwrap_or(0.0);
+                                    sum += lf * cb[i] as f64;
+                                }
+                            }
+                            Ok(Value2::Float(sum))
+                        } else {
+                            let lval = self.eval_const(left, t)?;
+                            let factor = lval.as_f64().unwrap_or(0.0);
+                            let col = &t.columns[b];
+                            let mut sum = 0.0f64;
+                            if t.col_types[b] == ColType::Float {
+                                for &i in indices { sum += factor * f64::from_bits(col[i]); }
+                            } else {
+                                for &i in indices { sum += factor * col[i] as f64; }
+                            }
+                            Ok(Value2::Float(sum))
+                        }
+                    }
+                    _ => {
+                        // Fallback: per-row eval
+                        let mut sum = 0.0f64;
+                        for &i in indices { if let Some(f) = self.eval(expr, t, i)?.as_f64() { sum += f; } }
+                        Ok(Value2::Float(sum))
+                    }
+                }
+            }
+            Expr2::BinOp { op: BinOp2::Sub, left, right } => {
+                // (1 - Col) pattern — common in TPC-H: l_extendedprice * (1 - l_discount)
+                let li = self.col_in(left, t);
+                let ri = self.col_in(right, t);
+                match (li, ri) {
+                    (None, Some(b)) => {
+                        let lval = self.eval_const(left, t)?;
+                        let base = lval.as_f64().unwrap_or(0.0);
+                        let col = &t.columns[b];
+                        let mut sum = 0.0f64;
+                        if t.col_types[b] == ColType::Float {
+                            for &i in indices { sum += base - f64::from_bits(col[i]); }
+                        } else {
+                            for &i in indices { sum += base - col[i] as f64; }
+                        }
+                        Ok(Value2::Float(sum))
+                    }
+                    (Some(a), None) => {
+                        if self.expr_has_col(right) {
+                            let ca = &t.columns[a];
+                            let mut sum = 0.0f64;
+                            if t.col_types[a] == ColType::Float {
+                                for &i in indices {
+                                    let rf = self.eval(right, t, i)?.as_f64().unwrap_or(0.0);
+                                    sum += f64::from_bits(ca[i]) - rf;
+                                }
+                            } else {
+                                for &i in indices {
+                                    let rf = self.eval(right, t, i)?.as_f64().unwrap_or(0.0);
+                                    sum += ca[i] as f64 - rf;
+                                }
+                            }
+                            Ok(Value2::Float(sum))
+                        } else {
+                            let rval = self.eval_const(right, t)?;
+                            let sub = rval.as_f64().unwrap_or(0.0);
+                            let col = &t.columns[a];
+                            let mut sum = 0.0f64;
+                            if t.col_types[a] == ColType::Float {
+                                for &i in indices { sum += f64::from_bits(col[i]) - sub; }
+                            } else {
+                                for &i in indices { sum += col[i] as f64 - sub; }
+                            }
+                            Ok(Value2::Float(sum))
+                        }
+                    }
+                    _ => {
+                        let mut sum = 0.0f64;
+                        for &i in indices { if let Some(f) = self.eval(expr, t, i)?.as_f64() { sum += f; } }
+                        Ok(Value2::Float(sum))
+                    }
+                }
+            }
+            Expr2::BinOp { op: BinOp2::Add, left, right } => {
+                let li = self.col_in(left, t);
+                let ri = self.col_in(right, t);
+                match (li, ri) {
+                    (Some(a), Some(b)) => {
+                        let ca = &t.columns[a]; let cb = &t.columns[b];
+                        let mut sum = 0.0f64;
+                        if t.col_types[a] == ColType::Float && t.col_types[b] == ColType::Float {
+                            for &i in indices { sum += f64::from_bits(ca[i]) + f64::from_bits(cb[i]); }
+                        } else {
+                            for &i in indices { sum += ca[i] as f64 + cb[i] as f64; }
+                        }
+                        Ok(Value2::Float(sum))
+                    }
+                    _ => {
+                        let mut sum = 0.0f64;
+                        for &i in indices { if let Some(f) = self.eval(expr, t, i)?.as_f64() { sum += f; } }
+                        Ok(Value2::Float(sum))
+                    }
+                }
+            }
+            _ => {
+                // Fallback: per-row eval for complex expressions
+                let mut sum = 0.0f64;
+                for &i in indices { if let Some(f) = self.eval(expr, t, i)?.as_f64() { sum += f; } }
+                Ok(Value2::Float(sum))
+            }
+        }
+    }
+
+    /// Vectorized min/max.
+    fn minmax_vec(&self, expr: &Expr2, t: &ExecTable, indices: &[usize], is_min: bool) -> Result<Value2, Error> {
+        if let Expr2::Col(name) = expr {
+            if let Some(idx) = t.lookup_col(name) {
+                let col = &t.columns[idx];
+                if t.col_types[idx] == ColType::Float {
+                    let mut best: Option<f64> = None;
+                    for &i in indices {
+                        let v = f64::from_bits(col[i]);
+                        best = Some(match best {
+                            None => v,
+                            Some(b) => if is_min { b.min(v) } else { b.max(v) }
+                        });
+                    }
+                    return Ok(best.map(Value2::Float).unwrap_or(Value2::Null));
+                } else {
+                    let mut best: Option<i64> = None;
+                    for &i in indices {
+                        let v = col[i] as i64;
+                        best = Some(match best {
+                            None => v,
+                            Some(b) => if is_min { b.min(v) } else { b.max(v) }
+                        });
+                    }
+                    return Ok(best.map(Value2::Int).unwrap_or(Value2::Null));
+                }
+            }
+        }
+        // Fallback
+        let mut best: Option<f64> = None;
+        for &i in indices {
+            if let Some(f) = self.eval(expr, t, i)?.as_f64() {
+                best = Some(match best {
+                    None => f,
+                    Some(b) => if is_min { b.min(f) } else { b.max(f) }
+                });
+            }
+        }
+        Ok(best.map(Value2::Float).unwrap_or(Value2::Null))
+    }
+
+    fn sum_values(&self, values: &[Value2]) -> Value2 {
+        let mut sum = 0.0f64;
+        let mut all_int = true;
+        for v in values {
+            if !matches!(v, Value2::Int(_)) { all_int = false; }
+            if let Some(f) = v.as_f64() { sum += f; }
+        }
+        if all_int {
+            let mut isum = 0i64;
+            for v in values { if let Some(i) = v.as_i64() { isum = isum.wrapping_add(i); } }
+            Value2::Int(isum)
+        } else { Value2::Float(sum) }
+    }
+
+    fn avg_values(&self, values: &[Value2]) -> Value2 {
+        let mut sum = 0.0f64; let mut cnt = 0u64;
+        for v in values { if let Some(f) = v.as_f64() { sum += f; cnt += 1; } }
+        if cnt == 0 { Value2::Null } else { Value2::Float(sum / cnt as f64) }
+    }
+
+    fn min_values(&self, values: &[Value2]) -> Value2 {
+        let mut min: Option<f64> = None;
+        for v in values { if let Some(f) = v.as_f64() { min = Some(min.map_or(f, |m| m.min(f))); } }
+        min.map(Value2::Float).unwrap_or(Value2::Null)
+    }
+
+    fn max_values(&self, values: &[Value2]) -> Value2 {
+        let mut max: Option<f64> = None;
+        for v in values { if let Some(f) = v.as_f64() { max = Some(max.map_or(f, |m| m.max(f))); } }
+        max.map(Value2::Float).unwrap_or(Value2::Null)
     }
 }
 
