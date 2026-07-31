@@ -1325,7 +1325,7 @@ impl<'a> TpchExec<'a> {
                 if let Some(col_idx) = self.col_in(expr, t) {
                     let vals: Vec<u64> = list.iter().filter_map(|e| {
                         if let Some(ci) = self.col_in(e, t) { Some(t.columns[ci][0]) }
-                        else { self.eval_const(e, t).ok().and_then(|v| v.as_u64()) }
+                        else { self.eval_const(e, t).ok().map(|v| v.to_u64()) }
                     }).collect();
                     let col = &t.columns[col_idx];
                     for i in 0..t.row_count {
