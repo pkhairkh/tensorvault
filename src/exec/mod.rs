@@ -4,4 +4,5 @@ pub mod string_ops;
 pub mod datetime_ops;
 pub mod subquery;
 pub mod vectorized;
+pub mod bitmap;
 pub mod fm_index;

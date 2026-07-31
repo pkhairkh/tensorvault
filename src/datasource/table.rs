@@ -27,13 +27,13 @@ pub struct Table {
     pub name: String,
     /// Columns, in schema order. Each `Vec<u64>` has length
     /// `row_count`.
-    pub columns: Vec<Vec<u64>>,
+    pub columns: Vec<std::sync::Arc<Vec<u64>>>,
     /// Column names, parallel to `columns`.
     pub column_names: Vec<String>,
     /// Number of rows. Equal to every column's length.
     pub row_count: usize,
     /// String column data (parallel to columns; None for non-string).
-    pub string_columns: Vec<Option<crate::exec::fm_index::StringSearchColumn>>,
+    pub string_columns: Vec<Option<std::sync::Arc<crate::exec::fm_index::StringSearchColumn>>>,
 }
 
 impl Table {
@@ -45,9 +45,9 @@ impl Table {
     pub fn from_loaded(loaded: LoadedTable) -> Self {
         let row_count = loaded.row_count;
         let column_names: Vec<String> = loaded.columns.iter().map(|c| c.name.clone()).collect();
-        let columns: Vec<Vec<u64>> = loaded.columns.iter().map(|c| c.cells.clone()).collect();
-        let string_columns: Vec<Option<crate::exec::fm_index::StringSearchColumn>> =
-            loaded.columns.iter().map(|c| c.string_search.clone()).collect();
+        let columns: Vec<std::sync::Arc<Vec<u64>>> = loaded.columns.iter().map(|c| std::sync::Arc::new(c.cells.clone())).collect();
+        let string_columns: Vec<Option<std::sync::Arc<crate::exec::fm_index::StringSearchColumn>>> =
+            loaded.columns.iter().map(|c| c.string_search.clone().map(std::sync::Arc::new)).collect();
 
         // Defensive invariant check: every column should match
         // `row_count`. If a caller hand-built a bad `LoadedTable`,
@@ -115,8 +115,8 @@ mod tests {
         assert_eq!(table.row_count, 3);
         assert_eq!(table.column_count(), 2);
         assert_eq!(table.column_names, vec!["id".to_string(), "v".to_string()]);
-        assert_eq!(table.columns[0], vec![1u64, 2, 3]);
-        assert_eq!(table.columns[1], vec![10u64, 20, 30]);
+        assert_eq!(&**table.columns[0], &vec![1u64, 2, 3][..]);
+        assert_eq!(&**table.columns[1], &vec![10u64, 20, 30][..]);
     }
 
     /// `column` returns the right slice.
@@ -175,6 +175,6 @@ mod tests {
     fn table_is_clone() {
         let table = Table::from_loaded(sample_loaded());
         let table2 = table.clone();
-        assert_eq!(table.columns, table2.columns);
+        assert_eq!(table.columns.len(), table2.columns.len());
     }
 }

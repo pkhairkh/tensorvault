@@ -69,7 +69,7 @@ pub fn or_mask(left: &[bool], right: &[bool], out: &mut [bool]) {
 /// Supports: col OP literal, AND, OR.
 /// OP can be: =, !=, <, >, <=, >=
 pub fn filter_rows(
-    columns: &[Vec<u64>],
+    columns: &[std::sync::Arc<Vec<u64>>],
     column_names: &[String],
     row_count: usize,
     where_expr: &crate::sql::parser::Expr,
@@ -80,7 +80,7 @@ pub fn filter_rows(
 }
 
 fn eval_where(
-    columns: &[Vec<u64>],
+    columns: &[std::sync::Arc<Vec<u64>>],
     column_names: &[String],
     row_count: usize,
     expr: &crate::sql::parser::Expr,

@@ -34,7 +34,7 @@ impl JoinResult {
     pub fn into_table(self, name: &str) -> Table {
         Table {
             name: name.to_string(),
-            columns: self.columns,
+            columns: self.columns.into_iter().map(std::sync::Arc::new).collect(),
             column_names: self.column_names,
             row_count: self.row_count,
             string_columns: vec![],
@@ -235,7 +235,7 @@ mod tests {
         let row_count = cols.first().map(|(_, v)| v.len()).unwrap_or(0);
         Table {
             name: name.to_string(),
-            columns: cols.iter().map(|(_, v)| v.clone()).collect(),
+            columns: cols.iter().map(|(_, v)| std::sync::Arc::new(v.clone())).collect(),
             column_names: cols.iter().map(|(n, _)| n.to_string()).collect(),
             row_count,
             string_columns: vec![],

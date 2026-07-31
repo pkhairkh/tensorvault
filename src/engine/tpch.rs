@@ -599,10 +599,10 @@ impl TpchParser {
 // =========================================================================
 
 struct ExecTable {
-    columns: Vec<Vec<u64>>,
+    columns: Vec<std::sync::Arc<Vec<u64>>>,
     column_names: Vec<String>,
     col_types: Vec<ColType>,
-    string_columns: Vec<Option<StringSearchColumn>>,
+    string_columns: Vec<Option<std::sync::Arc<StringSearchColumn>>>,
     row_count: usize,
     col_map: HashMap<String, usize>,
 }
@@ -934,7 +934,7 @@ impl<'a> TpchExec<'a> {
             col_map.insert(k.clone(), *v + off);
         }
         Ok(ExecTable {
-            columns: out_cols,
+            columns: out_cols.into_iter().map(std::sync::Arc::new).collect(),
             column_names: out_names,
             col_types: out_types,
             string_columns: out_strings,
@@ -946,14 +946,14 @@ impl<'a> TpchExec<'a> {
     fn filter_table(&self, table: &ExecTable, indices: &[usize]) -> ExecTable {
         let mut new_cols = Vec::with_capacity(table.columns.len());
         for col in &table.columns {
-            new_cols.push(indices.iter().map(|&i| col[i]).collect());
+            new_cols.push(std::sync::Arc::new(indices.iter().map(|&i| col[i]).collect()));
         }
         // Rebuild string columns if present
         let mut new_strings = Vec::with_capacity(table.string_columns.len());
         for (i, sc) in table.string_columns.iter().enumerate() {
             if let Some(ref scol) = sc {
                 let strings: Vec<String> = indices.iter().map(|&r| scol.get(r).to_string()).collect();
-                new_strings.push(Some(StringSearchColumn::new(strings)));
+                new_strings.push(Some(std::sync::Arc::new(StringSearchColumn::new(strings))));
             } else {
                 new_strings.push(None);
             }
@@ -1116,7 +1116,7 @@ impl<'a> TpchExec<'a> {
         let mut string_columns = Vec::new();
         for (i, col) in result.columns.iter().enumerate() {
             column_names.push(col.name.clone());
-            columns.push(col.values.clone());
+            columns.push(std::sync::Arc::new(col.values.clone()));
             col_types.push(self.infer_result_type(&col.name));
             string_columns.push(None);
             let lower = col.name.to_lowercase();
@@ -1141,7 +1141,7 @@ impl<'a> TpchExec<'a> {
         let rr = right.row_count;
         if lr == 0 || rr == 0 {
             return ExecTable {
-                columns: left.columns.iter().chain(right.columns.iter()).map(|_| Vec::new()).collect(),
+                columns: left.columns.iter().chain(right.columns.iter()).map(|_| std::sync::Arc::new(Vec::new())).collect(),
                 column_names: left.column_names.iter().chain(right.column_names.iter()).cloned().collect(),
                 col_types: left.col_types.iter().chain(right.col_types.iter()).copied().collect(),
                 string_columns: left.string_columns.iter().chain(right.string_columns.iter()).cloned().collect(),
@@ -1154,12 +1154,12 @@ impl<'a> TpchExec<'a> {
         for col in &left.columns {
             let mut nc = Vec::with_capacity(total);
             for l in 0..lr { let v = col[l]; for _ in 0..rr { nc.push(v); } }
-            columns.push(nc);
+            columns.push(std::sync::Arc::new(nc));
         }
         for col in &right.columns {
             let mut nc = Vec::with_capacity(total);
             for _ in 0..lr { for r in 0..rr { nc.push(col[r]); } }
-            columns.push(nc);
+            columns.push(std::sync::Arc::new(nc));
         }
         let mut col_types = left.col_types.clone();
         col_types.extend(right.col_types.iter().copied());
@@ -1223,7 +1223,7 @@ impl<'a> TpchExec<'a> {
         let off = left.columns.len();
         for (k, v) in &right.col_map { col_map.insert(k.clone(), *v + off); }
 
-        Ok(ExecTable { columns: out_cols, column_names: out_names, col_types: out_types, string_columns: out_strings, row_count, col_map })
+        Ok(ExecTable { columns: out_cols.into_iter().map(std::sync::Arc::new).collect(), column_names: out_names, col_types: out_types, string_columns: out_strings, row_count, col_map })
     }
 
     fn extract_join_keys(&self, on: &Expr2, left: &ExecTable, right: &ExecTable) -> Result<Vec<JoinKey2>, Error> {
@@ -1469,75 +1469,97 @@ impl<'a> TpchExec<'a> {
 
     /// Apply a comparison (Col op Value) to the mask vectorized.
     fn apply_comparison(&self, op: BinOp2, col_idx: usize, val: &Value2, t: &ExecTable, mask: &mut [bool], _negated: bool) -> Result<(), Error> {
-        let col = &t.columns[col_idx];
+        use crate::exec::bitmap;
+        let col: &[u64] = &t.columns[col_idx];
         let col_type = t.col_types[col_idx];
         let n = t.row_count;
+        let mask = &mut mask[..n];
         match (col_type, val) {
             (ColType::Int, Value2::Int(ival)) => {
-                let target = *ival as u64;
-                match op {
-                    BinOp2::Eq => for i in 0..n { mask[i] = mask[i] && col[i] == target; }
-                    BinOp2::Ne => for i in 0..n { mask[i] = mask[i] && col[i] != target; }
-                    BinOp2::Lt => for i in 0..n { mask[i] = mask[i] && (col[i] as i64) < *ival; }
-                    BinOp2::Le => for i in 0..n { mask[i] = mask[i] && (col[i] as i64) <= *ival; }
-                    BinOp2::Gt => for i in 0..n { mask[i] = mask[i] && (col[i] as i64) > *ival; }
-                    BinOp2::Ge => for i in 0..n { mask[i] = mask[i] && (col[i] as i64) >= *ival; }
-                    _ => {}
-                }
+                let bm = match op {
+                    BinOp2::Eq => bitmap::filter_eq_u64(col, *ival as u64),
+                    BinOp2::Ne => bitmap::filter_ne_u64(col, *ival as u64),
+                    BinOp2::Lt => bitmap::filter_lt_i64(col, *ival),
+                    BinOp2::Le => bitmap::filter_le_i64(col, *ival),
+                    BinOp2::Gt => bitmap::filter_gt_i64(col, *ival),
+                    BinOp2::Ge => bitmap::filter_ge_i64(col, *ival),
+                    _ => return Ok(()),
+                };
+                bitmap::and_into_bool(&bm, mask);
             }
             (ColType::Date, Value2::Date(dval)) => {
                 let target = *dval as u64;
-                match op {
-                    BinOp2::Eq => for i in 0..n { mask[i] = mask[i] && col[i] == target; }
-                    BinOp2::Ne => for i in 0..n { mask[i] = mask[i] && col[i] != target; }
-                    BinOp2::Lt => for i in 0..n { mask[i] = mask[i] && col[i] < target; }
-                    BinOp2::Le => for i in 0..n { mask[i] = mask[i] && col[i] <= target; }
-                    BinOp2::Gt => for i in 0..n { mask[i] = mask[i] && col[i] > target; }
-                    BinOp2::Ge => for i in 0..n { mask[i] = mask[i] && col[i] >= target; }
-                    _ => {}
-                }
+                let bm = match op {
+                    BinOp2::Eq => bitmap::filter_eq_u64(col, target),
+                    BinOp2::Ne => bitmap::filter_ne_u64(col, target),
+                    BinOp2::Lt => bitmap::filter_lt_u64(col, target),
+                    BinOp2::Le => bitmap::filter_le_u64(col, target),
+                    BinOp2::Gt => bitmap::filter_gt_u64(col, target),
+                    BinOp2::Ge => bitmap::filter_ge_u64(col, target),
+                    _ => return Ok(()),
+                };
+                bitmap::and_into_bool(&bm, mask);
             }
             (ColType::Float, Value2::Float(fval)) => {
-                let target = fval.to_bits();
-                match op {
-                    BinOp2::Eq => for i in 0..n { mask[i] = mask[i] && col[i] == target; }
-                    BinOp2::Ne => for i in 0..n { mask[i] = mask[i] && col[i] != target; }
-                    BinOp2::Lt => for i in 0..n { mask[i] = mask[i] && f64::from_bits(col[i]) < *fval; }
-                    BinOp2::Le => for i in 0..n { mask[i] = mask[i] && f64::from_bits(col[i]) <= *fval; }
-                    BinOp2::Gt => for i in 0..n { mask[i] = mask[i] && f64::from_bits(col[i]) > *fval; }
-                    BinOp2::Ge => for i in 0..n { mask[i] = mask[i] && f64::from_bits(col[i]) >= *fval; }
-                    _ => {}
-                }
+                let bm = match op {
+                    BinOp2::Eq => bitmap::filter_eq_f64(col, *fval),
+                    BinOp2::Ne => bitmap::filter_ne_f64(col, *fval),
+                    BinOp2::Lt => bitmap::filter_lt_f64(col, *fval),
+                    BinOp2::Le => bitmap::filter_le_f64(col, *fval),
+                    BinOp2::Gt => bitmap::filter_gt_f64(col, *fval),
+                    BinOp2::Ge => bitmap::filter_ge_f64(col, *fval),
+                    _ => return Ok(()),
+                };
+                bitmap::and_into_bool(&bm, mask);
             }
             (ColType::Float, Value2::Int(ival)) => {
-                // Comparing float column to int literal (e.g., l_quantity < 24)
                 let fval = *ival as f64;
-                match op {
-                    BinOp2::Eq => for i in 0..n { mask[i] = mask[i] && f64::from_bits(col[i]) == fval; }
-                    BinOp2::Ne => for i in 0..n { mask[i] = mask[i] && f64::from_bits(col[i]) != fval; }
-                    BinOp2::Lt => for i in 0..n { mask[i] = mask[i] && f64::from_bits(col[i]) < fval; }
-                    BinOp2::Le => for i in 0..n { mask[i] = mask[i] && f64::from_bits(col[i]) <= fval; }
-                    BinOp2::Gt => for i in 0..n { mask[i] = mask[i] && f64::from_bits(col[i]) > fval; }
-                    BinOp2::Ge => for i in 0..n { mask[i] = mask[i] && f64::from_bits(col[i]) >= fval; }
-                    _ => {}
-                }
+                let bm = match op {
+                    BinOp2::Eq => bitmap::filter_eq_f64(col, fval),
+                    BinOp2::Ne => bitmap::filter_ne_f64(col, fval),
+                    BinOp2::Lt => bitmap::filter_lt_f64(col, fval),
+                    BinOp2::Le => bitmap::filter_le_f64(col, fval),
+                    BinOp2::Gt => bitmap::filter_gt_f64(col, fval),
+                    BinOp2::Ge => bitmap::filter_ge_f64(col, fval),
+                    _ => return Ok(()),
+                };
+                bitmap::and_into_bool(&bm, mask);
             }
             (ColType::String, Value2::Str(sval)) => {
-                // String equality via hash comparison
                 let target_hash = xxhash_rust::xxh3::xxh3_64(sval.as_bytes());
                 match op {
-                    BinOp2::Eq => for i in 0..n { mask[i] = mask[i] && col[i] == target_hash; }
-                    BinOp2::Ne => for i in 0..n { mask[i] = mask[i] && col[i] != target_hash; }
-                    _ => {} // < > on strings not common in TPC-H
+                    BinOp2::Eq => {
+                        let bm = bitmap::filter_eq_u64(col, target_hash);
+                        bitmap::and_into_bool(&bm, mask);
+                    }
+                    BinOp2::Ne => {
+                        let bm = bitmap::filter_ne_u64(col, target_hash);
+                        bitmap::and_into_bool(&bm, mask);
+                    }
+                    _ => {}
                 }
             }
             _ => {
                 // Fallback: per-row eval
                 for i in 0..n {
                     if !mask[i] { continue; }
-                    let cv = self.eval(&Expr2::Col(String::new()), t, i).unwrap_or(Value2::Null);
-                    let result = self.binop(op, &cv, val);
-                    mask[i] = mask[i] && self.truthy(&result);
+                    let cv = unsafe { std::ptr::read(col.as_ptr().add(i)) };
+                    let v = match col_type {
+                        ColType::Int => Value2::Int(cv as i64),
+                        ColType::Float => Value2::Float(f64::from_bits(cv)),
+                        ColType::Date => Value2::Date(cv as i32),
+                        ColType::String => Value2::Str(String::new()),
+                    };
+                    let matches = match op {
+                        BinOp2::Eq => self.cmp_eq(&v, val),
+                        BinOp2::Ne => !self.cmp_eq(&v, val),
+                        BinOp2::Lt => self.cmp_lt(&v, val),
+                        BinOp2::Le => self.cmp_le(&v, val),
+                        BinOp2::Gt => !self.cmp_le(&v, val),
+                        BinOp2::Ge => !self.cmp_lt(&v, val),
+                        _ => false,
+                    };
+                    mask[i] = mask[i] && matches;
                 }
             }
         }

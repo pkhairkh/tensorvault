@@ -30,7 +30,7 @@ pub fn union_all(left: &Table, right: &Table) -> Result<Table, Error> {
     }
     let mut columns = left.columns.clone();
     for (i, col) in right.columns.iter().enumerate() {
-        if i < columns.len() { columns[i].extend(col.iter().copied()); }
+        if i < columns.len() { std::sync::Arc::make_mut(&mut columns[i]).extend(col.iter().copied()); }
     }
     Ok(Table {
         name: format!("{}_union_{}", left.name, right.name),
@@ -56,7 +56,7 @@ pub fn union_distinct(left: &Table, right: &Table) -> Result<Table, Error> {
     }
     Ok(Table {
         name: combined.name,
-        columns: out_cols.clone(),
+        columns: out_cols.iter().map(|c| std::sync::Arc::new(c.clone())).collect(),
         column_names: combined.column_names.clone(),
         row_count: out_cols[0].len(),
         string_columns: vec![],
@@ -80,7 +80,7 @@ pub fn intersect(left: &Table, right: &Table) -> Result<Table, Error> {
     }
     Ok(Table {
         name: format!("{}_intersect", left.name),
-        columns: out_cols.clone(),
+        columns: out_cols.iter().map(|c| std::sync::Arc::new(c.clone())).collect(),
         column_names: left.column_names.clone(),
         row_count: out_cols[0].len(),
         string_columns: vec![],
@@ -104,7 +104,7 @@ pub fn except(left: &Table, right: &Table) -> Result<Table, Error> {
     }
     Ok(Table {
         name: format!("{}_except", left.name),
-        columns: out_cols.clone(),
+        columns: out_cols.iter().map(|c| std::sync::Arc::new(c.clone())).collect(),
         column_names: left.column_names.clone(),
         row_count: out_cols[0].len(),
         string_columns: vec![],
@@ -120,7 +120,7 @@ mod tests {
         let row_count = cols.first().map(|(_, v)| v.len()).unwrap_or(0);
         Table {
             name: name.to_string(),
-            columns: cols.iter().map(|(_, v)| v.clone()).collect(),
+            columns: cols.iter().map(|(_, v)| std::sync::Arc::new(v.clone())).collect(),
             column_names: cols.iter().map(|(n, _)| n.to_string()).collect(),
             row_count,
             string_columns: vec![],
