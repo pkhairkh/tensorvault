@@ -649,6 +649,13 @@ impl ExecTable {
     }
 
     fn lookup_col(&self, name: &str) -> Option<usize> {
+        // Fast path: direct lookup (common case — name is already lowercase
+        // because col_map keys are stored lowercase).
+        if let Some(&idx) = self.col_map.get(name) {
+            return Some(idx);
+        }
+        // Slow path: case-insensitive lookup via to_lowercase.
+        // Only reached for uppercase/mixed-case column names (rare in TPC-H).
         self.col_map.get(&name.to_lowercase()).copied()
     }
 }
@@ -2603,11 +2610,7 @@ impl<'a> TpchExec<'a> {
                 self.eval_bool_mask_vec(left, t, mask)?;
                 // Start rmask from the current mask so that the right side's
                 // per-row eval can skip rows already filtered out by the left
-                // side. This is critical for performance when the right side
-                // is an expensive correlated subquery (e.g. Q17's
-                // `l_quantity < (SELECT ... WHERE l_partkey = p_partkey)`):
-                // without this, the subquery was evaluated for ALL 6M lineitem
-                // rows instead of the ~6k rows surviving the brand/container filter.
+                // side. This is critical for Q17's correlated subquery.
                 let mut rmask = mask.to_vec();
                 self.eval_bool_mask_vec(right, t, &mut rmask)?;
                 for i in 0..t.row_count { mask[i] = mask[i] && rmask[i]; }
