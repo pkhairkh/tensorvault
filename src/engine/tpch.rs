@@ -690,6 +690,7 @@ pub fn execute_tpch(query: &SelectQuery2, catalog: &Catalog) -> Result<QueryResu
         catalog,
         outer: std::cell::Cell::new(None),
         subquery_cache: std::cell::RefCell::new(HashMap::new()),
+        exists_cache: std::cell::RefCell::new(HashMap::new()),
     }.execute(query)
 }
 
@@ -709,6 +710,14 @@ struct TpchExec<'a> {
     /// This fixes Q11 (HAVING with uncorrelated scalar subquery) which
     /// previously re-executed the subquery per group (~8000x) and timed out.
     subquery_cache: std::cell::RefCell<HashMap<usize, Value2>>,
+    /// Cache for EXISTS semi-join hash sets: keyed by the subquery AST pointer.
+    /// When an EXISTS subquery has a single correlation column with an equi-join
+    /// (e.g. Q4's `exists (SELECT * FROM lineitem WHERE l_orderkey = o_orderkey
+    /// AND l_commitdate < l_receiptdate)`), we build a hash set of the inner
+    /// column values (l_orderkey where l_commitdate < l_receiptdate) ONCE,
+    /// then check membership per outer row. This decorrelates the EXISTS,
+    /// reducing ~25k subquery executions to 1 hash-set build + 25k lookups.
+    exists_cache: std::cell::RefCell<HashMap<usize, std::collections::HashSet<u64>>>,
 }
 
 impl<'a> TpchExec<'a> {
@@ -940,6 +949,238 @@ impl<'a> TpchExec<'a> {
             }
             Expr2::Subquery(_) | Expr2::Exists { .. } | Expr2::InSubquery { .. } => {}
             _ => {}
+        }
+    }
+
+    /// For an EXISTS subquery, find the single correlation column and the
+    /// corresponding inner column via an equi-join conjunct
+    /// (`Col(inner) = Col(outer)` or `Col(outer) = Col(inner)`).
+    ///
+    /// Returns `Some((outer_col_idx, inner_col_idx))` if exactly one
+    /// correlation column with an equi-join is found; `None` otherwise
+    /// (e.g. multiple correlation cols, or no equi-join).
+    ///
+    /// Q4 example: `exists (SELECT * FROM lineitem WHERE l_orderkey = o_orderkey
+    /// AND l_commitdate < l_receiptdate)` → outer_col=o_orderkey, inner_col=l_orderkey.
+    fn find_exists_equi_join(&self, subquery: &SelectQuery2, outer_t: &ExecTable) -> Option<(usize, usize)> {
+        // Build inner column name set (subquery's own FROM tables)
+        let mut inner_cols: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for item in &subquery.from {
+            if let FromItem::Table(t) = item {
+                if let Some(table) = self.catalog.get(&t.name) {
+                    for cn in &table.column_names {
+                        inner_cols.insert(cn.to_lowercase());
+                    }
+                }
+            }
+        }
+        // Find correlation columns (in outer_t but not in inner tables)
+        let mut corr_names: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if let Some(ref wc) = subquery.where_clause {
+            self.collect_corr_names(wc, outer_t, &inner_cols, &mut corr_names, &mut seen);
+        }
+        if corr_names.len() != 1 {
+            return None;
+        }
+        let corr_name = &corr_names[0];
+        let outer_idx = outer_t.lookup_col(corr_name)
+            .or_else(|| corr_name.rfind('.').and_then(|p| outer_t.lookup_col(&corr_name[p+1..])))?;
+        // Find the equi-join conjunct: Col(inner) = Col(corr_name) or vice versa
+        if let Some(ref wc) = subquery.where_clause {
+            if let Some(inner_idx) = self.find_equi_join_inner(wc, corr_name, &inner_cols, subquery, outer_t) {
+                return Some((outer_idx, inner_idx));
+            }
+        }
+        None
+    }
+
+    fn collect_corr_names(
+        &self, expr: &Expr2, outer_t: &ExecTable, inner_cols: &std::collections::HashSet<String>,
+        names: &mut Vec<String>, seen: &mut std::collections::HashSet<String>,
+    ) {
+        match expr {
+            Expr2::Col(name) => {
+                let short = name.rfind('.').map(|p| &name[p+1..]).unwrap_or(name.as_str());
+                if !inner_cols.contains(&short.to_lowercase()) {
+                    if outer_t.lookup_col(name).is_some() || outer_t.lookup_col(short).is_some() {
+                        if seen.insert(name.to_lowercase()) {
+                            names.push(name.clone());
+                        }
+                    }
+                }
+            }
+            Expr2::BinOp { left, right, .. } => {
+                self.collect_corr_names(left, outer_t, inner_cols, names, seen);
+                self.collect_corr_names(right, outer_t, inner_cols, names, seen);
+            }
+            Expr2::Case { whens, else_ } => {
+                for (c, r) in whens {
+                    self.collect_corr_names(c, outer_t, inner_cols, names, seen);
+                    self.collect_corr_names(r, outer_t, inner_cols, names, seen);
+                }
+                if let Some(e) = else_ { self.collect_corr_names(e, outer_t, inner_cols, names, seen); }
+            }
+            Expr2::Like { expr, pattern, .. } => {
+                self.collect_corr_names(expr, outer_t, inner_cols, names, seen);
+                self.collect_corr_names(pattern, outer_t, inner_cols, names, seen);
+            }
+            Expr2::Between { expr, low, high, .. } => {
+                self.collect_corr_names(expr, outer_t, inner_cols, names, seen);
+                self.collect_corr_names(low, outer_t, inner_cols, names, seen);
+                self.collect_corr_names(high, outer_t, inner_cols, names, seen);
+            }
+            Expr2::InList { expr, list, .. } => {
+                self.collect_corr_names(expr, outer_t, inner_cols, names, seen);
+                for e in list { self.collect_corr_names(e, outer_t, inner_cols, names, seen); }
+            }
+            Expr2::Neg(e) | Expr2::Not(e) | Expr2::Extract { expr: e, .. } => {
+                self.collect_corr_names(e, outer_t, inner_cols, names, seen);
+            }
+            Expr2::Substr { expr, start, len } => {
+                self.collect_corr_names(expr, outer_t, inner_cols, names, seen);
+                self.collect_corr_names(start, outer_t, inner_cols, names, seen);
+                self.collect_corr_names(len, outer_t, inner_cols, names, seen);
+            }
+            Expr2::Subquery(_) | Expr2::Exists { .. } | Expr2::InSubquery { .. } => {}
+            _ => {}
+        }
+    }
+
+    /// Find `Col(inner) = Col(outer_name)` or reverse in a WHERE expr.
+    /// Returns the inner column index (in the subquery's own FROM table).
+    fn find_equi_join_inner(
+        &self, expr: &Expr2, outer_name: &str, inner_cols: &std::collections::HashSet<String>,
+        subquery: &SelectQuery2, outer_t: &ExecTable,
+    ) -> Option<usize> {
+        match expr {
+            Expr2::BinOp { op: BinOp2::Eq, left, right } => {
+                // left = inner, right = outer
+                if let (Expr2::Col(ln), Expr2::Col(rn)) = (left.as_ref(), right.as_ref()) {
+                    let l_short = ln.rfind('.').map(|p| &ln[p+1..]).unwrap_or(ln.as_str());
+                    let r_short = rn.rfind('.').map(|p| &rn[p+1..]).unwrap_or(rn.as_str());
+                    if inner_cols.contains(&l_short.to_lowercase()) && r_short.eq_ignore_ascii_case(outer_name.trim_start_matches(|c: char| !c.is_alphanumeric())) {
+                        return self.resolve_inner_col_idx(ln, subquery, outer_t);
+                    }
+                    if inner_cols.contains(&r_short.to_lowercase()) && l_short.eq_ignore_ascii_case(outer_name.trim_start_matches(|c: char| !c.is_alphanumeric())) {
+                        return self.resolve_inner_col_idx(rn, subquery, outer_t);
+                    }
+                }
+            }
+            Expr2::BinOp { op: BinOp2::And, left, right } => {
+                if let Some(idx) = self.find_equi_join_inner(left, outer_name, inner_cols, subquery, outer_t) {
+                    return Some(idx);
+                }
+                if let Some(idx) = self.find_equi_join_inner(right, outer_name, inner_cols, subquery, outer_t) {
+                    return Some(idx);
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
+    /// Resolve an inner column name to its index in the subquery's base table.
+    /// Loads the subquery's FROM and looks up the column.
+    fn resolve_inner_col_idx(
+        &self, col_name: &str, subquery: &SelectQuery2, _outer_t: &ExecTable,
+    ) -> Option<usize> {
+        // Load the subquery's FROM tables and look up the column.
+        // This is a lightweight version of resolve_from that doesn't do joins.
+        for item in &subquery.from {
+            if let FromItem::Table(t) = item {
+                if let Some(table) = self.catalog.get(&t.name) {
+                    let alias = t.alias.as_deref().unwrap_or(&t.name);
+                    // Build a temp ExecTable to use lookup_col
+                    let exec_t = ExecTable::from_catalog(table, alias);
+                    if let Some(idx) = exec_t.lookup_col(col_name) {
+                        return Some(idx);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Build a hash set of inner column values from the subquery's filtered
+    /// result (with the correlated equi-join conjunct removed — only
+    /// uncorrelated conjuncts are applied).
+    ///
+    /// For Q4: `SELECT DISTINCT l_orderkey FROM lineitem WHERE l_commitdate < l_receiptdate`
+    fn build_exists_hashset(&self, subquery: &SelectQuery2, inner_col_idx: usize) -> Result<std::collections::HashSet<u64>, Error> {
+        // Load the subquery's FROM table(s) and join them (no correlation).
+        let mut tables: Vec<ExecTable> = Vec::new();
+        for item in &subquery.from {
+            tables.push(self.resolve_from_item(item)?);
+        }
+        let base = if tables.len() == 1 {
+            tables.into_iter().next().unwrap()
+        } else {
+            self.join_tables_smart(tables, &subquery.where_clause)?
+        };
+        // Apply the subquery's WHERE conjuncts, EXCEPT the correlated equi-join.
+        // We identify the correlated conjunct by checking if it references outer cols.
+        // Since we're called with outer=None (top-level), any conjunct that would
+        // fail column resolution is correlated. We skip those.
+        let mask = if let Some(ref wc) = subquery.where_clause {
+            // Split into conjuncts, apply only uncorrelated ones
+            let conjuncts = self.split_conjuncts(&subquery.where_clause);
+            let mut mask = vec![true; base.row_count];
+            for conj in &conjuncts {
+                // Check if this conjunct references any column not in `base`.
+                // If so, it's correlated — skip it.
+                if self.is_conjunct_correlated(conj, &base) {
+                    continue;
+                }
+                // Apply uncorrelated conjunct
+                let mut cmask = vec![true; base.row_count];
+                self.eval_bool_mask_vec(conj, &base, &mut cmask)?;
+                for i in 0..base.row_count { mask[i] = mask[i] && cmask[i]; }
+            }
+            mask
+        } else { vec![true; base.row_count] };
+        // Build hash set of inner col values
+        let col = &base.columns[inner_col_idx];
+        let mut set = std::collections::HashSet::with_capacity(base.row_count);
+        for i in 0..base.row_count {
+            if mask[i] {
+                set.insert(col[i]);
+            }
+        }
+        Ok(set)
+    }
+
+    /// Check if a conjunct references a column not in `base` (i.e. correlated).
+    fn is_conjunct_correlated(&self, expr: &Expr2, base: &ExecTable) -> bool {
+        match expr {
+            Expr2::Col(name) => {
+                let short = name.rfind('.').map(|p| &name[p+1..]).unwrap_or(name.as_str());
+                base.lookup_col(name).is_none() && base.lookup_col(short).is_none()
+            }
+            Expr2::BinOp { left, right, .. } => {
+                self.is_conjunct_correlated(left, base) || self.is_conjunct_correlated(right, base)
+            }
+            Expr2::Case { whens, else_ } => {
+                whens.iter().any(|(c, r)| self.is_conjunct_correlated(c, base) || self.is_conjunct_correlated(r, base))
+                    || else_.as_ref().map(|e| self.is_conjunct_correlated(e, base)).unwrap_or(false)
+            }
+            Expr2::Like { expr, pattern, .. } => {
+                self.is_conjunct_correlated(expr, base) || self.is_conjunct_correlated(pattern, base)
+            }
+            Expr2::Between { expr, low, high, .. } => {
+                self.is_conjunct_correlated(expr, base) || self.is_conjunct_correlated(low, base) || self.is_conjunct_correlated(high, base)
+            }
+            Expr2::InList { expr, list, .. } => {
+                self.is_conjunct_correlated(expr, base) || list.iter().any(|e| self.is_conjunct_correlated(e, base))
+            }
+            Expr2::Neg(e) | Expr2::Not(e) | Expr2::Extract { expr: e, .. } => {
+                self.is_conjunct_correlated(e, base)
+            }
+            Expr2::Substr { expr, start, len } => {
+                self.is_conjunct_correlated(expr, base) || self.is_conjunct_correlated(start, base) || self.is_conjunct_correlated(len, base)
+            }
+            Expr2::Subquery(_) | Expr2::Exists { .. } | Expr2::InSubquery { .. } => true,
+            _ => false,
         }
     }
 
@@ -2177,6 +2418,27 @@ impl<'a> TpchExec<'a> {
                 Ok(v)
             }
             Expr2::Exists { query, negated } => {
+                // Semi-join fast path: if the subquery has a single correlation
+                // column with an equi-join (e.g. `l_orderkey = o_orderkey`),
+                // build a hash set of inner col values ONCE and check membership.
+                // This decorrelates EXISTS, reducing ~25k subquery executions
+                // (Q4) to 1 hash-set build + 25k lookups.
+                let ast_key = (query.as_ref() as *const SelectQuery2) as usize;
+                if let Some((outer_col_idx, inner_col_idx)) = self.find_exists_equi_join(query, t) {
+                    // Build the hash set (cached by AST pointer)
+                    let need_build = !self.exists_cache.borrow().contains_key(&ast_key);
+                    if need_build {
+                        let set = self.build_exists_hashset(query, inner_col_idx)?;
+                        self.exists_cache.borrow_mut().insert(ast_key, set);
+                    }
+                    let cache = self.exists_cache.borrow();
+                    if let Some(set) = cache.get(&ast_key) {
+                        let outer_val = t.columns[outer_col_idx].get(row).copied().unwrap_or(0);
+                        let exists = set.contains(&outer_val);
+                        return Ok(Value2::Int(if if *negated { !exists } else { exists } { 1 } else { 0 }));
+                    }
+                }
+                // Fallback: per-row execution (correlated subquery)
                 let old_outer = self.outer.get();
                 self.outer.set(Some((t as *const ExecTable, row)));
                 let r = self.execute(query);
@@ -3609,7 +3871,7 @@ mod tests {
 
     #[test]
     fn test_like_match() {
-        let cat = Catalog::new(); let exec = TpchExec { catalog: &cat, outer: std::cell::Cell::new(None), subquery_cache: std::cell::RefCell::new(HashMap::new()) };
+        let cat = Catalog::new(); let exec = TpchExec { catalog: &cat, outer: std::cell::Cell::new(None), subquery_cache: std::cell::RefCell::new(HashMap::new()), exists_cache: std::cell::RefCell::new(HashMap::new()) };
         assert!(exec.like("hello world", "%hello%"));
         assert!(exec.like("hello", "hello"));
         assert!(exec.like("hello world", "hello%"));
