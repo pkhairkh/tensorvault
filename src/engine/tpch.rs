@@ -2906,12 +2906,16 @@ impl<'a> TpchExec<'a> {
         let mut group_map: HashMap<u64, usize> = HashMap::with_capacity(64);
         let mut group_indices: Vec<Vec<usize>> = Vec::with_capacity(64);
         for &idx in &indices {
-            // Compute single u64 hash key from GROUP BY column values
+            // Compute single u64 hash key from GROUP BY column values.
+            // For simple columns, read u64 directly. For computed expressions
+            // (e.g. extract(year FROM l_shipdate)), eval per row.
             let mut key_hash: u64 = 0;
-            for &col_idx in &gb_cols {
-                let v = match col_idx {
-                    Some(ci) => t.columns[ci][idx],
-                    None => 0,
+            for (gi, gb) in query.group_by.iter().enumerate() {
+                let v = if let Some(ci) = gb_cols[gi] {
+                    t.columns[ci][idx]
+                } else {
+                    // Computed GROUP BY expression — eval per row
+                    self.eval(gb, t, idx)?.to_u64()
                 };
                 key_hash = key_hash.wrapping_mul(0x517cc1b727220a95).wrapping_add(v);
             }
