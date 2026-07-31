@@ -2447,6 +2447,23 @@ impl<'a> TpchExec<'a> {
                 Err(Error::NotFound(format!("column '{}'", name)))
             }
             Expr2::BinOp { op: BinOp2::Mul, left, right } => {
+                // W21: BF16 fast path for Sum(Col * Col) on float columns
+                if let (Some(a), Some(b)) = (self.col_in(left, t), self.col_in(right, t)) {
+                    if t.col_types[a] == ColType::Float && t.col_types[b] == ColType::Float
+                        && crate::kernel::vnni_agg::has_bf16() {
+                        let ca = &t.columns[a];
+                        let cb = &t.columns[b];
+                        let n = indices.len();
+                        let mut da = vec![0u64; n];
+                        let mut db = vec![0u64; n];
+                        for (k, &i) in indices.iter().enumerate() {
+                            da[k] = ca[i];
+                            db[k] = cb[i];
+                        }
+                        let mask = vec![true; n];
+                        return Ok(Value2::Float(crate::kernel::vnni_agg::dot_f64_bf16(&da, &db, &mask)));
+                    }
+                }
                 // Fast path: Col * (1 - Col2)  [Q1 sum_disc_price pattern]
                 if let (Some(a), Some(b)) = (self.col_in(left, t), self.col_in_sub_one_right(right, t)) {
                     let ca = &t.columns[a];

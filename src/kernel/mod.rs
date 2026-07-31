@@ -22,6 +22,7 @@
 //! makes the engine tier-aware rather than tier-blind.
 
 pub mod aggregate;
+pub mod vnni_agg;
 pub mod cpu;
 pub mod hash;
 pub mod leapfrog;
