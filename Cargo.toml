@@ -29,6 +29,9 @@ thiserror = "1"
 # Concurrency
 rayon = "1"
 parking_lot = "0.12"
+# Global allocator — replaces glibc ptmalloc2 (50% of query time was in
+# malloc_consolidate + free). mimalloc has thread-local heaps.
+mimalloc = { version = "0.1", features = ["override"] }
 # CPU detection
 raw-cpuid = "11.0"
 # Logging

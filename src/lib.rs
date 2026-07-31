@@ -38,6 +38,15 @@
 
 #![warn(rust_2018_idioms, missing_docs)]
 
+// Use mimalloc as the global allocator — glibc's ptmalloc2 spends ~50% of
+// query execution time in malloc_consolidate + unlink_chunk + _int_free
+// (measured via perf on Q3). mimalloc is a drop-in replacement with
+// thread-local heaps and compact size classes that eliminate the
+// consolidation overhead. This is the single highest-impact optimization
+// for join-heavy queries.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub mod catalog;
 pub mod compress;
 pub mod datasource;
