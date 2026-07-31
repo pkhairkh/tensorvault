@@ -1903,24 +1903,35 @@ impl<'a> TpchExec<'a> {
             return self.execute_scalar_agg(query, t, &indices);
         }
 
-        // Group rows
-        let mut groups: HashMap<Vec<u64>, Vec<usize>> = HashMap::new();
+        // Group rows — optimized: pre-resolve column indices, read u64 directly,
+        // use single u64 hash key instead of Vec<u64>.
+        let gb_cols: Vec<Option<usize>> = query.group_by.iter()
+            .map(|gb| self.col_in(gb, t))
+            .collect();
+        let mut group_map: HashMap<u64, usize> = HashMap::with_capacity(64);
+        let mut group_indices: Vec<Vec<usize>> = Vec::with_capacity(64);
         for &idx in &indices {
-            let mut key = Vec::with_capacity(query.group_by.len());
-            for gb in &query.group_by {
-                let v = self.eval(gb, t, idx)?;
-                key.push(match &v {
-                    Value2::Int(i) => *i as u64,
-                    Value2::Float(f) => f.to_bits(),
-                    Value2::Date(d) => *d as u32 as u64,
-                    Value2::Null => u64::MAX,
-                    Value2::Str(s) => xxhash_rust::xxh3::xxh3_64(s.as_bytes()),
-                });
+            // Compute single u64 hash key from GROUP BY column values
+            let mut key_hash: u64 = 0;
+            for &col_idx in &gb_cols {
+                let v = match col_idx {
+                    Some(ci) => t.columns[ci][idx],
+                    None => 0,
+                };
+                key_hash = key_hash.wrapping_mul(0x517cc1b727220a95).wrapping_add(v);
             }
-            groups.entry(key).or_default().push(idx);
+            let gid = if let Some(&existing) = group_map.get(&key_hash) {
+                existing
+            } else {
+                let new_id = group_indices.len();
+                group_map.insert(key_hash, new_id);
+                group_indices.push(Vec::new());
+                new_id
+            };
+            group_indices[gid].push(idx);
         }
 
-        let group_indices: Vec<&Vec<usize>> = groups.values().collect();
+        let group_indices: Vec<&Vec<usize>> = group_indices.iter().collect();
 
         // HAVING
         let filtered: Vec<usize> = if let Some(ref having) = query.having {
@@ -1932,14 +1943,24 @@ impl<'a> TpchExec<'a> {
             v
         } else { (0..group_indices.len()).collect() };
 
-        // Build result
+        // Build result using FUSED per-group aggregation.
+        let fused = self.try_fused_grouped_agg(&query.select, t, &group_indices, &filtered)?;
         let mut cols = Vec::new();
-        for item in &query.select {
+        for (item_idx, item) in query.select.iter().enumerate() {
             let name = item.alias.clone().unwrap_or_else(|| self.expr_name(&item.expr));
-            let values: Vec<u64> = filtered.iter().map(|&gi| {
-                let gidxs = group_indices[gi];
-                self.eval_agg_expr(&item.expr, t, gidxs).unwrap_or(Value2::Null).to_u64()
-            }).collect();
+            let values: Vec<u64> = if let Some(ref fv) = fused {
+                fv.get(item_idx).cloned().unwrap_or_else(|| {
+                    filtered.iter().map(|&gi| {
+                        let gidxs = group_indices[gi];
+                        self.eval_agg_expr(&item.expr, t, gidxs).unwrap_or(Value2::Null).to_u64()
+                    }).collect()
+                })
+            } else {
+                filtered.iter().map(|&gi| {
+                    let gidxs = group_indices[gi];
+                    self.eval_agg_expr(&item.expr, t, gidxs).unwrap_or(Value2::Null).to_u64()
+                }).collect()
+            };
             cols.push(ResultColumn { name, values });
         }
 
@@ -1955,6 +1976,161 @@ impl<'a> TpchExec<'a> {
             }
         }
         Ok(result)
+    }
+
+// Rust function to insert before execute_scalar_agg
+    /// Fused per-group aggregation: analyze all select items, and if they
+    /// match supported patterns, do a SINGLE pass per group computing all aggregates.
+    fn try_fused_grouped_agg(
+        &self, select: &[SelectItem2], t: &ExecTable,
+        group_indices: &[&Vec<usize>], filtered: &[usize],
+    ) -> Result<Option<Vec<Vec<u64>>>, Error> {
+        if filtered.is_empty() {
+            return Ok(Some(vec![Vec::new(); select.len()]));
+        }
+
+        #[derive(Clone)]
+        enum FusedAgg {
+            GroupByCol(usize),
+            CountAll,
+            SumCol(usize),
+            SumColCol(usize, usize),
+            SumColSubOne(usize, usize),
+            SumColSubOneAddOne(usize, usize, usize),
+            AvgCol(usize),
+            MinCol(usize),
+            MaxCol(usize),
+        }
+
+        let mut plans: Vec<Option<FusedAgg>> = Vec::with_capacity(select.len());
+        for item in select {
+            let plan = match &item.expr {
+                Expr2::CountStar => Some(FusedAgg::CountAll),
+                Expr2::Agg { func, arg, distinct: false } => {
+                    match func {
+                        AggFunc::Count => Some(FusedAgg::CountAll),
+                        AggFunc::Sum => {
+                            if let Some(a) = self.col_in(arg, t) {
+                                if t.col_types[a] == ColType::Float { Some(FusedAgg::SumCol(a)) } else { None }
+                            } else if let Expr2::BinOp { op: BinOp2::Mul, left, right } = arg.as_ref() {
+                                if let (Some(a), Some(b)) = (self.col_in(left, t), self.col_in(right, t)) {
+                                    if t.col_types[a] == ColType::Float && t.col_types[b] == ColType::Float {
+                                        Some(FusedAgg::SumColCol(a, b))
+                                    } else { None }
+                                } else if let (Some(a), Some(b)) = (self.col_in(left, t), self.col_in_sub_one_right(right, t)) {
+                                    if t.col_types[a] == ColType::Float && t.col_types[b] == ColType::Float {
+                                        Some(FusedAgg::SumColSubOne(a, b))
+                                    } else { None }
+                                } else if let (Some(b), Some(a)) = (self.col_in(right, t), self.col_in_sub_one_right(left, t)) {
+                                    if t.col_types[a] == ColType::Float && t.col_types[b] == ColType::Float {
+                                        Some(FusedAgg::SumColSubOne(a, b))
+                                    } else { None }
+                                } else { None }
+                            } else { None }
+                        }
+                        AggFunc::Avg => {
+                            if let Expr2::Col(name) = arg.as_ref() {
+                                if let Some(idx) = t.lookup_col(name) {
+                                    if t.col_types[idx] == ColType::Float { Some(FusedAgg::AvgCol(idx)) } else { None }
+                                } else { None }
+                            } else { None }
+                        }
+                        AggFunc::Min => {
+                            if let Expr2::Col(name) = arg.as_ref() {
+                                if let Some(idx) = t.lookup_col(name) { Some(FusedAgg::MinCol(idx)) } else { None }
+                            } else { None }
+                        }
+                        AggFunc::Max => {
+                            if let Expr2::Col(name) = arg.as_ref() {
+                                if let Some(idx) = t.lookup_col(name) { Some(FusedAgg::MaxCol(idx)) } else { None }
+                            } else { None }
+                        }
+                        _ => None,
+                    }
+                }
+                Expr2::Col(name) => {
+                    if let Some(idx) = t.lookup_col(name) { Some(FusedAgg::GroupByCol(idx)) } else { None }
+                }
+                _ => None,
+            };
+            plans.push(plan);
+        }
+
+        // Second pass for Sum(Col * (1 - Col2) * (1 + Col3))
+        for (i, item) in select.iter().enumerate() {
+            if plans[i].is_some() { continue; }
+            if let Expr2::Agg { func: AggFunc::Sum, arg, distinct: false } = &item.expr {
+                if let Expr2::BinOp { op: BinOp2::Mul, left, right } = arg.as_ref() {
+                    // Try: (Col * (1 - Col2)) * (1 + Col3)
+                    if let Some((a, b)) = self.col_in_mul_sub_one(left, t) {
+                        if let Some(c) = self.col_in_add_one_right(right, t) {
+                            if t.col_types[a] == ColType::Float && t.col_types[b] == ColType::Float && t.col_types[c] == ColType::Float {
+                                plans[i] = Some(FusedAgg::SumColSubOneAddOne(a, b, c));
+                            }
+                        }
+                    }
+                    // Try: Col * ((1 - Col2) * (1 + Col3))
+                    else if let Some(a) = self.col_in(left, t) {
+                        if let Some((b, c)) = self.col_in_mul_sub_one_add_one(right, t) {
+                            if t.col_types[a] == ColType::Float && t.col_types[b] == ColType::Float && t.col_types[c] == ColType::Float {
+                                plans[i] = Some(FusedAgg::SumColSubOneAddOne(a, b, c));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if plans.iter().any(|p| p.is_none()) {
+            return Ok(None);
+        }
+
+        let num_groups = filtered.len();
+        let mut results: Vec<Vec<u64>> = vec![Vec::with_capacity(num_groups); select.len()];
+
+        for &gi in filtered {
+            let indices = group_indices[gi];
+            let mut sums: Vec<f64> = vec![0.0; select.len()];
+            let mut counts: Vec<u64> = vec![0; select.len()];
+            let mut mins: Vec<f64> = vec![f64::INFINITY; select.len()];
+            let mut maxs: Vec<f64> = vec![f64::NEG_INFINITY; select.len()];
+            let mut gb_vals: Vec<u64> = vec![0; select.len()];
+            let mut gb_found: Vec<bool> = vec![false; select.len()];
+
+            for &i in indices {
+                for (j, plan) in plans.iter().enumerate() {
+                    match plan.as_ref().unwrap() {
+                        FusedAgg::GroupByCol(idx) => {
+                            if !gb_found[j] { gb_vals[j] = t.columns[*idx][i]; gb_found[j] = true; }
+                        }
+                        FusedAgg::CountAll => { counts[j] += 1; }
+                        FusedAgg::SumCol(a) => { sums[j] += f64::from_bits(t.columns[*a][i]); }
+                        FusedAgg::SumColCol(a, b) => { sums[j] += f64::from_bits(t.columns[*a][i]) * f64::from_bits(t.columns[*b][i]); }
+                        FusedAgg::SumColSubOne(a, b) => { sums[j] += f64::from_bits(t.columns[*a][i]) * (1.0 - f64::from_bits(t.columns[*b][i])); }
+                        FusedAgg::SumColSubOneAddOne(a, b, c) => {
+                            sums[j] += f64::from_bits(t.columns[*a][i]) * (1.0 - f64::from_bits(t.columns[*b][i])) * (1.0 + f64::from_bits(t.columns[*c][i]));
+                        }
+                        FusedAgg::AvgCol(a) => { sums[j] += f64::from_bits(t.columns[*a][i]); counts[j] += 1; }
+                        FusedAgg::MinCol(a) => { let v = f64::from_bits(t.columns[*a][i]); if v < mins[j] { mins[j] = v; } }
+                        FusedAgg::MaxCol(a) => { let v = f64::from_bits(t.columns[*a][i]); if v > maxs[j] { maxs[j] = v; } }
+                    }
+                }
+            }
+
+            for (j, plan) in plans.iter().enumerate() {
+                let val = match plan.as_ref().unwrap() {
+                    FusedAgg::GroupByCol(_) => gb_vals[j],
+                    FusedAgg::CountAll => counts[j],
+                    FusedAgg::SumCol(_) | FusedAgg::SumColCol(_, _) | FusedAgg::SumColSubOne(_, _) | FusedAgg::SumColSubOneAddOne(_, _, _) => sums[j].to_bits(),
+                    FusedAgg::AvgCol(_) => if counts[j] == 0 { 0u64 } else { (sums[j] / counts[j] as f64).to_bits() },
+                    FusedAgg::MinCol(_) => mins[j].to_bits(),
+                    FusedAgg::MaxCol(_) => maxs[j].to_bits(),
+                };
+                results[j].push(val);
+            }
+        }
+
+        Ok(Some(results))
     }
 
     fn execute_scalar_agg(&self, query: &SelectQuery2, t: &ExecTable, indices: &[usize]) -> Result<QueryResult, Error> {
@@ -2216,6 +2392,45 @@ impl<'a> TpchExec<'a> {
                 Err(Error::NotFound(format!("column '{}'", name)))
             }
             Expr2::BinOp { op: BinOp2::Mul, left, right } => {
+                // Fast path: Col * (1 - Col2)  [Q1 sum_disc_price pattern]
+                if let (Some(a), Some(b)) = (self.col_in(left, t), self.col_in_sub_one_right(right, t)) {
+                    let ca = &t.columns[a];
+                    let cb = &t.columns[b];
+                    if t.col_types[a] == ColType::Float && t.col_types[b] == ColType::Float {
+                        let mut sum = 0.0f64;
+                        for &i in indices {
+                            sum += f64::from_bits(ca[i]) * (1.0 - f64::from_bits(cb[i]));
+                        }
+                        return Ok(Value2::Float(sum));
+                    }
+                }
+                // Fast path: (1 - Col2) * Col  [reversed]
+                if let (Some(b), Some(a)) = (self.col_in(right, t), self.col_in_sub_one_right(left, t)) {
+                    let ca = &t.columns[a];
+                    let cb = &t.columns[b];
+                    if t.col_types[a] == ColType::Float && t.col_types[b] == ColType::Float {
+                        let mut sum = 0.0f64;
+                        for &i in indices {
+                            sum += f64::from_bits(ca[i]) * (1.0 - f64::from_bits(cb[i]));
+                        }
+                        return Ok(Value2::Float(sum));
+                    }
+                }
+                // Fast path: Col * (1 - Col2) * (1 + Col3)  [Q1 sum_charge pattern]
+                if let Some(a) = self.col_in(left, t) {
+                    if let Some((b, c)) = self.col_in_mul_sub_one_add_one(right, t) {
+                        let ca = &t.columns[a];
+                        let cb = &t.columns[b];
+                        let cc = &t.columns[c];
+                        if t.col_types[a] == ColType::Float && t.col_types[b] == ColType::Float && t.col_types[c] == ColType::Float {
+                            let mut sum = 0.0f64;
+                            for &i in indices {
+                                sum += f64::from_bits(ca[i]) * (1.0 - f64::from_bits(cb[i])) * (1.0 + f64::from_bits(cc[i]));
+                            }
+                            return Ok(Value2::Float(sum));
+                        }
+                    }
+                }
                 // Col * Col  or  Col * Literal  or  Literal * Col
                 let li = self.col_in(left, t);
                 let ri = self.col_in(right, t);
@@ -2427,6 +2642,62 @@ impl<'a> TpchExec<'a> {
             }
         }
         Ok(best.map(Value2::Float).unwrap_or(Value2::Null))
+    }
+
+    /// Detect the pattern `(1 - Col)` and return the column index.
+    fn col_in_sub_one_right(&self, expr: &Expr2, t: &ExecTable) -> Option<usize> {
+        if let Expr2::BinOp { op: BinOp2::Sub, left, right } = expr {
+            let is_one = match left.as_ref() {
+                Expr2::Int(i) if *i == 1 => true,
+                Expr2::Float(f) if *f == 1.0 => true,
+                _ => false,
+            };
+            if is_one {
+                return self.col_in(right, t);
+            }
+        }
+        None
+    }
+
+    /// Detect the pattern Col * (1 - Col2) and return (col, col2).
+    fn col_in_mul_sub_one(&self, expr: &Expr2, t: &ExecTable) -> Option<(usize, usize)> {
+        if let Expr2::BinOp { op: BinOp2::Mul, left, right } = expr {
+            if let (Some(a), Some(b)) = (self.col_in(left, t), self.col_in_sub_one_right(right, t)) {
+                return Some((a, b));
+            }
+            if let (Some(b), Some(a)) = (self.col_in(right, t), self.col_in_sub_one_right(left, t)) {
+                return Some((a, b));
+            }
+        }
+        None
+    }
+
+    /// Detect the pattern `(1 - Col2) * (1 + Col3)` and return (col2, col3).
+    fn col_in_mul_sub_one_add_one(&self, expr: &Expr2, t: &ExecTable) -> Option<(usize, usize)> {
+        if let Expr2::BinOp { op: BinOp2::Mul, left, right } = expr {
+            let b = self.col_in_sub_one_right(left, t);
+            let c = self.col_in_add_one_right(right, t);
+            if let (Some(b), Some(c)) = (b, c) { return Some((b, c)); }
+            let b = self.col_in_sub_one_right(right, t);
+            let c = self.col_in_add_one_right(left, t);
+            if let (Some(b), Some(c)) = (b, c) { return Some((b, c)); }
+        }
+        None
+    }
+
+    /// Detect the pattern `(1 + Col)` and return the column index.
+    fn col_in_add_one_right(&self, expr: &Expr2, t: &ExecTable) -> Option<usize> {
+        if let Expr2::BinOp { op: BinOp2::Add, left, right } = expr {
+            let is_one = match left.as_ref() {
+                Expr2::Int(i) if *i == 1 => true,
+                Expr2::Float(f) if *f == 1.0 => true,
+                _ => false,
+            };
+            if is_one {
+                return self.col_in(right, t);
+            }
+        }
+        None
     }
 
     fn sum_values(&self, values: &[Value2]) -> Value2 {
