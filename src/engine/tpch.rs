@@ -1218,7 +1218,7 @@ impl<'a> TpchExec<'a> {
         for (i, col) in result.columns.iter().enumerate() {
             column_names.push(col.name.clone());
             columns.push(std::sync::Arc::new(col.values.clone()));
-            col_types.push(self.infer_result_type(&col.name));
+            col_types.push(self.infer_result_type(&col.name, &col.values));
             string_columns.push(None);
             let lower = col.name.to_lowercase();
             col_map.entry(col.name.to_lowercase()).or_insert(i);
@@ -1227,12 +1227,44 @@ impl<'a> TpchExec<'a> {
         Ok(ExecTable { columns, column_names, col_types, string_columns, row_count: result.row_count, col_map })
     }
 
-    fn infer_result_type(&self, name: &str) -> ColType {
+    fn infer_result_type(&self, name: &str, values: &[u64]) -> ColType {
         let l = name.to_lowercase();
-        if l.contains("year") || l.contains("count") || l.contains("custdist") || l.contains("cntrycode")
-            || l.contains("order") || l.contains("partkey") || l.contains("suppkey") || l.contains("custkey")
-            || l.contains("size") || l.contains("numwait") || l.contains("numcust") || l.contains("supplier_cnt")
-        { ColType::Int } else { ColType::Float }
+        // Date columns
+        if l.contains("date") || l.contains("shipdate") || l.contains("commitdate") || l.contains("receiptdate")
+        { return ColType::Date; }
+        // String columns (common in TPC-H SELECT aliases)
+        if l == "n_name" || l == "supp_nation" || l == "cust_nation" || l == "nation"
+            || l == "s_name" || l == "c_name" || l == "p_mfgr" || l == "p_brand" || l == "p_type"
+            || l == "p_container" || l == "l_returnflag" || l == "l_linestatus"
+            || l == "l_shipmode" || l == "l_shipinstruct" || l == "o_orderpriority"
+            || l == "o_orderstatus" || l == "cntrycode"
+        { return ColType::String; }
+        // Known integer columns (key columns, counts, years, codes)
+        if l.contains("year") || l.contains("count") || l.contains("custdist")
+            || l.contains("partkey") || l.contains("suppkey")
+            || l.contains("custkey") || l.contains("nationkey") || l.contains("regionkey")
+            || l.contains("numwait") || l.contains("numcust")
+            || l.contains("supplier_cnt") || l.contains("availqty") || l.contains("size")
+            || l == "c_count" || l == "supplier_no" || l == "order_count"
+        { return ColType::Int; }
+        // Heuristic: inspect actual values to distinguish Int from Float.
+        // If all sampled non-zero values are "small" (< 2^32) AND none of them,
+        // when interpreted as f64 bits, look like normal float values, then
+        // the column contains raw integer values (e.g., an aliased GROUP BY key
+        // like `l_suppkey AS supplier_no`). Float aggregations (sum/avg) always
+        // produce normal-range f64 values, so this heuristic is safe.
+        let sample: Vec<u64> = values.iter().take(16).copied().filter(|&v| v != 0).collect();
+        if !sample.is_empty() {
+            let all_small_int = sample.iter().all(|&v| v < (1u64 << 32));
+            let any_normal_float = sample.iter().any(|&v| {
+                let f = f64::from_bits(v);
+                f.is_normal() && f.abs() >= 1e-3 && f.abs() <= 1e20
+            });
+            if all_small_int && !any_normal_float {
+                return ColType::Int;
+            }
+        }
+        ColType::Float
     }
 
     // --- Cross join ---
@@ -1857,7 +1889,8 @@ impl<'a> TpchExec<'a> {
                 let r = r?;
                 let val = r.columns.first().and_then(|c| c.values.first()).copied().unwrap_or(0);
                 let name = r.columns.first().map(|c| c.name.as_str()).unwrap_or("");
-                Ok(match self.infer_result_type(name) {
+                let vals_slice: &[u64] = r.columns.first().map(|c| c.values.as_slice()).unwrap_or(&[]);
+                Ok(match self.infer_result_type(name, vals_slice) {
                     ColType::Float => Value2::Float(f64::from_bits(val)),
                     _ => Value2::Int(val as i64),
                 })
