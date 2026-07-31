@@ -1926,9 +1926,6 @@ impl<'a> TpchExec<'a> {
             let end = std::cmp::min(start + CHUNK_SIZE, probe_row_count);
 
             let mut local_out: Vec<Vec<u64>> = (0..ncol).map(|_| Vec::with_capacity(CHUNK_SIZE * 2)).collect();
-            // Reuse matched_rows buffer across probe iterations to avoid
-            // per-probe malloc/free churn (was #1 perf bottleneck — 49% of
-            // time in malloc/free/memmove per perf profile).
             let mut matched_rows: Vec<u32> = Vec::with_capacity(16);
 
             for p in start..end {
@@ -1977,14 +1974,14 @@ impl<'a> TpchExec<'a> {
             local_out
         }).collect();
 
-        // Merge partial results: concatenate all chunk-local output columns.
-        let mut out_cols: Vec<Vec<u64>> = vec![Vec::new(); ncol];
+        // Merge: pre-calculate total size to avoid reallocation.
+        let total_rows: usize = partial_results.iter().map(|r| r.first().map(|c| c.len()).unwrap_or(0)).sum();
+        let mut out_cols: Vec<Vec<u64>> = (0..ncol).map(|_| Vec::with_capacity(total_rows)).collect();
         for local_out in partial_results {
             for c in 0..ncol {
                 out_cols[c].extend_from_slice(&local_out[c]);
             }
         }
-        // row_count is the max column length (all should be equal)
         let row_count = out_cols.first().map(|c| c.len()).unwrap_or(0);
 
         let mut col_map = HashMap::new();
