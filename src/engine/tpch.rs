@@ -1458,33 +1458,42 @@ impl<'a> TpchExec<'a> {
             self.join_tables_smart(tables, &subquery.where_clause)?
         };
         // Apply the subquery's WHERE conjuncts, EXCEPT the correlated equi-join.
-        // We identify the correlated conjunct by checking if it references outer cols.
-        // Since we're called with outer=None (top-level), any conjunct that would
-        // fail column resolution is correlated. We skip those.
         let mask = if let Some(ref wc) = subquery.where_clause {
-            // Split into conjuncts, apply only uncorrelated ones
             let conjuncts = self.split_conjuncts(&subquery.where_clause);
             let mut mask = vec![true; base.row_count];
             for conj in &conjuncts {
-                // Check if this conjunct references any column not in `base`.
-                // If so, it's correlated — skip it.
                 if self.is_conjunct_correlated(conj, &base) {
                     continue;
                 }
-                // Apply uncorrelated conjunct
                 let mut cmask = vec![true; base.row_count];
                 self.eval_bool_mask_vec(conj, &base, &mut cmask)?;
                 for i in 0..base.row_count { mask[i] = mask[i] && cmask[i]; }
             }
             mask
         } else { vec![true; base.row_count] };
-        // Build hash set of inner col values
+        // Build hash set of inner col values — PARALLEL using rayon.
+        // Split into chunks, each thread builds a local HashSet, then merge.
+        // This is critical for Q4 where lineitem has 6M rows and the serial
+        // HashSet insertion (SipHash + hashbrown) was a top-5 hotspot.
         let col = &base.columns[inner_col_idx];
-        let mut set = std::collections::HashSet::with_capacity(base.row_count);
-        for i in 0..base.row_count {
-            if mask[i] {
-                set.insert(col[i]);
+        const CHUNK_SIZE: usize = 65536;
+        let n = base.row_count;
+        let num_chunks = (n + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        let local_sets: Vec<std::collections::HashSet<u64>> = (0..num_chunks).into_par_iter().map(|chunk_idx| {
+            let start = chunk_idx * CHUNK_SIZE;
+            let end = std::cmp::min(start + CHUNK_SIZE, n);
+            let mut local = std::collections::HashSet::with_capacity(end - start);
+            for i in start..end {
+                if mask[i] {
+                    local.insert(col[i]);
+                }
             }
+            local
+        }).collect();
+        // Merge local sets into final set
+        let mut set = std::collections::HashSet::with_capacity(base.row_count);
+        for local in local_sets {
+            set.extend(local);
         }
         Ok(set)
     }
@@ -1670,10 +1679,27 @@ impl<'a> TpchExec<'a> {
         } else { vec![true; base.row_count] };
         let eq_col = &base.columns[inner_eq_idx];
         let neq_col = &base.columns[inner_neq_idx];
+        // Build HashMap<equi_key, HashSet<ineq_col>> — PARALLEL using rayon.
+        // Each chunk builds a local HashMap, then merge by extending sets.
+        const CHUNK_SIZE: usize = 65536;
+        let n = base.row_count;
+        let num_chunks = (n + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        let local_maps: Vec<std::collections::HashMap<u64, std::collections::HashSet<u64>>> = (0..num_chunks).into_par_iter().map(|chunk_idx| {
+            let start = chunk_idx * CHUNK_SIZE;
+            let end = std::cmp::min(start + CHUNK_SIZE, n);
+            let mut local: std::collections::HashMap<u64, std::collections::HashSet<u64>> = std::collections::HashMap::new();
+            for i in start..end {
+                if mask[i] {
+                    local.entry(eq_col[i]).or_default().insert(neq_col[i]);
+                }
+            }
+            local
+        }).collect();
+        // Merge local maps into final map
         let mut map: std::collections::HashMap<u64, std::collections::HashSet<u64>> = std::collections::HashMap::new();
-        for i in 0..base.row_count {
-            if mask[i] {
-                map.entry(eq_col[i]).or_default().insert(neq_col[i]);
+        for local in local_maps {
+            for (k, v) in local {
+                map.entry(k).or_default().extend(v);
             }
         }
         Ok(map)
