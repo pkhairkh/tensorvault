@@ -750,17 +750,41 @@ impl<'a> TpchExec<'a> {
             tables.push(self.hash_join(left, right, &join.on, join.join_type)?);
         }
 
-        // 3. Build base table — use hash joins for implicit multi-table joins
-        let base = if tables.len() == 1 {
-            tables.into_iter().next().unwrap()
+        // 3. Build base table — use hash joins for implicit multi-table joins.
+        // For multi-table FROM, join_tables_smart applies single-table filters
+        // (e.g. p_name LIKE '%green%') BEFORE joining. We must NOT re-apply
+        // those single-table filters after the join, because string_columns
+        // are not rebuilt after joins (LIKE on joined tables falls back to
+        // hash comparison, which fails for wildcard patterns).
+        let (base, mask) = if tables.len() == 1 {
+            let base = tables.into_iter().next().unwrap();
+            let mask = if let Some(ref wc) = query.where_clause {
+                self.build_mask(wc, &base)?
+            } else { vec![true; base.row_count] };
+            (base, mask)
         } else {
-            self.join_tables_smart(tables, &query.where_clause)?
+            // Identify multi-table conjuncts BEFORE consuming tables.
+            // Single-table conjuncts (refs.len() == 1) are applied by
+            // join_tables_smart and skipped here.
+            let conjuncts = self.split_conjuncts(&query.where_clause);
+            let multi_table: Vec<Expr2> = conjuncts.iter().filter(|conj| {
+                let refs = self.expr_table_refs(conj, &tables);
+                refs.len() != 1
+            }).cloned().collect();
+            let base = self.join_tables_smart(tables, &query.where_clause)?;
+            let mask = if multi_table.is_empty() {
+                vec![true; base.row_count]
+            } else {
+                let mut mask = vec![true; base.row_count];
+                for conj in &multi_table {
+                    let mut cmask = mask.clone();
+                    self.eval_bool_mask_vec(conj, &base, &mut cmask)?;
+                    for i in 0..base.row_count { mask[i] = mask[i] && cmask[i]; }
+                }
+                mask
+            };
+            (base, mask)
         };
-
-        // 4. Apply WHERE filter
-        let mask = if let Some(ref wc) = query.where_clause {
-            self.build_mask(wc, &base)?
-        } else { vec![true; base.row_count] };
 
         // 5. GROUP BY + aggregates
         if !query.group_by.is_empty() || self.has_agg(&query.select) {
@@ -1386,8 +1410,12 @@ impl<'a> TpchExec<'a> {
         let mut out_cols: Vec<Vec<u64>> = (0..ncol).map(|_| Vec::with_capacity(est_output)).collect();
         let mut out_types = left.col_types.clone();
         out_types.extend(right.col_types.iter().copied());
-        let mut out_strings = left.string_columns.clone();
-        out_strings.extend(right.string_columns.iter().cloned());
+        // String columns are NOT rebuilt after join — the original StringSearchColumn
+        // has the pre-join row count and doesn't correspond to joined rows.
+        // Set to None so eval falls back to u64 hash values (which are correct
+        // for filtering, joining, and grouping). LIKE on joined tables falls back
+        // to hash comparison (exact match only, no wildcards).
+        let out_strings: Vec<Option<std::sync::Arc<StringSearchColumn>>> = (0..ncol).map(|_| None).collect();
         let mut out_names = left.column_names.clone();
         out_names.extend(right.column_names.clone());
         let mut row_count = 0usize;
@@ -1734,8 +1762,8 @@ impl<'a> TpchExec<'a> {
         }
         let mut col_types = left.col_types.clone();
         col_types.extend(right.col_types.iter().copied());
-        let mut string_columns = left.string_columns.clone();
-        string_columns.extend(right.string_columns.iter().cloned());
+        // String columns are NOT rebuilt after cross join — set to None.
+        let string_columns: Vec<Option<std::sync::Arc<StringSearchColumn>>> = (0..(left.columns.len() + right.columns.len())).map(|_| None).collect();
         let mut column_names = left.column_names.clone();
         column_names.extend(right.column_names.clone());
         let mut col_map = HashMap::new();
@@ -1764,8 +1792,8 @@ impl<'a> TpchExec<'a> {
         let mut out_cols: Vec<Vec<u64>> = (0..ncol).map(|_| Vec::new()).collect();
         let mut out_types = left.col_types.clone();
         out_types.extend(right.col_types.iter().copied());
-        let mut out_strings = left.string_columns.clone();
-        out_strings.extend(right.string_columns.iter().cloned());
+        // String columns are NOT rebuilt after join — see hash_join_with_keys.
+        let out_strings: Vec<Option<std::sync::Arc<StringSearchColumn>>> = (0..ncol).map(|_| None).collect();
         let mut out_names = left.column_names.clone();
         out_names.extend(right.column_names.clone());
         let mut row_count = 0;
@@ -2237,8 +2265,18 @@ impl<'a> TpchExec<'a> {
                         ColType::Float => Value2::Float(f64::from_bits(cell)),
                         ColType::Date => Value2::Date(cell as u32 as i32),
                         ColType::String => {
+                            // Use the StringSearchColumn only if it has enough
+                            // entries for this row. After a join, string_columns
+                            // are not rebuilt (they still have the pre-join row
+                            // count), so sc.get(row) would return "" for rows
+                            // beyond the original count. Fall back to the u64
+                            // hash value (which is what filters and joins use).
                             if let Some(ref sc) = t.string_columns[idx] {
-                                Value2::Str(sc.get(row).to_string())
+                                if sc.len() > row {
+                                    Value2::Str(sc.get(row).to_string())
+                                } else {
+                                    Value2::Int(cell as i64)
+                                }
                             } else {
                                 Value2::Int(cell as i64)
                             }
@@ -2256,7 +2294,11 @@ impl<'a> TpchExec<'a> {
                             ColType::Date => Value2::Date(cell as u32 as i32),
                             ColType::String => {
                                 if let Some(ref sc) = t.string_columns[idx] {
-                                    Value2::Str(sc.get(row).to_string())
+                                    if sc.len() > row {
+                                        Value2::Str(sc.get(row).to_string())
+                                    } else {
+                                        Value2::Int(cell as i64)
+                                    }
                                 } else {
                                     Value2::Int(cell as i64)
                                 }
@@ -2278,7 +2320,11 @@ impl<'a> TpchExec<'a> {
                             ColType::Date => Value2::Date(cell as u32 as i32),
                             ColType::String => {
                                 if let Some(ref sc) = outer_t.string_columns[idx] {
-                                    Value2::Str(sc.get(outer_row).to_string())
+                                    if sc.len() > outer_row {
+                                        Value2::Str(sc.get(outer_row).to_string())
+                                    } else {
+                                        Value2::Int(cell as i64)
+                                    }
                                 } else {
                                     Value2::Int(cell as i64)
                                 }
@@ -2296,7 +2342,11 @@ impl<'a> TpchExec<'a> {
                                 ColType::Date => Value2::Date(cell as u32 as i32),
                                 ColType::String => {
                                     if let Some(ref sc) = outer_t.string_columns[idx] {
-                                        Value2::Str(sc.get(outer_row).to_string())
+                                        if sc.len() > outer_row {
+                                            Value2::Str(sc.get(outer_row).to_string())
+                                        } else {
+                                            Value2::Int(cell as i64)
+                                        }
                                     } else {
                                         Value2::Int(cell as i64)
                                     }
