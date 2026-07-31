@@ -20,6 +20,19 @@ use rayon::prelude::*;
 type HashMap<K, V> = ahash::AHashMap<K, V>;
 type HashSet<T> = ahash::AHashSet<T>;
 
+/// Create a HashMap without calling OS entropy (avoids getrandom syscall).
+/// Uses a fixed seed — sufficient for database internals where hash-flooding
+/// is not a concern (all inputs are trusted TPC-H data).
+/// Perf showed 2% of Q21 time was in ahash seed generation (gen_hasher_seed).
+fn new_hashmap<K, V>() -> HashMap<K, V> {
+    HashMap::with_hasher(ahash::RandomState::with_seed(0x517cc1b727220a95))
+}
+
+/// Create a HashSet without calling OS entropy.
+fn new_hashset<T>() -> HashSet<T> {
+    HashSet::with_hasher(ahash::RandomState::with_seed(0x517cc1b727220a95))
+}
+
 // =========================================================================
 // Column type tracking
 // =========================================================================
@@ -616,7 +629,7 @@ struct ExecTable {
 impl ExecTable {
     fn from_catalog(table: &Table, alias: &str) -> Self {
         let col_types = tpch_col_types(&table.name);
-        let mut col_map = HashMap::new();
+        let mut col_map = new_hashmap();
         for (i, name) in table.column_names.iter().enumerate() {
             let lower = name.to_lowercase();
             col_map.entry(name.to_lowercase()).or_insert(i);
@@ -694,11 +707,11 @@ pub fn execute_tpch(query: &SelectQuery2, catalog: &Catalog) -> Result<QueryResu
     TpchExec {
         catalog,
         outer: std::cell::Cell::new(None),
-        subquery_cache: std::cell::RefCell::new(HashMap::new()),
-        exists_cache: std::cell::RefCell::new(HashMap::new()),
-        exists_multi_cache: std::cell::RefCell::new(HashMap::new()),
-        in_subquery_cache: std::cell::RefCell::new(HashMap::new()),
-        decorrelated_cache: std::cell::RefCell::new(HashMap::new()),
+        subquery_cache: std::cell::RefCell::new(new_hashmap()),
+        exists_cache: std::cell::RefCell::new(new_hashmap()),
+        exists_multi_cache: std::cell::RefCell::new(new_hashmap()),
+        in_subquery_cache: std::cell::RefCell::new(new_hashmap()),
+        decorrelated_cache: std::cell::RefCell::new(new_hashmap()),
     }.execute(query)
 }
 
@@ -926,7 +939,7 @@ impl<'a> TpchExec<'a> {
     fn find_correlation_cols(&self, subquery: &SelectQuery2, outer_t: &ExecTable) -> Vec<usize> {
         // Build set of column names available in the subquery's own FROM tables.
         // A Col ref that resolves to one of these is NOT a correlation column.
-        let mut inner_cols: HashSet<String> = HashSet::new();
+        let mut inner_cols: HashSet<String> = new_hashset();
         for item in &subquery.from {
             if let FromItem::Table(t) = item {
                 if let Some(table) = self.catalog.get(&t.name) {
@@ -937,7 +950,7 @@ impl<'a> TpchExec<'a> {
             }
         }
         let mut cols: Vec<usize> = Vec::new();
-        let mut seen: HashSet<usize> = HashSet::new();
+        let mut seen: HashSet<usize> = new_hashset();
         if let Some(ref wc) = subquery.where_clause {
             self.collect_corr_cols_filtered(wc, outer_t, &inner_cols, &mut cols, &mut seen);
         }
@@ -1103,8 +1116,8 @@ impl<'a> TpchExec<'a> {
         if subquery.from.len() != 1 { return Ok(None); }
 
         // Build inner column name set and inner table aliases.
-        let mut inner_cols: HashSet<String> = HashSet::new();
-        let mut inner_aliases: HashSet<String> = HashSet::new();
+        let mut inner_cols: HashSet<String> = new_hashset();
+        let mut inner_aliases: HashSet<String> = new_hashset();
         for item in &subquery.from {
             if let FromItem::Table(t) = item {
                 inner_aliases.insert(t.name.to_lowercase());
@@ -1218,7 +1231,7 @@ impl<'a> TpchExec<'a> {
         let agg_expr = &subquery.select[0].expr;
         let inner_corr_indices: Vec<usize> = corr_to_inner.iter().map(|(_, ii, _, _)| *ii).collect();
         // Group rows by composite hash of inner corr cols.
-        let mut groups: HashMap<u64, Vec<usize>> = HashMap::new();
+        let mut groups: HashMap<u64, Vec<usize>> = new_hashmap();
         for i in 0..base.row_count {
             if !mask[i] { continue; }
             let mut h: u64 = 0;
@@ -1230,7 +1243,8 @@ impl<'a> TpchExec<'a> {
         }
 
         // For each group, compute the aggregate value.
-        let mut result_map: HashMap<u64, Value2> = HashMap::with_capacity(groups.len());
+        let mut result_map: HashMap<u64, Value2> = new_hashmap();
+        result_map.reserve(groups.len());
         for (hash, indices) in &groups {
             let v = self.eval_agg_expr(agg_expr, &base, indices)?;
             result_map.insert(*hash, v);
@@ -1244,7 +1258,7 @@ impl<'a> TpchExec<'a> {
 
     fn find_exists_equi_join(&self, subquery: &SelectQuery2, outer_t: &ExecTable) -> Option<(usize, usize)> {
         // Build inner column name set (subquery's own FROM tables)
-        let mut inner_cols: HashSet<String> = HashSet::new();
+        let mut inner_cols: HashSet<String> = new_hashset();
         for item in &subquery.from {
             if let FromItem::Table(t) = item {
                 if let Some(table) = self.catalog.get(&t.name) {
@@ -1256,7 +1270,7 @@ impl<'a> TpchExec<'a> {
         }
         // Find correlation columns (in outer_t but not in inner tables)
         let mut corr_names: Vec<String> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
+        let mut seen: HashSet<String> = new_hashset();
         if let Some(ref wc) = subquery.where_clause {
             self.collect_corr_names(wc, outer_t, &inner_cols, &mut corr_names, &mut seen);
         }
@@ -1487,7 +1501,7 @@ impl<'a> TpchExec<'a> {
         let local_sets: Vec<HashSet<u64>> = (0..num_chunks).into_par_iter().map(|chunk_idx| {
             let start = chunk_idx * CHUNK_SIZE;
             let end = std::cmp::min(start + CHUNK_SIZE, n);
-            let mut local = HashSet::with_capacity(end - start);
+            let mut local = new_hashset();
             for i in start..end {
                 if mask[i] {
                     local.insert(col[i]);
@@ -1496,7 +1510,7 @@ impl<'a> TpchExec<'a> {
             local
         }).collect();
         // Merge local sets into final set
-        let mut set = HashSet::with_capacity(base.row_count);
+        let mut set = new_hashset();
         for local in local_sets {
             set.extend(local);
         }
@@ -1578,8 +1592,8 @@ impl<'a> TpchExec<'a> {
     /// outer_neq=l1.l_suppkey, inner_neq=l2.l_suppkey.
     fn find_exists_multi_col(&self, subquery: &SelectQuery2, outer_t: &ExecTable) -> Option<(usize, usize, usize, usize)> {
         // Build inner column name set and inner table aliases
-        let mut inner_cols: HashSet<String> = HashSet::new();
-        let mut inner_aliases: HashSet<String> = HashSet::new();
+        let mut inner_cols: HashSet<String> = new_hashset();
+        let mut inner_aliases: HashSet<String> = new_hashset();
         for item in &subquery.from {
             if let FromItem::Table(t) = item {
                 inner_aliases.insert(t.name.to_lowercase());
@@ -1595,7 +1609,7 @@ impl<'a> TpchExec<'a> {
         }
         // Find correlation columns
         let mut corr_names: Vec<String> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
+        let mut seen: HashSet<String> = new_hashset();
         if let Some(ref wc) = subquery.where_clause {
             self.collect_corr_names_qualified(wc, outer_t, &inner_cols, &inner_aliases, &mut corr_names, &mut seen);
         }
@@ -1692,7 +1706,7 @@ impl<'a> TpchExec<'a> {
         let local_maps: Vec<HashMap<u64, HashSet<u64>>> = (0..num_chunks).into_par_iter().map(|chunk_idx| {
             let start = chunk_idx * CHUNK_SIZE;
             let end = std::cmp::min(start + CHUNK_SIZE, n);
-            let mut local: HashMap<u64, HashSet<u64>> = HashMap::new();
+            let mut local: HashMap<u64, HashSet<u64>> = new_hashmap();
             for i in start..end {
                 if mask[i] {
                     local.entry(eq_col[i]).or_default().insert(neq_col[i]);
@@ -1701,7 +1715,7 @@ impl<'a> TpchExec<'a> {
             local
         }).collect();
         // Merge local maps into final map
-        let mut map: HashMap<u64, HashSet<u64>> = HashMap::new();
+        let mut map: HashMap<u64, HashSet<u64>> = new_hashmap();
         for local in local_maps {
             for (k, v) in local {
                 map.entry(k).or_default().extend(v);
@@ -2006,7 +2020,7 @@ impl<'a> TpchExec<'a> {
         }
         let row_count = out_cols.first().map(|c| c.len()).unwrap_or(0);
 
-        let mut col_map = HashMap::new();
+        let mut col_map = new_hashmap();
         for (i, name) in out_names.iter().enumerate() {
             col_map.entry(name.to_lowercase()).or_insert(i);
         }
@@ -2076,7 +2090,7 @@ impl<'a> TpchExec<'a> {
 
     /// Find which tables an expression references.
     fn expr_table_refs(&self, expr: &Expr2, tables: &[ExecTable]) -> HashSet<usize> {
-        let mut refs = HashSet::new();
+        let mut refs = new_hashset();
         self.collect_table_refs(expr, tables, &mut refs);
         refs
     }
@@ -2259,7 +2273,7 @@ impl<'a> TpchExec<'a> {
     }
 
     fn result_to_exec_table(&self, result: &QueryResult, alias: &str) -> Result<ExecTable, Error> {
-        let mut col_map = HashMap::new();
+        let mut col_map = new_hashmap();
         let mut column_names = Vec::new();
         let mut columns = Vec::new();
         let mut col_types = Vec::new();
@@ -2328,7 +2342,7 @@ impl<'a> TpchExec<'a> {
                 col_types: left.col_types.iter().chain(right.col_types.iter()).copied().collect(),
                 string_columns: left.string_columns.iter().chain(right.string_columns.iter()).cloned().collect(),
                 row_count: 0,
-                col_map: HashMap::new(),
+                col_map: new_hashmap(),
             };
         }
         let total = lr * rr;
@@ -2349,7 +2363,7 @@ impl<'a> TpchExec<'a> {
         let string_columns: Vec<Option<std::sync::Arc<StringSearchColumn>>> = (0..(left.columns.len() + right.columns.len())).map(|_| None).collect();
         let mut column_names = left.column_names.clone();
         column_names.extend(right.column_names.clone());
-        let mut col_map = HashMap::new();
+        let mut col_map = new_hashmap();
         for (i, name) in column_names.iter().enumerate() {
             col_map.entry(name.to_lowercase()).or_insert(i);
         }
@@ -2375,7 +2389,7 @@ impl<'a> TpchExec<'a> {
                 if matches!(left.as_ref(), Expr2::Col(_)) && matches!(right.as_ref(), Expr2::Col(_)))
         }).cloned().collect();
 
-        let mut build: HashMap<Vec<u64>, Vec<usize>> = HashMap::new();
+        let mut build: HashMap<Vec<u64>, Vec<usize>> = new_hashmap();
         for r in 0..right.row_count {
             let key: Vec<u64> = keys.iter().map(|k| right.columns[k.right][r]).collect();
             build.entry(key).or_default().push(r);
@@ -2395,7 +2409,7 @@ impl<'a> TpchExec<'a> {
 
         // Pre-build the combined col_map once (reused per match).
         let combined_col_map: HashMap<String, usize> = {
-            let mut m = HashMap::new();
+            let mut m = new_hashmap();
             for (i, name) in out_names.iter().enumerate() {
                 m.entry(name.to_lowercase()).or_insert(i);
             }
@@ -2440,7 +2454,7 @@ impl<'a> TpchExec<'a> {
             }
         }
 
-        let mut col_map = HashMap::new();
+        let mut col_map = new_hashmap();
         for (i, name) in out_names.iter().enumerate() { col_map.entry(name.to_lowercase()).or_insert(i); }
         for (k, v) in &left.col_map { col_map.insert(k.clone(), *v); }
         let off = left.columns.len();
@@ -3281,7 +3295,7 @@ impl<'a> TpchExec<'a> {
                         Err(_) => {
                             // Correlated — mark as empty set so we don't retry.
                             // Per-row eval with outer context will handle it.
-                            self.in_subquery_cache.borrow_mut().insert(ast_key, HashSet::new());
+                            self.in_subquery_cache.borrow_mut().insert(ast_key, new_hashset());
                         }
                     }
                 }
@@ -3580,7 +3594,8 @@ impl<'a> TpchExec<'a> {
             let end = std::cmp::min(start + CHUNK_SIZE, n);
 
             let mut local_keys: Vec<u64> = Vec::with_capacity(16);
-            let mut local_slot: HashMap<u64, usize> = HashMap::with_capacity(16);
+            let mut local_slot: HashMap<u64, usize> = new_hashmap();
+
             let mut local_sums: Vec<f64> = Vec::new();
             let mut local_counts: Vec<u64> = Vec::new();
 
@@ -3641,7 +3656,8 @@ impl<'a> TpchExec<'a> {
         let partials: Vec<(Vec<u64>, Vec<f64>, Vec<u64>)> = partials.into_iter().map(|p| p.unwrap()).collect();
 
         // Merge: build global group->slot map from all chunk-local keys
-        let mut key_to_slot: HashMap<u64, usize> = HashMap::with_capacity(64);
+        let mut key_to_slot: HashMap<u64, usize> = new_hashmap();
+
         let mut group_keys_discovered: Vec<u64> = Vec::new();
         for (keys, _, _) in &partials {
             for &k in keys {
@@ -3794,7 +3810,8 @@ impl<'a> TpchExec<'a> {
         let local_maps: Vec<HashMap<u64, Vec<usize>>> = (0..num_chunks).into_par_iter().map(|chunk_idx| {
             let start = chunk_idx * GROUP_CHUNK_SIZE;
             let end = std::cmp::min(start + GROUP_CHUNK_SIZE, n_indices);
-            let mut local: HashMap<u64, Vec<usize>> = HashMap::with_capacity(1024);
+            let mut local: HashMap<u64, Vec<usize>> = new_hashmap();
+
             for i in start..end {
                 let idx = indices[i];
                 let mut key_hash: u64 = 0;
@@ -3813,7 +3830,8 @@ impl<'a> TpchExec<'a> {
         }).collect();
 
         // Merge local maps into global group_indices
-        let mut group_map: HashMap<u64, usize> = HashMap::with_capacity(1024);
+        let mut group_map: HashMap<u64, usize> = new_hashmap();
+
         let mut group_indices: Vec<Vec<usize>> = Vec::with_capacity(1024);
         for local in local_maps {
             for (hash, rows) in local {
@@ -4055,7 +4073,7 @@ impl<'a> TpchExec<'a> {
                     // Distinct requires materializing values — use slow path
                     let mut values: Vec<Value2> = Vec::with_capacity(indices.len());
                     for &idx in indices { values.push(self.eval(arg, t, idx)?); }
-                    let mut seen = HashSet::new();
+                    let mut seen = new_hashset();
                     values.retain(|v| {
                         let key = match v {
                             Value2::Int(i) => format!("i{}", i),
@@ -4095,12 +4113,12 @@ impl<'a> TpchExec<'a> {
                         if let Expr2::Col(name) = arg.as_ref() {
                             if let Some(idx) = t.lookup_col(name) {
                                 let col = &t.columns[idx];
-                                let mut seen = HashSet::new();
+                                let mut seen = new_hashset();
                                 for &i in indices { seen.insert(col[i]); }
                                 return Ok(Value2::Int(seen.len() as i64));
                             }
                         }
-                        let mut seen = HashSet::new();
+                        let mut seen = new_hashset();
                         for &i in indices { let v = self.eval(arg, t, i)?; seen.insert(format!("{:?}", v)); }
                         return Ok(Value2::Int(seen.len() as i64));
                     }
@@ -4780,7 +4798,7 @@ mod tests {
 
     #[test]
     fn test_like_match() {
-        let cat = Catalog::new(); let exec = TpchExec { catalog: &cat, outer: std::cell::Cell::new(None), subquery_cache: std::cell::RefCell::new(HashMap::new()), exists_cache: std::cell::RefCell::new(HashMap::new()), exists_multi_cache: std::cell::RefCell::new(HashMap::new()), in_subquery_cache: std::cell::RefCell::new(HashMap::new()), decorrelated_cache: std::cell::RefCell::new(HashMap::new()) };
+        let cat = Catalog::new(); let exec = TpchExec { catalog: &cat, outer: std::cell::Cell::new(None), subquery_cache: std::cell::RefCell::new(new_hashmap()), exists_cache: std::cell::RefCell::new(new_hashmap()), exists_multi_cache: std::cell::RefCell::new(new_hashmap()), in_subquery_cache: std::cell::RefCell::new(new_hashmap()), decorrelated_cache: std::cell::RefCell::new(new_hashmap()) };
         assert!(exec.like("hello world", "%hello%"));
         assert!(exec.like("hello", "hello"));
         assert!(exec.like("hello world", "hello%"));
