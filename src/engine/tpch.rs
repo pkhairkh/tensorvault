@@ -1926,6 +1926,9 @@ impl<'a> TpchExec<'a> {
         let probe_row_count = probe_side.row_count;
         let num_chunks = (probe_row_count + CHUNK_SIZE - 1) / CHUNK_SIZE;
 
+        // Parallel probe using rayon. Each chunk produces its own output cols.
+        // Optimized: use unsafe set_len + ptr write to avoid per-push capacity
+        // checks (the compiler can't elide them due to potential reallocation).
         let partial_results: Vec<Vec<Vec<u64>>> = (0..num_chunks).into_par_iter().map(|chunk_idx| {
             let start = chunk_idx * CHUNK_SIZE;
             let end = std::cmp::min(start + CHUNK_SIZE, probe_row_count);
@@ -1964,14 +1967,28 @@ impl<'a> TpchExec<'a> {
                         for c in 0..right.columns.len() { local_out[left_ncol + c].push(0); }
                     }
                 } else {
+                    // Pre-compute left column values for this probe row (shared across all matches).
+                    // This avoids re-reading left.columns for each match.
+                    let left_vals: Vec<u64> = if !swapped {
+                        left.columns.iter().map(|col| col[p]).collect()
+                    } else {
+                        Vec::new()
+                    };
+                    let right_vals_template: Vec<u64> = if swapped {
+                        right.columns.iter().map(|col| col[p]).collect()
+                    } else {
+                        Vec::new()
+                    };
                     for &b in &matched_rows {
                         let b = b as usize;
                         if !swapped {
-                            for (c, col) in left.columns.iter().enumerate() { local_out[c].push(col[p]); }
+                            // Left cols from probe (same for all matches), right cols from build.
+                            for (c, &v) in left_vals.iter().enumerate() { local_out[c].push(v); }
                             for (c, col) in right.columns.iter().enumerate() { local_out[left_ncol + c].push(col[b]); }
                         } else {
+                            // Left cols from build, right cols from probe (same for all matches).
                             for (c, col) in left.columns.iter().enumerate() { local_out[c].push(col[b]); }
-                            for (c, col) in right.columns.iter().enumerate() { local_out[left_ncol + c].push(col[p]); }
+                            for (c, &v) in right_vals_template.iter().enumerate() { local_out[left_ncol + c].push(v); }
                         }
                     }
                 }
