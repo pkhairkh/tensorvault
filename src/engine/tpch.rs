@@ -13,6 +13,7 @@ use crate::exec::fm_index::StringSearchColumn;
 use crate::sql::lexer::{tokenize, Token};
 use crate::Error;
 use std::collections::{HashMap, HashSet};
+use rayon::prelude::*;
 
 // =========================================================================
 // Column type tracking
@@ -2108,50 +2109,158 @@ impl<'a> TpchExec<'a> {
         let num_aggs = agg_indices.len();
         if num_aggs == 0 { return Ok(None); }
 
-        let mut acc = FixedAccumulator::new(num_aggs);
         let n = t.row_count;
 
-        for i in 0..n {
-            if !mask[i] { continue; }
-            let mut key_hash: u64 = 0;
-            for &ci in &gb_cols {
-                key_hash = key_hash.wrapping_mul(0x517cc1b727220a95).wrapping_add(t.columns[ci][i]);
+        // Collect aggregate column references
+        let agg_specs: Vec<(usize, Option<usize>, Option<usize>, u8)> = agg_indices.iter().map(|&item_idx| {
+            match plans[item_idx].as_ref().unwrap() {
+                LcAgg::SumCol(a) => (*a, None, None, 0),
+                LcAgg::SumColCol(a, b) => (*a, Some(*b), None, 1),
+                LcAgg::SumColSubOne(a, b) => (*a, Some(*b), None, 2),
+                LcAgg::SumColSubOneAddOne(a, b, c) => (*a, Some(*b), Some(*c), 3),
+                LcAgg::AvgCol(a) => (*a, None, None, 4),
+                LcAgg::MinCol(a) => (*a, None, None, 5),
+                LcAgg::MaxCol(a) => (*a, None, None, 6),
+                _ => (0, None, None, 0),
             }
-            let slot = acc.get_or_create_slot(key_hash);
-            if acc.num_active > MAX_FIXED_GROUPS - 4 {
-                return Ok(None);
+        }).collect();
+        let num_aggs_actual = num_aggs;
+
+        // Parallel single-pass morsel aggregation.
+        // Each thread processes a chunk, maintaining its own local group->slot map
+        // and per-group accumulators. At the end, merge all thread-local maps.
+        // For Q1 (4 groups, 8 threads): merge is 32 entries — trivial.
+        const CHUNK_SIZE: usize = 65536;
+        let num_chunks = (n + CHUNK_SIZE - 1) / CHUNK_SIZE;
+
+        // Each chunk produces: (group_keys: Vec<u64>, sums: Vec<f64>, counts: Vec<u64>)
+        // where sums is laid out as [agg0_grp0, agg0_grp1, ..., agg1_grp0, ...]
+        let partials: Vec<Option<(Vec<u64>, Vec<f64>, Vec<u64>)>> = (0..num_chunks).into_par_iter().map(|chunk_idx| {
+            let start = chunk_idx * CHUNK_SIZE;
+            let end = std::cmp::min(start + CHUNK_SIZE, n);
+
+            let mut local_keys: Vec<u64> = Vec::with_capacity(16);
+            let mut local_slot: HashMap<u64, usize> = HashMap::with_capacity(16);
+            let mut local_sums: Vec<f64> = Vec::new();
+            let mut local_counts: Vec<u64> = Vec::new();
+
+            for i in start..end {
+                if !mask[i] { continue; }
+
+                let mut key_hash: u64 = 0;
+                for &ci in &gb_cols {
+                    key_hash = key_hash.wrapping_mul(0x517cc1b727220a95).wrapping_add(t.columns[ci][i]);
+                }
+
+                let slot = if let Some(&s) = local_slot.get(&key_hash) {
+                    s
+                } else {
+                    let new_slot = local_keys.len();
+                    if new_slot >= MAX_FIXED_GROUPS - 1 { return None; }
+                    local_keys.push(key_hash);
+                    local_slot.insert(key_hash, new_slot);
+                    local_sums.extend(std::iter::repeat(0.0f64).take(num_aggs_actual));
+                    local_counts.push(0);
+                    new_slot
+                };
+
+                local_counts[slot] += 1;
+
+                for (ai, &(col_a, col_b_o, col_c_o, at)) in agg_specs.iter().enumerate() {
+                    let base = ai * local_keys.len();
+                    let va = t.columns[col_a][i];
+                    match at {
+                        0 => { local_sums[base + slot] += f64::from_bits(va); }
+                        1 => {
+                            if let Some(cb) = col_b_o {
+                                local_sums[base + slot] += f64::from_bits(va) * f64::from_bits(t.columns[cb][i]);
+                            }
+                        }
+                        2 => {
+                            if let Some(cb) = col_b_o {
+                                local_sums[base + slot] += f64::from_bits(va) * (1.0 - f64::from_bits(t.columns[cb][i]));
+                            }
+                        }
+                        3 => {
+                            if let (Some(cb), Some(cc)) = (col_b_o, col_c_o) {
+                                local_sums[base + slot] += f64::from_bits(va) * (1.0 - f64::from_bits(t.columns[cb][i])) * (1.0 + f64::from_bits(t.columns[cc][i]));
+                            }
+                        }
+                        4 => { local_sums[base + slot] += f64::from_bits(va); }
+                        _ => {}
+                    }
+                }
             }
-            acc.inc_count(slot);
-            for (agg_idx, &item_idx) in agg_indices.iter().enumerate() {
-                match plans[item_idx].as_ref().unwrap() {
-                    LcAgg::SumCol(a) => {
-                        acc.add_sum(agg_idx, slot, f64::from_bits(t.columns[*a][i]));
-                    }
-                    LcAgg::SumColCol(a, b) => {
-                        acc.add_sum(agg_idx, slot, f64::from_bits(t.columns[*a][i]) * f64::from_bits(t.columns[*b][i]));
-                    }
-                    LcAgg::SumColSubOne(a, b) => {
-                        acc.add_sum(agg_idx, slot, f64::from_bits(t.columns[*a][i]) * (1.0 - f64::from_bits(t.columns[*b][i])));
-                    }
-                    LcAgg::SumColSubOneAddOne(a, b, c) => {
-                        acc.add_sum(agg_idx, slot,
-                            f64::from_bits(t.columns[*a][i]) * (1.0 - f64::from_bits(t.columns[*b][i])) * (1.0 + f64::from_bits(t.columns[*c][i])));
-                    }
-                    LcAgg::AvgCol(a) => {
-                        acc.add_sum(agg_idx, slot, f64::from_bits(t.columns[*a][i]));
-                    }
-                    LcAgg::MinCol(a) => {
-                        acc.update_min(agg_idx, slot, f64::from_bits(t.columns[*a][i]));
-                    }
-                    LcAgg::MaxCol(a) => {
-                        acc.update_max(agg_idx, slot, f64::from_bits(t.columns[*a][i]));
-                    }
-                    _ => {}
+            Some((local_keys, local_sums, local_counts))
+        }).collect();
+
+        // If any chunk returned None (too many groups), fall back to HashMap path
+        if partials.iter().any(|p| p.is_none()) {
+            return Ok(None);
+        }
+        let partials: Vec<(Vec<u64>, Vec<f64>, Vec<u64>)> = partials.into_iter().map(|p| p.unwrap()).collect();
+
+        // Merge: build global group->slot map from all chunk-local keys
+        let mut key_to_slot: HashMap<u64, usize> = HashMap::with_capacity(64);
+        let mut group_keys_discovered: Vec<u64> = Vec::new();
+        for (keys, _, _) in &partials {
+            for &k in keys {
+                if !key_to_slot.contains_key(&k) {
+                    let slot = group_keys_discovered.len();
+                    if slot >= MAX_FIXED_GROUPS - 1 { return Ok(None); }
+                    key_to_slot.insert(k, slot);
+                    group_keys_discovered.push(k);
+                }
+            }
+        }
+        let num_groups_found = group_keys_discovered.len();
+        if num_groups_found == 0 {
+            let mut cols: Vec<ResultColumn> = Vec::with_capacity(query.select.len());
+            for item in &query.select {
+                let name = item.alias.clone().unwrap_or_else(|| self.expr_name(&item.expr));
+                cols.push(ResultColumn { name, values: Vec::new() });
+            }
+            return Ok(Some(QueryResult { columns: cols, row_count: 0, elapsed_us: 0 }));
+        }
+
+        // Merge sums and counts into final accumulators
+        let mut final_sums = vec![0.0f64; num_groups_found * num_aggs_actual];
+        let mut final_counts = vec![0u64; num_groups_found];
+        for (keys, sums, counts) in &partials {
+            let local_ng = keys.len();
+            for (local_slot, &key) in keys.iter().enumerate() {
+                let global_slot = key_to_slot[&key];
+                final_counts[global_slot] += counts[local_slot];
+                for a in 0..num_aggs_actual {
+                    final_sums[a * num_groups_found + global_slot] += sums[a * local_ng + local_slot];
                 }
             }
         }
 
-        let finalized = acc.finalize();
+        // Min/Max (serial pass)
+        for (ai, &item_idx) in agg_indices.iter().enumerate() {
+            if matches!(plans[item_idx], Some(LcAgg::MinCol(_)) | Some(LcAgg::MaxCol(_))) {
+                let a = if let Some(LcAgg::MinCol(a)) | Some(LcAgg::MaxCol(a)) = plans[item_idx] { a } else { 0 };
+                let is_min = matches!(plans[item_idx], Some(LcAgg::MinCol(_)));
+                let mut mm = vec![if is_min { f64::INFINITY } else { f64::NEG_INFINITY }; num_groups_found];
+                for i in 0..n {
+                    if !mask[i] { continue; }
+                    let mut key_hash: u64 = 0;
+                    for &ci in &gb_cols { key_hash = key_hash.wrapping_mul(0x517cc1b727220a95).wrapping_add(t.columns[ci][i]); }
+                    if let Some(&slot) = key_to_slot.get(&key_hash) {
+                        let v = f64::from_bits(t.columns[a][i]);
+                        if is_min { if v < mm[slot] { mm[slot] = v; } } else { if v > mm[slot] { mm[slot] = v; } }
+                    }
+                }
+                for g in 0..num_groups_found { final_sums[ai * num_groups_found + g] = mm[g]; }
+            }
+        }
+
+        let finalized: Vec<(u64, Vec<f64>, u64, Vec<f64>, Vec<f64>)> = (0..num_groups_found).map(|g| {
+            let key = group_keys_discovered[g];
+            let sums: Vec<f64> = (0..num_aggs_actual).map(|a| final_sums[a * num_groups_found + g]).collect();
+            (key, sums, final_counts[g], vec![0.0; num_aggs_actual], vec![0.0; num_aggs_actual])
+        }).collect();
         let mut cols: Vec<ResultColumn> = Vec::with_capacity(query.select.len());
 
         for (item_idx, item) in query.select.iter().enumerate() {
