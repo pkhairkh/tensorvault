@@ -1873,92 +1873,90 @@ impl<'a> TpchExec<'a> {
             }
         };
 
-        // --- Probe phase ---
-        // Pre-allocate output. Estimate: probe_rows * avg_selectivity.
-        // For equi-joins, average matches per probe ≈ build_rows / unique_keys.
-        // Conservative estimate: min(probe_rows * 4, build_rows * 4).
+        // --- Probe phase (PARALLEL morsel-driven) ---
+        // Split the probe side into chunks, each thread probes independently
+        // and produces its own output columns. Merge at the end by concatenation.
+        // This is critical for Q3/Q5/Q7/Q18 where the probe side is large
+        // (6M+ rows for lineitem joins) and the build side is small.
+        // Each thread gets its own output buffers to avoid contention.
         let est_output = std::cmp::max(probe_side.row_count, build_side.row_count).min(4_000_000);
-        let mut out_cols: Vec<Vec<u64>> = (0..ncol).map(|_| Vec::with_capacity(est_output)).collect();
         let mut out_types = left.col_types.clone();
         out_types.extend(right.col_types.iter().copied());
-        // String columns are NOT rebuilt after join — the original StringSearchColumn
-        // has the pre-join row count and doesn't correspond to joined rows.
-        // Set to None so eval falls back to u64 hash values (which are correct
-        // for filtering, joining, and grouping). LIKE on joined tables falls back
-        // to hash comparison (exact match only, no wildcards).
         let out_strings: Vec<Option<std::sync::Arc<StringSearchColumn>>> = (0..ncol).map(|_| None).collect();
         let mut out_names = left.column_names.clone();
         out_names.extend(right.column_names.clone());
-        let mut row_count = 0usize;
 
         let left_ncol = left.columns.len();
-
-        // Helper: emit one output row from (probe_row, build_row)
-        // If swapped: probe_side=right, build_side=left → left cols come from build, right cols from probe
-        // If not swapped: probe_side=left, build_side=right → left cols from probe, right cols from build
         let pk_cols: Vec<usize> = probe_keys.iter().map(|k| k.left).collect();
 
-        for p in 0..probe_side.row_count {
-            // Compute probe key
-            let probe_key = if keys.len() == 1 {
-                probe_side.columns[pk_cols[0]][p]
-            } else {
-                let mut buf = [0u8; 64];
-                let mut off = 0;
-                for &kc in &pk_cols {
-                    let v = probe_side.columns[kc][p];
-                    let bytes = v.to_le_bytes();
-                    if off + 8 <= 64 {
-                        buf[off..off + 8].copy_from_slice(&bytes);
-                        off += 8;
-                    }
-                }
-                xxh3_64(&buf[..off])
-            };
+        // Parallel probe using rayon. Each chunk produces its own output cols.
+        // The build_hash and bloom are shared (read-only) across threads.
+        const CHUNK_SIZE: usize = 65536;
+        let probe_row_count = probe_side.row_count;
+        let num_chunks = (probe_row_count + CHUNK_SIZE - 1) / CHUNK_SIZE;
 
-            // W29 Wilson-loop bloom filter: check the L1-resident bloom filter
-            // BEFORE probing the L2-resident hash-table directory. For
-            // selective joins this skips ~90% of probe lookups.
-            // Frobenius μ: the bloom filter has ~1% false-positive rate,
-            // so ~1% of definitely-absent keys fall through to the hash
-            // table probe (which then returns no match) — never causes
-            // incorrect results, just a small wasted probe.
-            if !bloom.might_contain(probe_key) {
-                // Key definitely absent — skip hash-table probe.
-                // For LEFT join (probe is left side), emit unmatched left row.
-                if jt == JoinType2::Left && !swapped {
-                    for (c, col) in left.columns.iter().enumerate() { out_cols[c].push(col[p]); }
-                    for c in 0..right.columns.len() { out_cols[left_ncol + c].push(0); }
-                    row_count += 1;
-                }
-                continue;
-            }
-            let mut matched_rows: Vec<u32> = Vec::new();
-            build_hash.probe_all(probe_key, &mut matched_rows);
-            if matched_rows.is_empty() {
-                // Bloom filter false-positive — key was not in hash table.
-                // For LEFT join (probe is left side), emit unmatched left row.
-                if jt == JoinType2::Left && !swapped {
-                    for (c, col) in left.columns.iter().enumerate() { out_cols[c].push(col[p]); }
-                    for c in 0..right.columns.len() { out_cols[left_ncol + c].push(0); }
-                    row_count += 1;
-                }
-            } else {
-                for b in matched_rows {
-                    let b = b as usize;
-                    if !swapped {
-                        // probe=left, build=right: left cols from probe, right cols from build
-                        for (c, col) in left.columns.iter().enumerate() { out_cols[c].push(col[p]); }
-                        for (c, col) in right.columns.iter().enumerate() { out_cols[left_ncol + c].push(col[b]); }
-                    } else {
-                        // probe=right, build=left: left cols from build, right cols from probe
-                        for (c, col) in left.columns.iter().enumerate() { out_cols[c].push(col[b]); }
-                        for (c, col) in right.columns.iter().enumerate() { out_cols[left_ncol + c].push(col[p]); }
+        let partial_results: Vec<Vec<Vec<u64>>> = (0..num_chunks).into_par_iter().map(|chunk_idx| {
+            let start = chunk_idx * CHUNK_SIZE;
+            let end = std::cmp::min(start + CHUNK_SIZE, probe_row_count);
+
+            let mut local_out: Vec<Vec<u64>> = (0..ncol).map(|_| Vec::with_capacity(CHUNK_SIZE * 2)).collect();
+
+            for p in start..end {
+                let probe_key = if keys.len() == 1 {
+                    probe_side.columns[pk_cols[0]][p]
+                } else {
+                    let mut buf = [0u8; 64];
+                    let mut off = 0;
+                    for &kc in &pk_cols {
+                        let v = probe_side.columns[kc][p];
+                        let bytes = v.to_le_bytes();
+                        if off + 8 <= 64 {
+                            buf[off..off + 8].copy_from_slice(&bytes);
+                            off += 8;
+                        }
                     }
-                    row_count += 1;
+                    xxh3_64(&buf[..off])
+                };
+
+                if !bloom.might_contain(probe_key) {
+                    if jt == JoinType2::Left && !swapped {
+                        for (c, col) in left.columns.iter().enumerate() { local_out[c].push(col[p]); }
+                        for c in 0..right.columns.len() { local_out[left_ncol + c].push(0); }
+                    }
+                    continue;
                 }
+                let mut matched_rows: Vec<u32> = Vec::new();
+                build_hash.probe_all(probe_key, &mut matched_rows);
+                if matched_rows.is_empty() {
+                    if jt == JoinType2::Left && !swapped {
+                        for (c, col) in left.columns.iter().enumerate() { local_out[c].push(col[p]); }
+                        for c in 0..right.columns.len() { local_out[left_ncol + c].push(0); }
+                    }
+                } else {
+                    for b in matched_rows {
+                        let b = b as usize;
+                        if !swapped {
+                            for (c, col) in left.columns.iter().enumerate() { local_out[c].push(col[p]); }
+                            for (c, col) in right.columns.iter().enumerate() { local_out[left_ncol + c].push(col[b]); }
+                        } else {
+                            for (c, col) in left.columns.iter().enumerate() { local_out[c].push(col[b]); }
+                            for (c, col) in right.columns.iter().enumerate() { local_out[left_ncol + c].push(col[p]); }
+                        }
+                    }
+                }
+            }
+            local_out
+        }).collect();
+
+        // Merge partial results: concatenate all chunk-local output columns.
+        let mut out_cols: Vec<Vec<u64>> = vec![Vec::new(); ncol];
+        for local_out in partial_results {
+            for c in 0..ncol {
+                out_cols[c].extend_from_slice(&local_out[c]);
             }
         }
+        // row_count is the max column length (all should be equal)
+        let row_count = out_cols.first().map(|c| c.len()).unwrap_or(0);
 
         let mut col_map = HashMap::new();
         for (i, name) in out_names.iter().enumerate() {
