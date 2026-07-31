@@ -745,6 +745,23 @@ impl<'a> TpchExec<'a> {
         Ok(result)
     }
 
+    /// Estimate the number of distinct values in a column using a sampling
+    /// approach: hash the first min(n, 10000) values into 256 buckets and
+    /// count non-empty buckets. This is fast and good enough for join ordering.
+    fn estimate_distinct(&self, col: &[u64], n: usize) -> u64 {
+        if n == 0 { return 0; }
+        let sample_size = n.min(10000);
+        let mut buckets = [false; 256];
+        for i in 0..sample_size {
+            let h = crate::exec::join_hash_table::JoinHashTable::hash(col[i]);
+            buckets[(h % 256) as usize] = true;
+        }
+        let filled = buckets.iter().filter(|&&b| b).count() as u64;
+        // Scale up: if we filled X/256 buckets with 10000 samples, distinct ≈
+        // X/256 * 10000 (rough). Cap at n.
+        (filled * 40).min(n as u64)
+    }
+
     /// Smart join: extract equi-join predicates from WHERE, apply single-table
     /// filters first, then hash-join tables left-to-right.
     fn join_tables_smart(&self, tables: Vec<ExecTable>, where_clause: &Option<Expr2>) -> Result<ExecTable, Error> {
@@ -763,14 +780,56 @@ impl<'a> TpchExec<'a> {
             }
         }
 
-        // Join tables left-to-right using equi-join predicates
-        let mut joined = tables.remove(0);
+        // Join tables using cardinality-aware ordering.
+        // Start with the smallest filtered table (e.g., region after r_name='ASIA'
+        // has 1 row). This prevents many-to-many explosions like customer ⋈ supplier.
+        // Pick the table with the fewest rows that has at least one join key
+        // to another table.
+        let mut start_idx = 0;
+        let mut start_rows = usize::MAX;
+        for (i, t) in tables.iter().enumerate() {
+            if t.row_count < start_rows {
+                // Check if this table can join to at least one other table
+                let mut has_join = false;
+                for (j, other) in tables.iter().enumerate() {
+                    if i == j { continue; }
+                    if !self.find_join_keys(t, other, &conjuncts).is_empty() {
+                        has_join = true;
+                        break;
+                    }
+                }
+                if has_join {
+                    start_idx = i;
+                    start_rows = t.row_count;
+                }
+            }
+        }
+        let mut joined = tables.remove(start_idx);
         while !tables.is_empty() {
             let mut best_idx = 0;
             let mut best_keys: Vec<JoinKey2> = Vec::new();
+            let mut best_est_output: u64 = u64::MAX;
             for (i, table) in tables.iter().enumerate() {
                 let keys = self.find_join_keys(&joined, table, &conjuncts);
-                if !keys.is_empty() && (best_keys.is_empty() || table.row_count < tables[best_idx].row_count) {
+                if keys.is_empty() { continue; }
+                // Estimate output cardinality.
+                // For each join key pair (left_col, right_col), estimate:
+                //   output ≈ left_rows * right_rows / max(distinct_left, distinct_right)
+                // Use the max distinct across all keys (conservative).
+                let mut est_output: u64 = 1;
+                for k in &keys {
+                    let dl = self.estimate_distinct(&joined.columns[k.left][..], joined.row_count);
+                    let dr = self.estimate_distinct(&table.columns[k.right][..], table.row_count);
+                    let max_d = dl.max(dr).max(1);
+                    // Join cardinality formula (Selinger-style):
+                    // |R ⋈ S| ≈ |R| * |S| / max(V(R,k), V(S,k))
+                    est_output = est_output
+                        .saturating_mul(joined.row_count as u64)
+                        .saturating_mul(table.row_count as u64)
+                        / max_d;
+                }
+                if est_output < best_est_output {
+                    best_est_output = est_output;
                     best_idx = i;
                     best_keys = keys;
                 }
