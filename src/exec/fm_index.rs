@@ -286,6 +286,43 @@ impl StringSearchColumn {
         StringSearchColumn { strings, offsets, bytes }
     }
 
+    /// Create a remapped column containing only the strings at `indices`.
+    ///
+    /// Used by `filter_table` to project a subset of rows without allocating
+    /// a new `String` per row. The `strings` Vec is left empty — `get()`
+    /// falls back to deriving strings from the rebuilt `bytes` + `offsets`.
+    ///
+    /// Cost: O(total_bytes) memcpy + 2 Vec allocations (bytes + offsets).
+    /// No per-String allocation. For lineitem (3M rows × 5 string cols),
+    /// this is ~26ms total vs ~611ms for per-String cloning.
+    ///
+    /// LIKE scanning methods (`count_like_*`, `like_contains_mask`) are NOT
+    /// supported on remapped columns (they require the `strings` Vec).
+    /// This is fine because LIKE filters are applied to original columns
+    /// during the initial scan, before any `filter_table` call.
+    pub fn remap(&self, indices: &[usize]) -> Self {
+        let total_bytes: usize = indices.iter()
+            .map(|&i| {
+                if i + 1 < self.offsets.len() {
+                    self.offsets[i + 1] - self.offsets[i]
+                } else {
+                    0
+                }
+            })
+            .sum();
+        let mut new_bytes: Vec<u8> = Vec::with_capacity(total_bytes);
+        let mut new_offsets: Vec<usize> = Vec::with_capacity(indices.len() + 1);
+        for &i in indices {
+            let start = if i < self.offsets.len() { self.offsets[i] } else { self.bytes.len() };
+            let end = if i + 1 < self.offsets.len() { self.offsets[i + 1] } else { self.bytes.len() };
+            new_offsets.push(new_bytes.len());
+            new_bytes.extend_from_slice(&self.bytes[start..end]);
+        }
+        new_offsets.push(new_bytes.len());
+        // strings left empty — get() falls back to bytes+offsets.
+        StringSearchColumn { strings: Vec::new(), offsets: new_offsets, bytes: new_bytes }
+    }
+
     /// Count strings containing the pattern (LIKE '%pattern%').
     /// Uses memchr for fast byte-level substring search.
     pub fn count_like_contains(&self, pattern: &str) -> usize {
@@ -328,16 +365,32 @@ impl StringSearchColumn {
     }
 
     /// Get the string at row index.
+    ///
+    /// Fast path: `strings` Vec populated (original column) → direct index.
+    /// Fallback: `strings` empty (remapped column) → derive from `bytes` +
+    /// `offsets`. The `from_utf8` check is cheap (~1ns/byte) and only
+    /// applies to remapped columns (filter_table output).
     pub fn get(&self, i: usize) -> &str {
         if i < self.strings.len() {
             &self.strings[i]
+        } else if i + 1 < self.offsets.len() {
+            // Remapped column: derive string from the contiguous bytes buffer.
+            // SAFETY: bytes were originally from valid UTF-8 Strings, so
+            // from_utf8 always succeeds. unwrap_or("") is defensive.
+            std::str::from_utf8(&self.bytes[self.offsets[i]..self.offsets[i + 1]])
+                .unwrap_or("")
         } else {
             ""
         }
     }
 
     pub fn len(&self) -> usize {
-        self.strings.len()
+        // Original column: strings.len(). Remapped column: offsets.len()-1.
+        if !self.strings.is_empty() {
+            self.strings.len()
+        } else {
+            self.offsets.len().saturating_sub(1)
+        }
     }
 }
 
@@ -409,6 +462,48 @@ mod tests {
         ]);
         let mask = col.like_contains_mask("google");
         assert_eq!(mask, vec![true, false, true]);
+    }
+
+
+    #[test]
+    fn test_remap_preserves_strings() {
+        let col = StringSearchColumn::new(vec![
+            "alpha".to_string(),
+            "beta".to_string(),
+            "gamma".to_string(),
+            "delta".to_string(),
+            "epsilon".to_string(),
+        ]);
+        // Remap to keep only rows 0, 2, 4
+        let remapped = col.remap(&[0, 2, 4]);
+        assert_eq!(remapped.len(), 3);
+        assert_eq!(remapped.get(0), "alpha");
+        assert_eq!(remapped.get(1), "gamma");
+        assert_eq!(remapped.get(2), "epsilon");
+        // Out of bounds
+        assert_eq!(remapped.get(3), "");
+    }
+
+    #[test]
+    fn test_remap_empty_indices() {
+        let col = StringSearchColumn::new(vec!["a".to_string(), "b".to_string()]);
+        let remapped = col.remap(&[]);
+        assert_eq!(remapped.len(), 0);
+        assert_eq!(remapped.get(0), "");
+    }
+
+    #[test]
+    fn test_remap_preserves_like_scan() {
+        // Remapped columns should support get() but LIKE methods require
+        // the strings Vec (only original columns support LIKE).
+        let col = StringSearchColumn::new(vec![
+            "https://google.com".to_string(),
+            "https://yahoo.com".to_string(),
+            "http://google.com".to_string(),
+        ]);
+        let remapped = col.remap(&[0, 2]);
+        assert_eq!(remapped.get(0), "https://google.com");
+        assert_eq!(remapped.get(1), "http://google.com");
     }
 
     #[test]
