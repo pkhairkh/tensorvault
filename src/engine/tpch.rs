@@ -1602,7 +1602,7 @@ impl<'a> TpchExec<'a> {
             }
             (ColType::Float, Value2::Float(fval)) => {
                 let bm = match op {
-                    BinOp2::Eq => bitmap::filter_eq_f64(col, *fval),
+                    BinOp2::Eq => bitmap::filter_eq_f64_epsilon(col, *fval),
                     BinOp2::Ne => bitmap::filter_ne_f64(col, *fval),
                     BinOp2::Lt => bitmap::filter_lt_f64(col, *fval),
                     BinOp2::Le => bitmap::filter_le_f64(col, *fval),
