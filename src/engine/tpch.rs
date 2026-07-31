@@ -693,6 +693,7 @@ pub fn execute_tpch(query: &SelectQuery2, catalog: &Catalog) -> Result<QueryResu
         exists_cache: std::cell::RefCell::new(HashMap::new()),
         exists_multi_cache: std::cell::RefCell::new(HashMap::new()),
         in_subquery_cache: std::cell::RefCell::new(HashMap::new()),
+        decorrelated_cache: std::cell::RefCell::new(HashMap::new()),
     }.execute(query)
 }
 
@@ -730,6 +731,17 @@ struct TpchExec<'a> {
     /// ps_suppkey FROM partsupp WHERE ...)`), we execute it ONCE and cache
     /// the set of values. Then per-row eval just checks membership.
     in_subquery_cache: std::cell::RefCell<HashMap<usize, std::collections::HashSet<u64>>>,
+    /// Cache for decorrelated correlated scalar subqueries.
+    /// When a correlated scalar subquery has an aggregate (sum/avg/min/max)
+    /// and multiple correlation columns, we proactively build a derived table:
+    /// execute the subquery's FROM table with local filters, GROUP BY the
+    /// correlation columns, and cache a HashMap<corr_key_hash, agg_value>.
+    /// Then per-row eval is a single hash lookup (O(1)) instead of a full
+    /// subquery execution. This is critical for Q20 where the correlation
+    /// key (ps_partkey, ps_suppkey) has 800k distinct values, each requiring
+    /// a 6M-row lineitem scan — the derived table scans lineitem ONCE.
+    /// Value: (HashMap<corr_hash, agg_value>, Vec<usize> corr_col_indices_in_outer).
+    decorrelated_cache: std::cell::RefCell<HashMap<usize, (std::collections::HashMap<u64, Value2>, Vec<usize>)>>,
 }
 
 impl<'a> TpchExec<'a> {
@@ -1001,6 +1013,154 @@ impl<'a> TpchExec<'a> {
     ///
     /// Q4 example: `exists (SELECT * FROM lineitem WHERE l_orderkey = o_orderkey
     /// AND l_commitdate < l_receiptdate)` → outer_col=o_orderkey, inner_col=l_orderkey.
+    /// Try to decorrelate a correlated scalar subquery by building a derived
+    /// table: execute the subquery's FROM table with local (non-correlated)
+    /// filters, GROUP BY the correlation columns, compute the aggregate, and
+    /// cache a HashMap<corr_hash, agg_value>. Then per-row eval is O(1).
+    ///
+    /// Pattern: `SELECT agg(expr) FROM t WHERE corr1 = outer1 AND ... AND local_filters`
+    /// → derived table: `SELECT corr1, ..., agg(expr) FROM t WHERE local_filters GROUP BY corr1, ...`
+    ///
+    /// Returns Some((HashMap<corr_hash, agg_value>, Vec<outer_col_indices>))
+    /// if the pattern matches, None otherwise.
+    ///
+    /// Q20 example: `SELECT 0.5 * sum(l_quantity) FROM lineitem
+    ///   WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey
+    ///   AND l_shipdate >= date '1994-01-01' AND l_shipdate < date '1995-01-01'`
+    /// → derived table groups lineitem by (l_partkey, l_suppkey), computes
+    ///   0.5 * sum(l_quantity), caches HashMap<(l_partkey,l_suppkey)_hash, threshold>.
+    fn try_decorrelate_subquery(
+        &self, subquery: &SelectQuery2, outer_t: &ExecTable,
+    ) -> Result<Option<(std::collections::HashMap<u64, Value2>, Vec<usize>)>, Error> {
+        // Only decorrelate if the subquery has exactly 1 SELECT item that is
+        // an aggregate (or a scalar function of an aggregate, like 0.2 * avg(x)).
+        if subquery.select.len() != 1 { return Ok(None); }
+        if !self.expr_has_agg(&subquery.select[0].expr) { return Ok(None); }
+        if subquery.having.is_some() { return Ok(None); }
+        if !subquery.group_by.is_empty() { return Ok(None); }
+
+        // Build inner column name set and inner table aliases.
+        let mut inner_cols: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut inner_aliases: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for item in &subquery.from {
+            if let FromItem::Table(t) = item {
+                inner_aliases.insert(t.name.to_lowercase());
+                if let Some(ref alias) = t.alias {
+                    inner_aliases.insert(alias.to_lowercase());
+                }
+                if let Some(table) = self.catalog.get(&t.name) {
+                    for cn in &table.column_names {
+                        inner_cols.insert(cn.to_lowercase());
+                    }
+                }
+            }
+        }
+
+        // Find correlation columns (outer cols referenced by the subquery).
+        let mut corr_cols = self.find_correlation_cols(subquery, outer_t);
+        // Need at least 1 correlation column to be correlated.
+        if corr_cols.is_empty() { return Ok(None); }
+
+        // Find the inner column indices for each correlation column by
+        // looking at the equi-join conjuncts in the subquery's WHERE.
+        // Each corr col has a corresponding inner col via `inner_col = outer_col`.
+        let wc = match &subquery.where_clause {
+            Some(w) => w,
+            None => return Ok(None),
+        };
+        let conjuncts = self.split_conjuncts(&Some(wc.clone()));
+
+        // Map: outer_col_idx -> (inner_col_idx, outer_col_name, inner_col_name)
+        let mut corr_to_inner: Vec<(usize, usize, String, String)> = Vec::new();
+        for conj in &conjuncts {
+            if let Expr2::BinOp { op: BinOp2::Eq, left: l, right: r } = conj {
+                if let (Expr2::Col(ln), Expr2::Col(rn)) = (l.as_ref(), r.as_ref()) {
+                    let l_is_inner = self.col_is_inner(ln, &inner_aliases, &inner_cols);
+                    let r_is_inner = self.col_is_inner(rn, &inner_aliases, &inner_cols);
+                    if l_is_inner != r_is_inner {
+                        let (inner_name, outer_name) = if l_is_inner {
+                            (ln.clone(), rn.clone())
+                        } else {
+                            (rn.clone(), ln.clone())
+                        };
+                        let outer_short = outer_name.rfind('.').map(|p| &outer_name[p+1..]).unwrap_or(&outer_name).to_lowercase();
+                        let outer_idx = match outer_t.lookup_col(&outer_name).or_else(|| outer_t.lookup_col(&outer_short)) {
+                            Some(idx) => idx,
+                            None => continue,
+                        };
+                        let inner_idx = match self.resolve_inner_col_idx(&inner_name, subquery, outer_t) {
+                            Some(idx) => idx,
+                            None => continue,
+                        };
+                        if !corr_to_inner.iter().any(|(oi, _, _, _)| *oi == outer_idx) {
+                            corr_to_inner.push((outer_idx, inner_idx, outer_name.clone(), inner_name.clone()));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check that every correlation column found has a matching equi-join.
+        // (corr_cols and corr_to_inner outer indices should match.)
+        let corr_outer_indices: std::collections::HashSet<usize> = corr_cols.iter().copied().collect();
+        let matched_outer_indices: std::collections::HashSet<usize> = corr_to_inner.iter().map(|(oi, _, _, _)| *oi).collect();
+        if corr_outer_indices != matched_outer_indices {
+            return Ok(None);
+        }
+        if corr_to_inner.is_empty() { return Ok(None); }
+
+        // Build the derived table: load inner FROM, apply local (non-correlated)
+        // conjuncts, GROUP BY inner correlation columns, compute aggregate.
+        let mut tables: Vec<ExecTable> = Vec::new();
+        for item in &subquery.from {
+            tables.push(self.resolve_from_item(item)?);
+        }
+        let base = if tables.len() == 1 {
+            tables.into_iter().next().unwrap()
+        } else {
+            self.join_tables_smart(tables, &subquery.where_clause)?
+        };
+
+        // Apply local (non-correlated) conjuncts only.
+        let mask = {
+            let mut m = vec![true; base.row_count];
+            for conj in &conjuncts {
+                if self.is_conjunct_correlated(conj, &base) { continue; }
+                let mut cm = vec![true; base.row_count];
+                self.eval_bool_mask_vec(conj, &base, &mut cm)?;
+                for i in 0..base.row_count { m[i] = m[i] && cm[i]; }
+            }
+            m
+        };
+
+        // Build the aggregate map: GROUP BY inner corr cols, compute agg.
+        let agg_expr = &subquery.select[0].expr;
+        let inner_corr_indices: Vec<usize> = corr_to_inner.iter().map(|(_, ii, _, _)| *ii).collect();
+        // Group rows by composite hash of inner corr cols.
+        let mut groups: std::collections::HashMap<u64, Vec<usize>> = std::collections::HashMap::new();
+        for i in 0..base.row_count {
+            if !mask[i] { continue; }
+            let mut h: u64 = 0;
+            for &ci in &inner_corr_indices {
+                let v = base.columns[ci][i];
+                h = h.wrapping_mul(0x517cc1b727220a95).wrapping_add(v);
+            }
+            groups.entry(h).or_default().push(i);
+        }
+
+        // For each group, compute the aggregate value.
+        let mut result_map: std::collections::HashMap<u64, Value2> = std::collections::HashMap::with_capacity(groups.len());
+        for (hash, indices) in &groups {
+            let v = self.eval_agg_expr(agg_expr, &base, indices)?;
+            result_map.insert(*hash, v);
+        }
+
+        // The outer col indices (for computing corr_hash per outer row).
+        let outer_corr_indices: Vec<usize> = corr_to_inner.iter().map(|(oi, _, _, _)| *oi).collect();
+
+        Ok(Some((result_map, outer_corr_indices)))
+    }
+
     fn find_exists_equi_join(&self, subquery: &SelectQuery2, outer_t: &ExecTable) -> Option<(usize, usize)> {
         // Build inner column name set (subquery's own FROM tables)
         let mut inner_cols: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -2870,11 +3030,35 @@ impl<'a> TpchExec<'a> {
                         return Ok(v.clone());
                     }
                 }
+                // Try decorrelation: if the subquery is a correlated aggregate
+                // (SELECT agg(expr) FROM t WHERE corr1 = outer1 AND corr2 = outer2 AND local_filters),
+                // proactively build a derived table once, then per-row eval is a hash lookup.
+                // This is critical for Q20 (800k correlation keys, each scanning 6M rows).
+                {
+                    let cached = self.decorrelated_cache.borrow().contains_key(&ast_key);
+                    if !cached {
+                        if let Some((map, cols)) = self.try_decorrelate_subquery(q, t)? {
+                            self.decorrelated_cache.borrow_mut().insert(ast_key, (map, cols));
+                        }
+                    }
+                }
+                {
+                    let cache = self.decorrelated_cache.borrow();
+                    if let Some((map, corr_cols)) = cache.get(&ast_key) {
+                        // Compute correlation hash from outer row's corr cols.
+                        let mut corr_hash: u64 = 0;
+                        for &ci in corr_cols {
+                            let v = t.columns[ci].get(row).copied().unwrap_or(0);
+                            corr_hash = corr_hash.wrapping_mul(0x517cc1b727220a95).wrapping_add(v);
+                        }
+                        if let Some(v) = map.get(&corr_hash) {
+                            return Ok(v.clone());
+                        }
+                        // No match in derived table → subquery returns NULL (no rows match).
+                        return Ok(Value2::Null);
+                    }
+                }
                 // Correlated subquery: cache by (ast_key, hash of correlation column values).
-                // Find columns in the outer table `t` that the subquery references.
-                // For Q17 (`l_quantity < (SELECT 0.2 * avg(l_quantity) FROM lineitem WHERE l_partkey = p_partkey)`)
-                // the correlation col is `p_partkey`. Caching by p_partkey value reduces
-                // ~60k subquery executions to ~200 (one per distinct part).
                 let corr_cols = self.find_correlation_cols(q, t);
                 let mut corr_hash: u64 = 0;
                 for &ci in &corr_cols {
@@ -4439,7 +4623,7 @@ mod tests {
 
     #[test]
     fn test_like_match() {
-        let cat = Catalog::new(); let exec = TpchExec { catalog: &cat, outer: std::cell::Cell::new(None), subquery_cache: std::cell::RefCell::new(HashMap::new()), exists_cache: std::cell::RefCell::new(HashMap::new()), exists_multi_cache: std::cell::RefCell::new(HashMap::new()), in_subquery_cache: std::cell::RefCell::new(HashMap::new()) };
+        let cat = Catalog::new(); let exec = TpchExec { catalog: &cat, outer: std::cell::Cell::new(None), subquery_cache: std::cell::RefCell::new(HashMap::new()), exists_cache: std::cell::RefCell::new(HashMap::new()), exists_multi_cache: std::cell::RefCell::new(HashMap::new()), in_subquery_cache: std::cell::RefCell::new(HashMap::new()), decorrelated_cache: std::cell::RefCell::new(HashMap::new()) };
         assert!(exec.like("hello world", "%hello%"));
         assert!(exec.like("hello", "hello"));
         assert!(exec.like("hello world", "hello%"));

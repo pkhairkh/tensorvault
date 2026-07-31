@@ -52,10 +52,10 @@ const RESULTS_DIR: &str = "/root/results";
 const JSON_OUT: &str = "/root/results/turbogp_tpch.json";
 const LOG_OUT: &str = "/root/results/turbogp_tpch.log";
 
-/// Queries with correlated subqueries that previously hung or OOM'd.
-/// Q4 (EXISTS), Q19 (OR join), and Q21 (double EXISTS) are now handled.
-/// Q20 (nested IN-subqueries, times out) still unsupported.
-const SKIP_QUERIES: &[&str] = &["Q20"];
+/// All 22 TPC-H queries are now supported.
+/// Q4 (EXISTS), Q19 (OR join), Q20 (decorrelated scalar subquery), and
+/// Q21 (double EXISTS) are all handled via decorrelation.
+const SKIP_QUERIES: &[&str] = &[];
 
 /// Run a single TPC-H query with a timeout. Returns (ms, row_count) or error string.
 /// Uses a spawned thread + mpsc channel with recv_timeout.
