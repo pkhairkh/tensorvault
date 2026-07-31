@@ -47,7 +47,7 @@ const TPCH_QUERIES: &[(&str, &str)] = &[
 ];
 
 const NUM_RUNS: usize = 3;
-const QUERY_TIMEOUT_SECS: u64 = 60;
+const QUERY_TIMEOUT_SECS: u64 = 30;
 const RESULTS_DIR: &str = "/root/results";
 const JSON_OUT: &str = "/root/results/turbogp_tpch.json";
 const LOG_OUT: &str = "/root/results/turbogp_tpch.log";
