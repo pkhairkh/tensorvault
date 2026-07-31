@@ -4191,7 +4191,7 @@ impl<'a> TpchExec<'a> {
         order.sort_by(|&a, &b| {
             for (i, (va, asc)) in sort_keys[a].iter().enumerate() {
                 let vb = sort_keys[b][i].0;
-                let cmp = va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal);
+                let cmp = va.total_cmp(&vb);
                 let cmp = if *asc { cmp } else { cmp.reverse() };
                 if cmp != std::cmp::Ordering::Equal { return cmp; }
             }
@@ -4221,7 +4221,7 @@ impl<'a> TpchExec<'a> {
         order.sort_by(|&a, &b| {
             for (i, (va, asc)) in sort_keys[a].iter().enumerate() {
                 let vb = sort_keys[b][i].0;
-                let cmp = va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal);
+                let cmp = va.total_cmp(&vb);
                 let cmp = if *asc { cmp } else { cmp.reverse() };
                 if cmp != std::cmp::Ordering::Equal { return cmp; }
             }
