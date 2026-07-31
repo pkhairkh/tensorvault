@@ -1,0 +1,654 @@
+{
+  "engine": "turbogp",
+  "version": "0.2.0",
+  "clickbench_load_ms": 1227,
+  "queries": [
+    {
+      "id": "Q1",
+      "suite": "clickbench",
+      "sql": "SELECT count(*) FROM hits_1m",
+      "runs_ms": [
+        0.008,
+        0.001,
+        0.0
+      ],
+      "best_ms": 0.0,
+      "median_ms": 0.001,
+      "status": "ok",
+      "rows": 1,
+      "error": null
+    },
+    {
+      "id": "Q2",
+      "suite": "clickbench",
+      "sql": "SELECT count(DISTINCT UserID) FROM hits_1m",
+      "runs_ms": [
+        26.087,
+        25.836,
+        25.644
+      ],
+      "best_ms": 25.644,
+      "median_ms": 25.836,
+      "status": "ok",
+      "rows": 1,
+      "error": null
+    },
+    {
+      "id": "Q3",
+      "suite": "clickbench",
+      "sql": "SELECT min(EventDate) FROM hits_1m",
+      "runs_ms": [
+        0.372,
+        0.255,
+        0.248
+      ],
+      "best_ms": 0.248,
+      "median_ms": 0.255,
+      "status": "ok",
+      "rows": 1,
+      "error": null
+    },
+    {
+      "id": "Q4",
+      "suite": "clickbench",
+      "sql": "SELECT count(*) FROM hits_1m WHERE EventDate = 18500",
+      "runs_ms": [
+        0.532,
+        0.523,
+        0.521
+      ],
+      "best_ms": 0.521,
+      "median_ms": 0.523,
+      "status": "ok",
+      "rows": 1,
+      "error": null
+    },
+    {
+      "id": "Q5",
+      "suite": "clickbench",
+      "sql": "SELECT count(*) FROM hits_1m WHERE URL LIKE '%google%'",
+      "runs_ms": [
+        38.075,
+        38.255,
+        38.427
+      ],
+      "best_ms": 38.075,
+      "median_ms": 38.255,
+      "status": "ok",
+      "rows": 1,
+      "error": null
+    },
+    {
+      "id": "Q6",
+      "suite": "clickbench",
+      "sql": "SELECT sum(AdvEngineID) FROM hits_1m WHERE AdvEngineID > 0",
+      "runs_ms": [
+        1.126,
+        1.235,
+        1.182
+      ],
+      "best_ms": 1.126,
+      "median_ms": 1.182,
+      "status": "ok",
+      "rows": 1,
+      "error": null
+    },
+    {
+      "id": "Q7",
+      "suite": "clickbench",
+      "sql": "SELECT sum(AdvEngineID) FROM hits_1m WHERE AdvEngineID > 0",
+      "runs_ms": [
+        1.169,
+        1.172,
+        1.166
+      ],
+      "best_ms": 1.166,
+      "median_ms": 1.169,
+      "status": "ok",
+      "rows": 1,
+      "error": null
+    },
+    {
+      "id": "Q8",
+      "suite": "clickbench",
+      "sql": "SELECT RegionID, count(*) FROM hits_1m GROUP BY RegionID",
+      "runs_ms": [
+        5.111,
+        4.824,
+        4.675
+      ],
+      "best_ms": 4.675,
+      "median_ms": 4.824,
+      "status": "ok",
+      "rows": 3733,
+      "error": null
+    },
+    {
+      "id": "Q9",
+      "suite": "clickbench",
+      "sql": "SELECT RegionID, count(*) FROM hits_1m GROUP BY RegionID",
+      "runs_ms": [
+        4.863,
+        4.769,
+        4.694
+      ],
+      "best_ms": 4.694,
+      "median_ms": 4.769,
+      "status": "ok",
+      "rows": 3733,
+      "error": null
+    },
+    {
+      "id": "Q10",
+      "suite": "clickbench",
+      "sql": "SELECT MobilePhone, count(*) FROM hits_1m GROUP BY MobilePhone",
+      "runs_ms": [
+        3.69,
+        3.72,
+        3.604
+      ],
+      "best_ms": 3.604,
+      "median_ms": 3.69,
+      "status": "ok",
+      "rows": 27,
+      "error": null
+    },
+    {
+      "id": "Q11",
+      "suite": "clickbench",
+      "sql": "SELECT MobilePhone, count(*) FROM hits_1m GROUP BY MobilePhone",
+      "runs_ms": [
+        3.6,
+        3.593,
+        3.567
+      ],
+      "best_ms": 3.567,
+      "median_ms": 3.593,
+      "status": "ok",
+      "rows": 27,
+      "error": null
+    },
+    {
+      "id": "Q12",
+      "suite": "clickbench",
+      "sql": "SELECT SearchEngineID, count(*) FROM hits_1m GROUP BY SearchEngineID",
+      "runs_ms": [
+        3.577,
+        3.569,
+        3.526
+      ],
+      "best_ms": 3.526,
+      "median_ms": 3.569,
+      "status": "ok",
+      "rows": 60,
+      "error": null
+    },
+    {
+      "id": "Q13",
+      "suite": "clickbench",
+      "sql": "SELECT count(*) FROM hits_1m WHERE UserID = 7",
+      "runs_ms": [
+        0.628,
+        0.55,
+        0.519
+      ],
+      "best_ms": 0.519,
+      "median_ms": 0.55,
+      "status": "ok",
+      "rows": 1,
+      "error": null
+    },
+    {
+      "id": "Q14",
+      "suite": "clickbench",
+      "sql": "SELECT URL, count(*) AS c FROM hits_1m GROUP BY URL ORDER BY c DESC LIMIT 10",
+      "runs_ms": [
+        47.442,
+        42.484,
+        41.639
+      ],
+      "best_ms": 41.639,
+      "median_ms": 42.484,
+      "status": "ok",
+      "rows": 10,
+      "error": null
+    },
+    {
+      "id": "Q15",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE 'https://%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "runs_ms": [
+        12.779,
+        11.975,
+        10.759
+      ],
+      "best_ms": 10.759,
+      "median_ms": 11.975,
+      "status": "ok",
+      "rows": 10,
+      "error": null
+    },
+    {
+      "id": "Q16",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE 'http://%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "runs_ms": [
+        54.395,
+        47.99,
+        49.125
+      ],
+      "best_ms": 47.99,
+      "median_ms": 49.125,
+      "status": "ok",
+      "rows": 10,
+      "error": null
+    },
+    {
+      "id": "Q17",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE 'http%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "runs_ms": [
+        51.539,
+        50.885,
+        49.909
+      ],
+      "best_ms": 49.909,
+      "median_ms": 50.885,
+      "status": "ok",
+      "rows": 10,
+      "error": null
+    },
+    {
+      "id": "Q18",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%google%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "runs_ms": [
+        39.323,
+        38.704,
+        38.661
+      ],
+      "best_ms": 38.661,
+      "median_ms": 38.704,
+      "status": "ok",
+      "rows": 10,
+      "error": null
+    },
+    {
+      "id": "Q19",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%auto%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "runs_ms": [
+        80.837,
+        81.097,
+        81.128
+      ],
+      "best_ms": 80.837,
+      "median_ms": 81.097,
+      "status": "ok",
+      "rows": 10,
+      "error": null
+    },
+    {
+      "id": "Q20",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%news%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "runs_ms": [
+        58.261,
+        58.139,
+        58.498
+      ],
+      "best_ms": 58.139,
+      "median_ms": 58.261,
+      "status": "ok",
+      "rows": 10,
+      "error": null
+    },
+    {
+      "id": "Q21",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%vk%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "runs_ms": [
+        40.508,
+        40.455,
+        40.727
+      ],
+      "best_ms": 40.455,
+      "median_ms": 40.508,
+      "status": "ok",
+      "rows": 10,
+      "error": null
+    },
+    {
+      "id": "Q22",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%yandex%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "runs_ms": [
+        58.001,
+        58.229,
+        58.035
+      ],
+      "best_ms": 58.001,
+      "median_ms": 58.035,
+      "status": "ok",
+      "rows": 10,
+      "error": null
+    },
+    {
+      "id": "Q23",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%mail%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "runs_ms": [
+        49.796,
+        49.954,
+        50.505
+      ],
+      "best_ms": 49.796,
+      "median_ms": 49.954,
+      "status": "ok",
+      "rows": 10,
+      "error": null
+    },
+    {
+      "id": "Q24",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%weather%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "runs_ms": [
+        36.179,
+        35.93,
+        36.053
+      ],
+      "best_ms": 35.93,
+      "median_ms": 36.053,
+      "status": "ok",
+      "rows": 10,
+      "error": null
+    },
+    {
+      "id": "Q25",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%facebook%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "runs_ms": [
+        36.146,
+        36.009,
+        36.288
+      ],
+      "best_ms": 36.009,
+      "median_ms": 36.146,
+      "status": "ok",
+      "rows": 10,
+      "error": null
+    },
+    {
+      "id": "Q26",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%twitter%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "runs_ms": [
+        59.415,
+        59.418,
+        59.694
+      ],
+      "best_ms": 59.415,
+      "median_ms": 59.418,
+      "status": "ok",
+      "rows": 10,
+      "error": null
+    },
+    {
+      "id": "Q27",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%yahoo%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "runs_ms": [
+        39.005,
+        39.032,
+        39.01
+      ],
+      "best_ms": 39.005,
+      "median_ms": 39.01,
+      "status": "ok",
+      "rows": 1,
+      "error": null
+    },
+    {
+      "id": "Q28",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%bing%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "runs_ms": [
+        37.441,
+        37.402,
+        37.467
+      ],
+      "best_ms": 37.402,
+      "median_ms": 37.441,
+      "status": "ok",
+      "rows": 10,
+      "error": null
+    },
+    {
+      "id": "Q29",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%api%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "runs_ms": [
+        65.996,
+        65.787,
+        65.719
+      ],
+      "best_ms": 65.719,
+      "median_ms": 65.787,
+      "status": "ok",
+      "rows": 10,
+      "error": null
+    },
+    {
+      "id": "Q30",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%ad%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "runs_ms": [
+        80.396,
+        80.001,
+        79.479
+      ],
+      "best_ms": 79.479,
+      "median_ms": 80.001,
+      "status": "ok",
+      "rows": 10,
+      "error": null
+    },
+    {
+      "id": "Q31",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%game%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "runs_ms": [
+        40.029,
+        39.938,
+        39.837
+      ],
+      "best_ms": 39.837,
+      "median_ms": 39.938,
+      "status": "ok",
+      "rows": 10,
+      "error": null
+    },
+    {
+      "id": "Q32",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%download%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "runs_ms": [
+        47.765,
+        47.521,
+        47.529
+      ],
+      "best_ms": 47.521,
+      "median_ms": 47.529,
+      "status": "ok",
+      "rows": 10,
+      "error": null
+    },
+    {
+      "id": "Q33",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%video%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "runs_ms": [
+        56.506,
+        56.413,
+        56.869
+      ],
+      "best_ms": 56.413,
+      "median_ms": 56.506,
+      "status": "ok",
+      "rows": 10,
+      "error": null
+    },
+    {
+      "id": "Q34",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%sport%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "runs_ms": [
+        55.98,
+        55.824,
+        55.97
+      ],
+      "best_ms": 55.824,
+      "median_ms": 55.97,
+      "status": "ok",
+      "rows": 10,
+      "error": null
+    },
+    {
+      "id": "Q35",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%shop%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "runs_ms": [
+        56.241,
+        56.31,
+        57.301
+      ],
+      "best_ms": 56.241,
+      "median_ms": 56.31,
+      "status": "ok",
+      "rows": 10,
+      "error": null
+    },
+    {
+      "id": "Q36",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%forum%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "runs_ms": [
+        43.158,
+        43.118,
+        42.852
+      ],
+      "best_ms": 42.852,
+      "median_ms": 43.118,
+      "status": "ok",
+      "rows": 10,
+      "error": null
+    },
+    {
+      "id": "Q37",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%blog%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "runs_ms": [
+        38.3,
+        38.02,
+        37.643
+      ],
+      "best_ms": 37.643,
+      "median_ms": 38.02,
+      "status": "ok",
+      "rows": 10,
+      "error": null
+    },
+    {
+      "id": "Q38",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%edu%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "runs_ms": [
+        69.451,
+        69.229,
+        69.362
+      ],
+      "best_ms": 69.229,
+      "median_ms": 69.362,
+      "status": "ok",
+      "rows": 10,
+      "error": null
+    },
+    {
+      "id": "Q39",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%gov%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "runs_ms": [
+        38.824,
+        38.83,
+        38.766
+      ],
+      "best_ms": 38.766,
+      "median_ms": 38.824,
+      "status": "ok",
+      "rows": 10,
+      "error": null
+    },
+    {
+      "id": "Q40",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%travel%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "runs_ms": [
+        59.695,
+        59.386,
+        59.318
+      ],
+      "best_ms": 59.318,
+      "median_ms": 59.386,
+      "status": "ok",
+      "rows": 10,
+      "error": null
+    },
+    {
+      "id": "Q41",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%shop%' OR URL LIKE '%game%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "runs_ms": [
+        96.122,
+        96.256,
+        96.015
+      ],
+      "best_ms": 96.015,
+      "median_ms": 96.122,
+      "status": "ok",
+      "rows": 10,
+      "error": null
+    },
+    {
+      "id": "Q42",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%weather%' OR URL LIKE '%news%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "runs_ms": [
+        93.16,
+        94.201,
+        93.185
+      ],
+      "best_ms": 93.16,
+      "median_ms": 93.185,
+      "status": "ok",
+      "rows": 10,
+      "error": null
+    },
+    {
+      "id": "Q43",
+      "suite": "clickbench",
+      "sql": "SELECT TraficSourceID, count(*) AS c FROM hits_1m GROUP BY TraficSourceID ORDER BY c DESC LIMIT 10",
+      "runs_ms": [
+        3.815,
+        3.519,
+        3.467
+      ],
+      "best_ms": 3.467,
+      "median_ms": 3.519,
+      "status": "ok",
+      "rows": 10,
+      "error": null
+    }
+  ],
+  "total_best_ms": 1612.7960000000005,
+  "total_median_ms": 1620.889
+}

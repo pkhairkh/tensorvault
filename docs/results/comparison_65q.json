@@ -1,0 +1,713 @@
+{
+  "metadata": {
+    "date": "2026-07-31",
+    "hardware": "AMD EPYC-Turin Zen 5, 8 vCPU, 32GB RAM, AVX-512",
+    "data": {
+      "clickbench": "Real hits_1m.parquet, 1M rows, 105 columns",
+      "tpch": "Real TPC-H SF=1 CSV, lineitem=6,001,215 rows, all 8 tables"
+    },
+    "engines": {
+      "duckdb": {
+        "version": "v1.5.5",
+        "mode": "in-process (bundled libduckdb)"
+      },
+      "clickhouse": {
+        "version": "26.8.1.435",
+        "mode": "HTTP client to running server"
+      },
+      "turbogp": {
+        "version": "0.2.0",
+        "mode": "in-process (Rust release, LTO=fat)"
+      }
+    },
+    "methodology": "3 runs per query, best-of-3 reported. Warm-up pass before measurement."
+  },
+  "summary": {
+    "clickbench": {
+      "duckdb": {
+        "pass": 43,
+        "total": 43,
+        "best_ms": 313.61690999999996
+      },
+      "clickhouse": {
+        "pass": 43,
+        "total": 43,
+        "best_ms": 627.165406
+      },
+      "turbogp": {
+        "pass": 43,
+        "total": 43,
+        "best_ms": 1612.7960000000005
+      }
+    },
+    "tpch": {
+      "duckdb": {
+        "pass": 22,
+        "total": 22,
+        "best_ms": 442.344957
+      },
+      "clickhouse": {
+        "pass": 22,
+        "total": 22,
+        "best_ms": 2619.392371
+      },
+      "turbogp": {
+        "pass": 14,
+        "total": 22,
+        "best_ms": 94209.00671
+      }
+    }
+  },
+  "queries": [
+    {
+      "id": "Q1",
+      "suite": "clickbench",
+      "sql": "SELECT count(*) FROM hits_1m",
+      "duckdb_ms": 0.212232,
+      "clickhouse_ms": 0.765341,
+      "turbogp_ms": 0.0,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q2",
+      "suite": "clickbench",
+      "sql": "SELECT count(DISTINCT UserID) FROM hits_1m",
+      "duckdb_ms": 6.933869,
+      "clickhouse_ms": 20.250346999999998,
+      "turbogp_ms": 25.644,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q3",
+      "suite": "clickbench",
+      "sql": "SELECT min(EventDate) FROM hits_1m",
+      "duckdb_ms": 0.551315,
+      "clickhouse_ms": 2.494735,
+      "turbogp_ms": 0.248,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q4",
+      "suite": "clickbench",
+      "sql": "SELECT count(*) FROM hits_1m WHERE EventDate = 18500",
+      "duckdb_ms": 0.21545599999999998,
+      "clickhouse_ms": 2.523834,
+      "turbogp_ms": 0.521,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q5",
+      "suite": "clickbench",
+      "sql": "SELECT count(*) FROM hits_1m WHERE URL LIKE '%google%'",
+      "duckdb_ms": 6.070354,
+      "clickhouse_ms": 12.632711,
+      "turbogp_ms": 38.075,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q6",
+      "suite": "clickbench",
+      "sql": "SELECT sum(AdvEngineID) FROM hits_1m WHERE AdvEngineID > 0",
+      "duckdb_ms": 0.838561,
+      "clickhouse_ms": 2.857433,
+      "turbogp_ms": 1.126,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q7",
+      "suite": "clickbench",
+      "sql": "SELECT sum(AdvEngineID) FROM hits_1m WHERE AdvEngineID > 0",
+      "duckdb_ms": 0.7240639999999999,
+      "clickhouse_ms": 2.795227,
+      "turbogp_ms": 1.166,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q8",
+      "suite": "clickbench",
+      "sql": "SELECT RegionID, count(*) FROM hits_1m GROUP BY RegionID",
+      "duckdb_ms": 8.704168,
+      "clickhouse_ms": 19.083026,
+      "turbogp_ms": 4.675,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q9",
+      "suite": "clickbench",
+      "sql": "SELECT RegionID, count(*) FROM hits_1m GROUP BY RegionID",
+      "duckdb_ms": 2.222431,
+      "clickhouse_ms": 4.681997,
+      "turbogp_ms": 4.694,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q10",
+      "suite": "clickbench",
+      "sql": "SELECT MobilePhone, count(*) FROM hits_1m GROUP BY MobilePhone",
+      "duckdb_ms": 2.2210289999999997,
+      "clickhouse_ms": 5.17208,
+      "turbogp_ms": 3.604,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q11",
+      "suite": "clickbench",
+      "sql": "SELECT MobilePhone, count(*) FROM hits_1m GROUP BY MobilePhone",
+      "duckdb_ms": 2.370454,
+      "clickhouse_ms": 5.945621,
+      "turbogp_ms": 3.567,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q12",
+      "suite": "clickbench",
+      "sql": "SELECT SearchEngineID, count(*) FROM hits_1m GROUP BY SearchEngineID",
+      "duckdb_ms": 8.287875,
+      "clickhouse_ms": 27.063881000000002,
+      "turbogp_ms": 3.526,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q13",
+      "suite": "clickbench",
+      "sql": "SELECT count(*) FROM hits_1m WHERE UserID = 7",
+      "duckdb_ms": 0.684289,
+      "clickhouse_ms": 1.8589710000000002,
+      "turbogp_ms": 0.519,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q14",
+      "suite": "clickbench",
+      "sql": "SELECT URL, count(*) AS c FROM hits_1m GROUP BY URL ORDER BY c DESC LIMIT 10",
+      "duckdb_ms": 18.954108,
+      "clickhouse_ms": 44.890583,
+      "turbogp_ms": 41.639,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q15",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE 'https://%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "duckdb_ms": 3.619367,
+      "clickhouse_ms": 13.333154,
+      "turbogp_ms": 10.759,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q16",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE 'http://%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "duckdb_ms": 19.87281,
+      "clickhouse_ms": 46.591076,
+      "turbogp_ms": 47.99,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q17",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE 'http%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "duckdb_ms": 21.594433,
+      "clickhouse_ms": 50.12579,
+      "turbogp_ms": 49.909,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q18",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%google%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "duckdb_ms": 6.705134,
+      "clickhouse_ms": 14.495729,
+      "turbogp_ms": 38.661,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q19",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%auto%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "duckdb_ms": 11.350401,
+      "clickhouse_ms": 19.205894,
+      "turbogp_ms": 80.837,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q20",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%news%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "duckdb_ms": 8.86543,
+      "clickhouse_ms": 17.416098,
+      "turbogp_ms": 58.139,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q21",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%vk%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "duckdb_ms": 6.608331000000001,
+      "clickhouse_ms": 14.051397999999999,
+      "turbogp_ms": 40.455,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q22",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%yandex%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "duckdb_ms": 9.231520999999999,
+      "clickhouse_ms": 21.041264,
+      "turbogp_ms": 58.001,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q23",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%mail%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "duckdb_ms": 7.859609,
+      "clickhouse_ms": 14.558665999999999,
+      "turbogp_ms": 49.796,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q24",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%weather%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "duckdb_ms": 5.57997,
+      "clickhouse_ms": 9.639982,
+      "turbogp_ms": 35.93,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q25",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%facebook%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "duckdb_ms": 5.538643,
+      "clickhouse_ms": 14.828415,
+      "turbogp_ms": 36.009,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q26",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%twitter%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "duckdb_ms": 9.235599,
+      "clickhouse_ms": 4.114888,
+      "turbogp_ms": 59.415,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q27",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%yahoo%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "duckdb_ms": 6.017209,
+      "clickhouse_ms": 2.233315,
+      "turbogp_ms": 39.005,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q28",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%bing%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "duckdb_ms": 6.044007,
+      "clickhouse_ms": 11.258594,
+      "turbogp_ms": 37.402,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q29",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%api%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "duckdb_ms": 9.064022,
+      "clickhouse_ms": 12.838654,
+      "turbogp_ms": 65.719,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q30",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%ad%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "duckdb_ms": 12.160713,
+      "clickhouse_ms": 21.625856,
+      "turbogp_ms": 79.479,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q31",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%game%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "duckdb_ms": 6.670566999999999,
+      "clickhouse_ms": 13.547036,
+      "turbogp_ms": 39.837,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q32",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%download%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "duckdb_ms": 7.407777,
+      "clickhouse_ms": 13.080784999999999,
+      "turbogp_ms": 47.521,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q33",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%video%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "duckdb_ms": 7.7239320000000005,
+      "clickhouse_ms": 17.274433,
+      "turbogp_ms": 56.413,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q34",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%sport%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "duckdb_ms": 9.226554,
+      "clickhouse_ms": 17.088188000000002,
+      "turbogp_ms": 55.824,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q35",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%shop%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "duckdb_ms": 8.674487,
+      "clickhouse_ms": 15.635303,
+      "turbogp_ms": 56.241,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q36",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%forum%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "duckdb_ms": 6.503327,
+      "clickhouse_ms": 14.673381,
+      "turbogp_ms": 42.852,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q37",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%blog%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "duckdb_ms": 6.311595,
+      "clickhouse_ms": 13.014725,
+      "turbogp_ms": 37.643,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q38",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%edu%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "duckdb_ms": 9.882746,
+      "clickhouse_ms": 14.8613,
+      "turbogp_ms": 69.229,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q39",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%gov%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "duckdb_ms": 6.619606999999999,
+      "clickhouse_ms": 13.432008,
+      "turbogp_ms": 38.766,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q40",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%travel%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "duckdb_ms": 9.721915,
+      "clickhouse_ms": 13.249998000000001,
+      "turbogp_ms": 59.318,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q41",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%shop%' OR URL LIKE '%game%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "duckdb_ms": 13.461870000000001,
+      "clickhouse_ms": 18.665622,
+      "turbogp_ms": 96.015,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q42",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%weather%' OR URL LIKE '%news%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "duckdb_ms": 12.293686,
+      "clickhouse_ms": 18.981586,
+      "turbogp_ms": 93.16,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q43",
+      "suite": "clickbench",
+      "sql": "SELECT TraficSourceID, count(*) AS c FROM hits_1m GROUP BY TraficSourceID ORDER BY c DESC LIMIT 10",
+      "duckdb_ms": 0.781443,
+      "clickhouse_ms": 3.2864809999999998,
+      "turbogp_ms": 3.467,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q1",
+      "suite": "clickbench",
+      "sql": "SELECT count(*) FROM hits_1m",
+      "duckdb_ms": 0.212232,
+      "clickhouse_ms": 0.765341,
+      "turbogp_ms": 0.0,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q2",
+      "suite": "clickbench",
+      "sql": "SELECT count(DISTINCT UserID) FROM hits_1m",
+      "duckdb_ms": 6.933869,
+      "clickhouse_ms": 20.250346999999998,
+      "turbogp_ms": 25.644,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q3",
+      "suite": "clickbench",
+      "sql": "SELECT min(EventDate) FROM hits_1m",
+      "duckdb_ms": 0.551315,
+      "clickhouse_ms": 2.494735,
+      "turbogp_ms": 0.248,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q4",
+      "suite": "clickbench",
+      "sql": "SELECT count(*) FROM hits_1m WHERE EventDate = 18500",
+      "duckdb_ms": 0.21545599999999998,
+      "clickhouse_ms": 2.523834,
+      "turbogp_ms": 0.521,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q5",
+      "suite": "clickbench",
+      "sql": "SELECT count(*) FROM hits_1m WHERE URL LIKE '%google%'",
+      "duckdb_ms": 6.070354,
+      "clickhouse_ms": 12.632711,
+      "turbogp_ms": 38.075,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q6",
+      "suite": "clickbench",
+      "sql": "SELECT sum(AdvEngineID) FROM hits_1m WHERE AdvEngineID > 0",
+      "duckdb_ms": 0.838561,
+      "clickhouse_ms": 2.857433,
+      "turbogp_ms": 1.126,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q7",
+      "suite": "clickbench",
+      "sql": "SELECT sum(AdvEngineID) FROM hits_1m WHERE AdvEngineID > 0",
+      "duckdb_ms": 0.7240639999999999,
+      "clickhouse_ms": 2.795227,
+      "turbogp_ms": 1.166,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q8",
+      "suite": "clickbench",
+      "sql": "SELECT RegionID, count(*) FROM hits_1m GROUP BY RegionID",
+      "duckdb_ms": 8.704168,
+      "clickhouse_ms": 19.083026,
+      "turbogp_ms": 4.675,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q9",
+      "suite": "clickbench",
+      "sql": "SELECT RegionID, count(*) FROM hits_1m GROUP BY RegionID",
+      "duckdb_ms": 2.222431,
+      "clickhouse_ms": 4.681997,
+      "turbogp_ms": 4.694,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q10",
+      "suite": "clickbench",
+      "sql": "SELECT MobilePhone, count(*) FROM hits_1m GROUP BY MobilePhone",
+      "duckdb_ms": 2.2210289999999997,
+      "clickhouse_ms": 5.17208,
+      "turbogp_ms": 3.604,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q11",
+      "suite": "clickbench",
+      "sql": "SELECT MobilePhone, count(*) FROM hits_1m GROUP BY MobilePhone",
+      "duckdb_ms": 2.370454,
+      "clickhouse_ms": 5.945621,
+      "turbogp_ms": 3.567,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q12",
+      "suite": "clickbench",
+      "sql": "SELECT SearchEngineID, count(*) FROM hits_1m GROUP BY SearchEngineID",
+      "duckdb_ms": 8.287875,
+      "clickhouse_ms": 27.063881000000002,
+      "turbogp_ms": 3.526,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q13",
+      "suite": "clickbench",
+      "sql": "SELECT count(*) FROM hits_1m WHERE UserID = 7",
+      "duckdb_ms": 0.684289,
+      "clickhouse_ms": 1.8589710000000002,
+      "turbogp_ms": 0.519,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q14",
+      "suite": "clickbench",
+      "sql": "SELECT URL, count(*) AS c FROM hits_1m GROUP BY URL ORDER BY c DESC LIMIT 10",
+      "duckdb_ms": 18.954108,
+      "clickhouse_ms": 44.890583,
+      "turbogp_ms": 41.639,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q15",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE 'https://%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "duckdb_ms": 3.619367,
+      "clickhouse_ms": 13.333154,
+      "turbogp_ms": 10.759,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q16",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE 'http://%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "duckdb_ms": 19.87281,
+      "clickhouse_ms": 46.591076,
+      "turbogp_ms": 47.99,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q17",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE 'http%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "duckdb_ms": 21.594433,
+      "clickhouse_ms": 50.12579,
+      "turbogp_ms": 49.909,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q18",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%google%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "duckdb_ms": 6.705134,
+      "clickhouse_ms": 14.495729,
+      "turbogp_ms": 38.661,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q19",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%auto%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "duckdb_ms": 11.350401,
+      "clickhouse_ms": 19.205894,
+      "turbogp_ms": 80.837,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q20",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%news%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "duckdb_ms": 8.86543,
+      "clickhouse_ms": 17.416098,
+      "turbogp_ms": 58.139,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q21",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%vk%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "duckdb_ms": 6.608331000000001,
+      "clickhouse_ms": 14.051397999999999,
+      "turbogp_ms": 40.455,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    },
+    {
+      "id": "Q22",
+      "suite": "clickbench",
+      "sql": "SELECT 1, URL, count(*) AS c FROM hits_1m WHERE URL LIKE '%yandex%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
+      "duckdb_ms": 9.231520999999999,
+      "clickhouse_ms": 21.041264,
+      "turbogp_ms": 58.001,
+      "turbogp_status": "ok",
+      "turbogp_error": null
+    }
+  ]
+}
