@@ -56,6 +56,7 @@
 //! Both return the row count so the caller can sanity-check the load.
 
 pub mod executor;
+pub mod tpch;
 pub mod result;
 
 pub use executor::execute_select;
@@ -213,6 +214,20 @@ impl QueryEngine {
         )?;
 
         // Stamp the elapsed time.
+        result.elapsed_us = start.elapsed().as_micros() as u64;
+        Ok(result)
+    }
+
+    /// Execute a TPC-H SQL query using the dedicated TPC-H interpreter.
+    ///
+    /// This path uses [] which
+    /// has a richer parser (arithmetic in aggregates, CASE WHEN, EXTRACT,
+    /// BETWEEN, IN, subqueries, derived tables, multi-table implicit
+    /// joins, HAVING, LEFT JOIN) and a type-aware row-based evaluator
+    /// (correctly interprets Float64 columns stored as f64::to_bits).
+    pub fn execute_tpch(&self, sql: &str) -> Result<QueryResult> {
+        let start = Instant::now();
+        let mut result = crate::engine::tpch::parse_and_execute(sql, &self.catalog)?;
         result.elapsed_us = start.elapsed().as_micros() as u64;
         Ok(result)
     }

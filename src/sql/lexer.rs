@@ -65,7 +65,7 @@ pub const KEYWORDS: &[&str] = &[
     "CONSISTENCY",
     "SCOPE",
     "RACK",
-    "REGION",
+
     "GLOBAL",
     "ASYNC",
     "USING",
@@ -74,6 +74,10 @@ pub const KEYWORDS: &[&str] = &[
     "ENERGY",
     "JOULES",
     "CONTINUOUS",
+    "HAVING",
+    "OUTER",
+    "LEFT",
+    "INNER",
     "QUERY",
 ];
 
@@ -176,6 +180,9 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                 if chars.peek() == Some(&'=') {
                     chars.next();
                     tokens.push(Token::Op("<=".to_string()));
+                } else if chars.peek() == Some(&'>') {
+                    chars.next();
+                    tokens.push(Token::Op("<>".to_string()));
                 } else {
                     tokens.push(Token::Op("<".to_string()));
                 }
@@ -204,9 +211,10 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                 let (tok, _consumed) = read_number(&mut chars)?;
                 tokens.push(tok);
             }
-            // Float with no integer part (`.5`). A lone `.` not followed by
-            // a digit is an error (qualified names like `table.col` are not
-            // yet supported).
+            // Float with no integer part (`.5`), or qualified-name
+            // separator (`table.col`). A `.` followed by a letter
+            // or underscore is treated as an operator so the parser can
+            // build qualified column references.
             '.' => {
                 let mut peek_iter = chars.clone();
                 peek_iter.next(); // consume '.'
@@ -215,7 +223,10 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                         let (tok, _consumed) = read_number(&mut chars)?;
                         tokens.push(tok);
                     }
-                    _ => return Err("unexpected character: '.'".to_string()),
+                    _ => {
+                        chars.next(); // consume '.'
+                        tokens.push(Token::Op(".".to_string()));
+                    }
                 }
             }
             // Hex literal `x'...'` or `X'...'`, or an identifier starting
