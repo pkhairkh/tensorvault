@@ -686,7 +686,11 @@ impl Value2 {
 }
 
 pub fn execute_tpch(query: &SelectQuery2, catalog: &Catalog) -> Result<QueryResult, Error> {
-    TpchExec { catalog, outer: std::cell::Cell::new(None) }.execute(query)
+    TpchExec {
+        catalog,
+        outer: std::cell::Cell::new(None),
+        subquery_cache: std::cell::RefCell::new(HashMap::new()),
+    }.execute(query)
 }
 
 struct TpchExec<'a> {
@@ -696,10 +700,34 @@ struct TpchExec<'a> {
     /// for lifetime erasure (safe because the outer table is valid for the
     /// duration of the synchronous subquery execution).
     outer: std::cell::Cell<Option<(*const ExecTable, usize)>>,
+    /// Cache for uncorrelated scalar subqueries: keyed by the SelectQuery2
+    /// AST pointer (stable for the query's lifetime). Populated lazily by
+    /// `precache_subqueries` (called at the start of `execute`) which tries
+    /// to execute each subquery with outer=None — if it succeeds, the
+    /// subquery is uncorrelated and the result is cached; if it fails
+    /// (column not found), it's correlated and per-row eval handles it.
+    /// This fixes Q11 (HAVING with uncorrelated scalar subquery) which
+    /// previously re-executed the subquery per group (~8000x) and timed out.
+    subquery_cache: std::cell::RefCell<HashMap<usize, Value2>>,
 }
 
 impl<'a> TpchExec<'a> {
     fn execute(&self, query: &SelectQuery2) -> Result<QueryResult, Error> {
+        // Pre-execute uncorrelated scalar subqueries found in WHERE/HAVING/SELECT.
+        // Each subquery is tried with outer=None — if it succeeds, it's uncorrelated
+        // and the result is cached; subsequent per-row/per-group eval hits the cache.
+        // This is critical for Q11 (HAVING with uncorrelated scalar subquery) which
+        // would otherwise re-execute the subquery per group and time out.
+        if let Some(ref wc) = query.where_clause {
+            self.precache_subqueries(wc);
+        }
+        if let Some(ref hv) = query.having {
+            self.precache_subqueries(hv);
+        }
+        for item in &query.select {
+            self.precache_subqueries(&item.expr);
+        }
+
         // 1. Load all FROM tables
         let mut tables: Vec<ExecTable> = Vec::new();
         for item in &query.from {
@@ -744,6 +772,175 @@ impl<'a> TpchExec<'a> {
             }
         }
         Ok(result)
+    }
+
+    /// Walk an expression tree and pre-execute all uncorrelated scalar subqueries,
+    /// caching their results in `subquery_cache`. Correlated subqueries (those
+    /// that reference outer columns) will fail when executed with outer=None
+    /// and are silently skipped — per-row eval will handle them.
+    ///
+    /// This is critical for Q11 (HAVING with uncorrelated scalar subquery)
+    /// which would otherwise re-execute the subquery per group (~8000x) and
+    /// time out. Also helps Q2 (correlated subquery in WHERE) by ensuring
+    /// the uncorrelated parts of any nested subqueries are cached.
+    fn precache_subqueries(&self, expr: &Expr2) {
+        match expr {
+            Expr2::Subquery(q) => {
+                let key = (q.as_ref() as *const SelectQuery2) as usize;
+                // Already cached?
+                if self.subquery_cache.borrow().contains_key(&key) {
+                    return;
+                }
+                // Try executing with outer=None. If it succeeds, the subquery
+                // is uncorrelated — cache the result. If it fails (column not
+                // found), it's correlated — leave uncached.
+                let old_outer = self.outer.get();
+                self.outer.set(None);
+                let r = self.execute(q);
+                self.outer.set(old_outer);
+                if let Ok(r) = r {
+                    if let Some(col) = r.columns.first() {
+                        let val = col.values.first().copied().unwrap_or(0);
+                        let vals_slice = col.values.as_slice();
+                        let v = match self.infer_result_type(&col.name, vals_slice) {
+                            ColType::Float => Value2::Float(f64::from_bits(val)),
+                            _ => Value2::Int(val as i64),
+                        };
+                        self.subquery_cache.borrow_mut().insert(key, v);
+                    }
+                }
+            }
+            Expr2::BinOp { left, right, .. } => {
+                self.precache_subqueries(left);
+                self.precache_subqueries(right);
+            }
+            Expr2::Case { whens, else_ } => {
+                for (c, r) in whens {
+                    self.precache_subqueries(c);
+                    self.precache_subqueries(r);
+                }
+                if let Some(e) = else_ { self.precache_subqueries(e); }
+            }
+            Expr2::Like { expr, pattern, .. } => {
+                self.precache_subqueries(expr);
+                self.precache_subqueries(pattern);
+            }
+            Expr2::Between { expr, low, high, .. } => {
+                self.precache_subqueries(expr);
+                self.precache_subqueries(low);
+                self.precache_subqueries(high);
+            }
+            Expr2::InList { expr, list, .. } => {
+                self.precache_subqueries(expr);
+                for e in list { self.precache_subqueries(e); }
+            }
+            Expr2::Neg(e) | Expr2::Not(e) | Expr2::Extract { expr: e, .. } => {
+                self.precache_subqueries(e);
+            }
+            Expr2::Substr { expr, start, len } => {
+                self.precache_subqueries(expr);
+                self.precache_subqueries(start);
+                self.precache_subqueries(len);
+            }
+            Expr2::InSubquery { expr, query, .. } => {
+                self.precache_subqueries(expr);
+                self.precache_subqueries(&Expr2::Subquery(query.clone()));
+            }
+            _ => {}
+        }
+    }
+
+    /// Find columns in the outer table `t` that the subquery references
+    /// (correlation columns). These are column references in the subquery's
+    /// WHERE/SELECT/HAVING that resolve to `t` (the outer table) but NOT to
+    /// the subquery's own FROM tables.
+    ///
+    /// Used to cache correlated subquery results by the outer row's correlation
+    /// values, dramatically reducing redundant subquery executions (e.g. Q17
+    /// goes from ~60k executions to ~200, one per distinct p_partkey).
+    fn find_correlation_cols(&self, subquery: &SelectQuery2, outer_t: &ExecTable) -> Vec<usize> {
+        // Build set of column names available in the subquery's own FROM tables.
+        // A Col ref that resolves to one of these is NOT a correlation column.
+        let mut inner_cols: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for item in &subquery.from {
+            if let FromItem::Table(t) = item {
+                if let Some(table) = self.catalog.get(&t.name) {
+                    for cn in &table.column_names {
+                        inner_cols.insert(cn.to_lowercase());
+                    }
+                }
+            }
+        }
+        let mut cols: Vec<usize> = Vec::new();
+        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        if let Some(ref wc) = subquery.where_clause {
+            self.collect_corr_cols_filtered(wc, outer_t, &inner_cols, &mut cols, &mut seen);
+        }
+        if let Some(ref hv) = subquery.having {
+            self.collect_corr_cols_filtered(hv, outer_t, &inner_cols, &mut cols, &mut seen);
+        }
+        for item in &subquery.select {
+            self.collect_corr_cols_filtered(&item.expr, outer_t, &inner_cols, &mut cols, &mut seen);
+        }
+        cols
+    }
+
+    fn collect_corr_cols_filtered(
+        &self, expr: &Expr2, outer_t: &ExecTable, inner_cols: &std::collections::HashSet<String>,
+        cols: &mut Vec<usize>, seen: &mut std::collections::HashSet<usize>,
+    ) {
+        match expr {
+            Expr2::Col(name) => {
+                // Get short name (after '.') for comparison with inner_cols
+                let short = name.rfind('.').map(|p| &name[p+1..]).unwrap_or(name.as_str());
+                let short_lower = short.to_lowercase();
+                // If the short name resolves to an inner table column, it's NOT a correlation col
+                if inner_cols.contains(&short_lower) {
+                    return;
+                }
+                // Otherwise, check if it resolves to outer_t
+                let idx = outer_t.lookup_col(name).or_else(|| outer_t.lookup_col(short));
+                if let Some(idx) = idx {
+                    if seen.insert(idx) {
+                        cols.push(idx);
+                    }
+                }
+            }
+            Expr2::BinOp { left, right, .. } => {
+                self.collect_corr_cols_filtered(left, outer_t, inner_cols, cols, seen);
+                self.collect_corr_cols_filtered(right, outer_t, inner_cols, cols, seen);
+            }
+            Expr2::Case { whens, else_ } => {
+                for (c, r) in whens {
+                    self.collect_corr_cols_filtered(c, outer_t, inner_cols, cols, seen);
+                    self.collect_corr_cols_filtered(r, outer_t, inner_cols, cols, seen);
+                }
+                if let Some(e) = else_ { self.collect_corr_cols_filtered(e, outer_t, inner_cols, cols, seen); }
+            }
+            Expr2::Like { expr, pattern, .. } => {
+                self.collect_corr_cols_filtered(expr, outer_t, inner_cols, cols, seen);
+                self.collect_corr_cols_filtered(pattern, outer_t, inner_cols, cols, seen);
+            }
+            Expr2::Between { expr, low, high, .. } => {
+                self.collect_corr_cols_filtered(expr, outer_t, inner_cols, cols, seen);
+                self.collect_corr_cols_filtered(low, outer_t, inner_cols, cols, seen);
+                self.collect_corr_cols_filtered(high, outer_t, inner_cols, cols, seen);
+            }
+            Expr2::InList { expr, list, .. } => {
+                self.collect_corr_cols_filtered(expr, outer_t, inner_cols, cols, seen);
+                for e in list { self.collect_corr_cols_filtered(e, outer_t, inner_cols, cols, seen); }
+            }
+            Expr2::Neg(e) | Expr2::Not(e) | Expr2::Extract { expr: e, .. } => {
+                self.collect_corr_cols_filtered(e, outer_t, inner_cols, cols, seen);
+            }
+            Expr2::Substr { expr, start, len } => {
+                self.collect_corr_cols_filtered(expr, outer_t, inner_cols, cols, seen);
+                self.collect_corr_cols_filtered(start, outer_t, inner_cols, cols, seen);
+                self.collect_corr_cols_filtered(len, outer_t, inner_cols, cols, seen);
+            }
+            Expr2::Subquery(_) | Expr2::Exists { .. } | Expr2::InSubquery { .. } => {}
+            _ => {}
+        }
     }
 
     /// Estimate the number of distinct values in a column using a sampling
@@ -1402,7 +1599,14 @@ impl<'a> TpchExec<'a> {
         match expr {
             Expr2::BinOp { op: BinOp2::And, left, right } => {
                 self.eval_bool_mask_vec(left, t, mask)?;
-                let mut rmask = vec![true; t.row_count];
+                // Start rmask from the current mask so that the right side's
+                // per-row eval can skip rows already filtered out by the left
+                // side. This is critical for performance when the right side
+                // is an expensive correlated subquery (e.g. Q17's
+                // `l_quantity < (SELECT ... WHERE l_partkey = p_partkey)`):
+                // without this, the subquery was evaluated for ALL 6M lineitem
+                // rows instead of the ~6k rows surviving the brand/container filter.
+                let mut rmask = mask.to_vec();
                 self.eval_bool_mask_vec(right, t, &mut rmask)?;
                 for i in 0..t.row_count { mask[i] = mask[i] && rmask[i]; }
                 Ok(())
@@ -1587,6 +1791,55 @@ impl<'a> TpchExec<'a> {
                 let lval = self.eval_const(left, t)?;
                 self.apply_comparison(swap_op(op), col_idx, &lval, t, mask, false)?;
                 return Ok(());
+            }
+        }
+        // Try Col(inner) op Col(outer): correlated subquery fast path.
+        // When evaluating a WHERE filter inside a correlated subquery, one
+        // side is an inner column (resolves to `t`) and the other is an
+        // outer column (resolves via `self.outer`). Get the outer value ONCE
+        // and use the vectorized bitmap filter — avoids per-row outer lookups
+        // which made Q17's subquery take 300ms each (× 200 = 60s timeout).
+        if let Some((outer_ptr, outer_row)) = self.outer.get() {
+            let outer_t = unsafe { &*outer_ptr };
+            // Col(inner) op Col(outer)
+            if let Some(col_idx) = self.col_in(left, t) {
+                if let Expr2::Col(rname) = right {
+                    if t.lookup_col(rname).is_none() {
+                        if let Some(outer_idx) = outer_t.lookup_col(rname)
+                            .or_else(|| rname.rfind('.').and_then(|p| outer_t.lookup_col(&rname[p+1..])))
+                        {
+                            let cell = outer_t.columns[outer_idx].get(outer_row).copied().unwrap_or(0);
+                            let rval = match outer_t.col_types[outer_idx] {
+                                ColType::Int => Value2::Int(cell as i64),
+                                ColType::Float => Value2::Float(f64::from_bits(cell)),
+                                ColType::Date => Value2::Date(cell as u32 as i32),
+                                ColType::String => Value2::Int(cell as i64),
+                            };
+                            self.apply_comparison(op, col_idx, &rval, t, mask, false)?;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            // Col(outer) op Col(inner) — swap
+            if let Some(col_idx) = self.col_in(right, t) {
+                if let Expr2::Col(lname) = left {
+                    if t.lookup_col(lname).is_none() {
+                        if let Some(outer_idx) = outer_t.lookup_col(lname)
+                            .or_else(|| lname.rfind('.').and_then(|p| outer_t.lookup_col(&lname[p+1..])))
+                        {
+                            let cell = outer_t.columns[outer_idx].get(outer_row).copied().unwrap_or(0);
+                            let lval = match outer_t.col_types[outer_idx] {
+                                ColType::Int => Value2::Int(cell as i64),
+                                ColType::Float => Value2::Float(f64::from_bits(cell)),
+                                ColType::Date => Value2::Date(cell as u32 as i32),
+                                ColType::String => Value2::Int(cell as i64),
+                            };
+                            self.apply_comparison(swap_op(op), col_idx, &lval, t, mask, false)?;
+                            return Ok(());
+                        }
+                    }
+                }
             }
         }
         // Fallback: per-row eval for Col op Col or complex expressions
@@ -1881,7 +2134,33 @@ impl<'a> TpchExec<'a> {
                 Ok(self.substr(&sv, &st, &ln))
             }
             Expr2::Subquery(q) => {
-                // Set outer context so correlated columns resolve to current row
+                // Check uncorrelated-subquery cache first.
+                let ast_key = (q.as_ref() as *const SelectQuery2) as usize;
+                {
+                    let cache = self.subquery_cache.borrow();
+                    if let Some(v) = cache.get(&ast_key) {
+                        return Ok(v.clone());
+                    }
+                }
+                // Correlated subquery: cache by (ast_key, hash of correlation column values).
+                // Find columns in the outer table `t` that the subquery references.
+                // For Q17 (`l_quantity < (SELECT 0.2 * avg(l_quantity) FROM lineitem WHERE l_partkey = p_partkey)`)
+                // the correlation col is `p_partkey`. Caching by p_partkey value reduces
+                // ~60k subquery executions to ~200 (one per distinct part).
+                let corr_cols = self.find_correlation_cols(q, t);
+                let mut corr_hash: u64 = 0;
+                for &ci in &corr_cols {
+                    let v = t.columns[ci].get(row).copied().unwrap_or(0);
+                    corr_hash = corr_hash.wrapping_mul(0x517cc1b727220a95).wrapping_add(v);
+                }
+                let cache_key = ast_key.wrapping_add((corr_hash.wrapping_mul(0x9E3779B97F4A7C15)) as usize);
+                {
+                    let cache = self.subquery_cache.borrow();
+                    if let Some(v) = cache.get(&cache_key) {
+                        return Ok(v.clone());
+                    }
+                }
+                // Cache miss — execute with outer context (correlated subquery).
                 let old_outer = self.outer.get();
                 self.outer.set(Some((t as *const ExecTable, row)));
                 let r = self.execute(q);
@@ -1890,10 +2169,12 @@ impl<'a> TpchExec<'a> {
                 let val = r.columns.first().and_then(|c| c.values.first()).copied().unwrap_or(0);
                 let name = r.columns.first().map(|c| c.name.as_str()).unwrap_or("");
                 let vals_slice: &[u64] = r.columns.first().map(|c| c.values.as_slice()).unwrap_or(&[]);
-                Ok(match self.infer_result_type(name, vals_slice) {
+                let v = match self.infer_result_type(name, vals_slice) {
                     ColType::Float => Value2::Float(f64::from_bits(val)),
                     _ => Value2::Int(val as i64),
-                })
+                };
+                self.subquery_cache.borrow_mut().insert(cache_key, v.clone());
+                Ok(v)
             }
             Expr2::Exists { query, negated } => {
                 let old_outer = self.outer.get();
@@ -2816,6 +3097,13 @@ impl<'a> TpchExec<'a> {
             Expr2::Between { expr, low, high, .. } => self.expr_has_col(expr) || self.expr_has_col(low) || self.expr_has_col(high),
             Expr2::InList { expr, list, .. } => self.expr_has_col(expr) || list.iter().any(|e| self.expr_has_col(e)),
             Expr2::Substr { expr, start, len } => self.expr_has_col(expr) || self.expr_has_col(start) || self.expr_has_col(len),
+            // Subqueries can reference outer columns (correlated). Treat as
+            // "has column refs" so eval_comparison_vec falls back to per-row
+            // eval, which sets up the correct outer context for each row.
+            // Without this, `Col = (correlated subquery)` was treated as
+            // `Col = const` and the subquery was evaluated ONCE at row 0,
+            // producing wrong results (e.g. Q2 returned 1 row instead of 100).
+            Expr2::Subquery(_) | Expr2::Exists { .. } | Expr2::InSubquery { .. } => true,
             _ => false,
         }
     }
@@ -3321,7 +3609,7 @@ mod tests {
 
     #[test]
     fn test_like_match() {
-        let cat = Catalog::new(); let exec = TpchExec { catalog: &cat, outer: std::cell::Cell::new(None) };
+        let cat = Catalog::new(); let exec = TpchExec { catalog: &cat, outer: std::cell::Cell::new(None), subquery_cache: std::cell::RefCell::new(HashMap::new()) };
         assert!(exec.like("hello world", "%hello%"));
         assert!(exec.like("hello", "hello"));
         assert!(exec.like("hello world", "hello%"));
