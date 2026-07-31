@@ -1041,32 +1041,8 @@ impl<'a> TpchExec<'a> {
         match expr {
             Expr2::Col(name) => {
                 let short = name.rfind('.').map(|p| &name[p+1..]).unwrap_or(name.as_str());
-                // Check if this column is qualified with an inner table alias.
-                // For Q21: `l1.l_orderkey` (outer) vs `l2.l_orderkey` (inner).
-                // Both have short name "l_orderkey" which is in inner_cols.
-                // We must check the qualifier to distinguish.
-                let is_inner = if let Some(dot_pos) = name.find('.') {
-                    let qualifier = &name[..dot_pos].to_lowercase();
-                    // Check if qualifier matches an inner table alias/name.
-                    // If it does, this is an inner column (not correlated).
-                    // If it doesn't, it's a correlation column.
-                    // For now, check if the short name is in inner_cols AND
-                    // the qualifier resolves to an inner table.
-                    // Simple heuristic: if the short name is in inner_cols,
-                    // check if the outer table has this qualified name.
-                    // If outer_t has "qualifier.short", it's a correlation column.
-                    if inner_cols.contains(&short.to_lowercase()) {
-                        // Ambiguous: could be inner or outer. Check if outer_t
-                        // has this qualified name — if so, it's a correlation column.
-                        outer_t.lookup_col(name).is_none() && outer_t.lookup_col(short).is_none()
-                    } else {
-                        false
-                    }
-                } else {
-                    // Unqualified name: check if it's in inner_cols
-                    !inner_cols.contains(&short.to_lowercase())
-                };
-                if !is_inner {
+                // If the column is NOT in inner_cols, it's a correlation column.
+                if !inner_cols.contains(&short.to_lowercase()) {
                     if outer_t.lookup_col(name).is_some() || outer_t.lookup_col(short).is_some() {
                         if seen.insert(name.to_lowercase()) {
                             names.push(name.clone());
