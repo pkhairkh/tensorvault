@@ -12,8 +12,13 @@ use crate::engine::result::{QueryResult, ResultColumn};
 use crate::exec::fm_index::StringSearchColumn;
 use crate::sql::lexer::{tokenize, Token};
 use crate::Error;
-use std::collections::{HashMap, HashSet};
 use rayon::prelude::*;
+
+// Use ahash (hardware AES) instead of std SipHash for all HashMap/HashSet.
+// Perf showed 28% of Q21 time was in SipHash + hashbrown operations.
+// ahash is ~5x faster for u64 keys.
+type HashMap<K, V> = ahash::AHashMap<K, V>;
+type HashSet<T> = ahash::AHashSet<T>;
 
 // =========================================================================
 // Column type tracking
@@ -720,17 +725,17 @@ struct TpchExec<'a> {
     /// column values (l_orderkey where l_commitdate < l_receiptdate) ONCE,
     /// then check membership per outer row. This decorrelates the EXISTS,
     /// reducing ~25k subquery executions to 1 hash-set build + 25k lookups.
-    exists_cache: std::cell::RefCell<HashMap<usize, std::collections::HashSet<u64>>>,
+    exists_cache: std::cell::RefCell<HashMap<usize, HashSet<u64>>>,
     /// Cache for multi-column EXISTS: HashMap<equi_key, HashSet<ineq_col>>.
     /// For Q21's `exists (SELECT * FROM lineitem l2 WHERE l2.l_orderkey = l1.l_orderkey
     /// AND l2.l_suppkey <> l1.l_suppkey)`, we build a HashMap<l_orderkey, HashSet<l_suppkey>>
     /// once, then for each outer row, check if any suppkey in the set != l1.l_suppkey.
-    exists_multi_cache: std::cell::RefCell<HashMap<usize, std::collections::HashMap<u64, std::collections::HashSet<u64>>>>,
+    exists_multi_cache: std::cell::RefCell<HashMap<usize, HashMap<u64, HashSet<u64>>>>,
     /// Cache for uncorrelated IN-subquery result sets: keyed by AST pointer.
     /// When an IN-subquery is uncorrelated (e.g. Q20's `s_suppkey IN (SELECT
     /// ps_suppkey FROM partsupp WHERE ...)`), we execute it ONCE and cache
     /// the set of values. Then per-row eval just checks membership.
-    in_subquery_cache: std::cell::RefCell<HashMap<usize, std::collections::HashSet<u64>>>,
+    in_subquery_cache: std::cell::RefCell<HashMap<usize, HashSet<u64>>>,
     /// Cache for decorrelated correlated scalar subqueries.
     /// When a correlated scalar subquery has an aggregate (sum/avg/min/max)
     /// and multiple correlation columns, we proactively build a derived table:
@@ -741,7 +746,7 @@ struct TpchExec<'a> {
     /// key (ps_partkey, ps_suppkey) has 800k distinct values, each requiring
     /// a 6M-row lineitem scan — the derived table scans lineitem ONCE.
     /// Value: (HashMap<corr_hash, agg_value>, Vec<usize> corr_col_indices_in_outer).
-    decorrelated_cache: std::cell::RefCell<HashMap<usize, (std::collections::HashMap<u64, Value2>, Vec<usize>)>>,
+    decorrelated_cache: std::cell::RefCell<HashMap<usize, (HashMap<u64, Value2>, Vec<usize>)>>,
 }
 
 impl<'a> TpchExec<'a> {
@@ -921,7 +926,7 @@ impl<'a> TpchExec<'a> {
     fn find_correlation_cols(&self, subquery: &SelectQuery2, outer_t: &ExecTable) -> Vec<usize> {
         // Build set of column names available in the subquery's own FROM tables.
         // A Col ref that resolves to one of these is NOT a correlation column.
-        let mut inner_cols: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut inner_cols: HashSet<String> = HashSet::new();
         for item in &subquery.from {
             if let FromItem::Table(t) = item {
                 if let Some(table) = self.catalog.get(&t.name) {
@@ -932,7 +937,7 @@ impl<'a> TpchExec<'a> {
             }
         }
         let mut cols: Vec<usize> = Vec::new();
-        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut seen: HashSet<usize> = HashSet::new();
         if let Some(ref wc) = subquery.where_clause {
             self.collect_corr_cols_filtered(wc, outer_t, &inner_cols, &mut cols, &mut seen);
         }
@@ -946,8 +951,8 @@ impl<'a> TpchExec<'a> {
     }
 
     fn collect_corr_cols_filtered(
-        &self, expr: &Expr2, outer_t: &ExecTable, inner_cols: &std::collections::HashSet<String>,
-        cols: &mut Vec<usize>, seen: &mut std::collections::HashSet<usize>,
+        &self, expr: &Expr2, outer_t: &ExecTable, inner_cols: &HashSet<String>,
+        cols: &mut Vec<usize>, seen: &mut HashSet<usize>,
     ) {
         match expr {
             Expr2::Col(name) => {
@@ -1018,8 +1023,8 @@ impl<'a> TpchExec<'a> {
     /// to determine if a column reference is inner or correlated (outer).
     fn is_conjunct_correlated_wrt_inner(
         &self, expr: &Expr2,
-        inner_cols: &std::collections::HashSet<String>,
-        inner_aliases: &std::collections::HashSet<String>,
+        inner_cols: &HashSet<String>,
+        inner_aliases: &HashSet<String>,
     ) -> bool {
         match expr {
             Expr2::Col(name) => {
@@ -1082,7 +1087,7 @@ impl<'a> TpchExec<'a> {
     ///   0.5 * sum(l_quantity), caches HashMap<(l_partkey,l_suppkey)_hash, threshold>.
     fn try_decorrelate_subquery(
         &self, subquery: &SelectQuery2, outer_t: &ExecTable,
-    ) -> Result<Option<(std::collections::HashMap<u64, Value2>, Vec<usize>)>, Error> {
+    ) -> Result<Option<(HashMap<u64, Value2>, Vec<usize>)>, Error> {
         // Only decorrelate if the subquery has exactly 1 SELECT item that is
         // an aggregate (or a scalar function of an aggregate, like 0.2 * avg(x)).
         if subquery.select.len() != 1 { return Ok(None); }
@@ -1098,8 +1103,8 @@ impl<'a> TpchExec<'a> {
         if subquery.from.len() != 1 { return Ok(None); }
 
         // Build inner column name set and inner table aliases.
-        let mut inner_cols: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut inner_aliases: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut inner_cols: HashSet<String> = HashSet::new();
+        let mut inner_aliases: HashSet<String> = HashSet::new();
         for item in &subquery.from {
             if let FromItem::Table(t) = item {
                 inner_aliases.insert(t.name.to_lowercase());
@@ -1160,8 +1165,8 @@ impl<'a> TpchExec<'a> {
 
         // Check that every correlation column found has a matching equi-join.
         // (corr_cols and corr_to_inner outer indices should match.)
-        let corr_outer_indices: std::collections::HashSet<usize> = corr_cols.iter().copied().collect();
-        let matched_outer_indices: std::collections::HashSet<usize> = corr_to_inner.iter().map(|(oi, _, _, _)| *oi).collect();
+        let corr_outer_indices: HashSet<usize> = corr_cols.iter().copied().collect();
+        let matched_outer_indices: HashSet<usize> = corr_to_inner.iter().map(|(oi, _, _, _)| *oi).collect();
         if corr_outer_indices != matched_outer_indices {
             return Ok(None);
         }
@@ -1213,7 +1218,7 @@ impl<'a> TpchExec<'a> {
         let agg_expr = &subquery.select[0].expr;
         let inner_corr_indices: Vec<usize> = corr_to_inner.iter().map(|(_, ii, _, _)| *ii).collect();
         // Group rows by composite hash of inner corr cols.
-        let mut groups: std::collections::HashMap<u64, Vec<usize>> = std::collections::HashMap::new();
+        let mut groups: HashMap<u64, Vec<usize>> = HashMap::new();
         for i in 0..base.row_count {
             if !mask[i] { continue; }
             let mut h: u64 = 0;
@@ -1225,7 +1230,7 @@ impl<'a> TpchExec<'a> {
         }
 
         // For each group, compute the aggregate value.
-        let mut result_map: std::collections::HashMap<u64, Value2> = std::collections::HashMap::with_capacity(groups.len());
+        let mut result_map: HashMap<u64, Value2> = HashMap::with_capacity(groups.len());
         for (hash, indices) in &groups {
             let v = self.eval_agg_expr(agg_expr, &base, indices)?;
             result_map.insert(*hash, v);
@@ -1239,7 +1244,7 @@ impl<'a> TpchExec<'a> {
 
     fn find_exists_equi_join(&self, subquery: &SelectQuery2, outer_t: &ExecTable) -> Option<(usize, usize)> {
         // Build inner column name set (subquery's own FROM tables)
-        let mut inner_cols: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut inner_cols: HashSet<String> = HashSet::new();
         for item in &subquery.from {
             if let FromItem::Table(t) = item {
                 if let Some(table) = self.catalog.get(&t.name) {
@@ -1251,7 +1256,7 @@ impl<'a> TpchExec<'a> {
         }
         // Find correlation columns (in outer_t but not in inner tables)
         let mut corr_names: Vec<String> = Vec::new();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen: HashSet<String> = HashSet::new();
         if let Some(ref wc) = subquery.where_clause {
             self.collect_corr_names(wc, outer_t, &inner_cols, &mut corr_names, &mut seen);
         }
@@ -1271,8 +1276,8 @@ impl<'a> TpchExec<'a> {
     }
 
     fn collect_corr_names(
-        &self, expr: &Expr2, outer_t: &ExecTable, inner_cols: &std::collections::HashSet<String>,
-        names: &mut Vec<String>, seen: &mut std::collections::HashSet<String>,
+        &self, expr: &Expr2, outer_t: &ExecTable, inner_cols: &HashSet<String>,
+        names: &mut Vec<String>, seen: &mut HashSet<String>,
     ) {
         match expr {
             Expr2::Col(name) => {
@@ -1328,9 +1333,9 @@ impl<'a> TpchExec<'a> {
     /// short name (e.g. Q21's l1.l_orderkey vs l2.l_orderkey).
     fn collect_corr_names_qualified(
         &self, expr: &Expr2, outer_t: &ExecTable,
-        inner_cols: &std::collections::HashSet<String>,
-        inner_aliases: &std::collections::HashSet<String>,
-        names: &mut Vec<String>, seen: &mut std::collections::HashSet<String>,
+        inner_cols: &HashSet<String>,
+        inner_aliases: &HashSet<String>,
+        names: &mut Vec<String>, seen: &mut HashSet<String>,
     ) {
         match expr {
             Expr2::Col(name) => {
@@ -1389,7 +1394,7 @@ impl<'a> TpchExec<'a> {
     /// Find `Col(inner) = Col(outer_name)` or reverse in a WHERE expr.
     /// Returns the inner column index (in the subquery's own FROM table).
     fn find_equi_join_inner(
-        &self, expr: &Expr2, outer_name: &str, inner_cols: &std::collections::HashSet<String>,
+        &self, expr: &Expr2, outer_name: &str, inner_cols: &HashSet<String>,
         subquery: &SelectQuery2, outer_t: &ExecTable,
     ) -> Option<usize> {
         match expr {
@@ -1446,7 +1451,7 @@ impl<'a> TpchExec<'a> {
     /// uncorrelated conjuncts are applied).
     ///
     /// For Q4: `SELECT DISTINCT l_orderkey FROM lineitem WHERE l_commitdate < l_receiptdate`
-    fn build_exists_hashset(&self, subquery: &SelectQuery2, inner_col_idx: usize) -> Result<std::collections::HashSet<u64>, Error> {
+    fn build_exists_hashset(&self, subquery: &SelectQuery2, inner_col_idx: usize) -> Result<HashSet<u64>, Error> {
         // Load the subquery's FROM table(s) and join them (no correlation).
         let mut tables: Vec<ExecTable> = Vec::new();
         for item in &subquery.from {
@@ -1479,10 +1484,10 @@ impl<'a> TpchExec<'a> {
         const CHUNK_SIZE: usize = 65536;
         let n = base.row_count;
         let num_chunks = (n + CHUNK_SIZE - 1) / CHUNK_SIZE;
-        let local_sets: Vec<std::collections::HashSet<u64>> = (0..num_chunks).into_par_iter().map(|chunk_idx| {
+        let local_sets: Vec<HashSet<u64>> = (0..num_chunks).into_par_iter().map(|chunk_idx| {
             let start = chunk_idx * CHUNK_SIZE;
             let end = std::cmp::min(start + CHUNK_SIZE, n);
-            let mut local = std::collections::HashSet::with_capacity(end - start);
+            let mut local = HashSet::with_capacity(end - start);
             for i in start..end {
                 if mask[i] {
                     local.insert(col[i]);
@@ -1491,7 +1496,7 @@ impl<'a> TpchExec<'a> {
             local
         }).collect();
         // Merge local sets into final set
-        let mut set = std::collections::HashSet::with_capacity(base.row_count);
+        let mut set = HashSet::with_capacity(base.row_count);
         for local in local_sets {
             set.extend(local);
         }
@@ -1573,8 +1578,8 @@ impl<'a> TpchExec<'a> {
     /// outer_neq=l1.l_suppkey, inner_neq=l2.l_suppkey.
     fn find_exists_multi_col(&self, subquery: &SelectQuery2, outer_t: &ExecTable) -> Option<(usize, usize, usize, usize)> {
         // Build inner column name set and inner table aliases
-        let mut inner_cols: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut inner_aliases: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut inner_cols: HashSet<String> = HashSet::new();
+        let mut inner_aliases: HashSet<String> = HashSet::new();
         for item in &subquery.from {
             if let FromItem::Table(t) = item {
                 inner_aliases.insert(t.name.to_lowercase());
@@ -1590,7 +1595,7 @@ impl<'a> TpchExec<'a> {
         }
         // Find correlation columns
         let mut corr_names: Vec<String> = Vec::new();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen: HashSet<String> = HashSet::new();
         if let Some(ref wc) = subquery.where_clause {
             self.collect_corr_names_qualified(wc, outer_t, &inner_cols, &inner_aliases, &mut corr_names, &mut seen);
         }
@@ -1645,7 +1650,7 @@ impl<'a> TpchExec<'a> {
 
     /// Check if a column name refers to an inner table column.
     /// Uses the qualifier (if present) to distinguish inner from outer.
-    fn col_is_inner(&self, name: &str, inner_aliases: &std::collections::HashSet<String>, inner_cols: &std::collections::HashSet<String>) -> bool {
+    fn col_is_inner(&self, name: &str, inner_aliases: &HashSet<String>, inner_cols: &HashSet<String>) -> bool {
         if let Some(dot_pos) = name.find('.') {
             let qualifier = name[..dot_pos].to_lowercase();
             inner_aliases.contains(&qualifier)
@@ -1656,7 +1661,7 @@ impl<'a> TpchExec<'a> {
 
     /// Build HashMap<equi_key, HashSet<ineq_col>> from the subquery's inner
     /// table, applying only uncorrelated conjuncts.
-    fn build_exists_multi_map(&self, subquery: &SelectQuery2, inner_eq_idx: usize, inner_neq_idx: usize) -> Result<std::collections::HashMap<u64, std::collections::HashSet<u64>>, Error> {
+    fn build_exists_multi_map(&self, subquery: &SelectQuery2, inner_eq_idx: usize, inner_neq_idx: usize) -> Result<HashMap<u64, HashSet<u64>>, Error> {
         let mut tables: Vec<ExecTable> = Vec::new();
         for item in &subquery.from {
             tables.push(self.resolve_from_item(item)?);
@@ -1684,10 +1689,10 @@ impl<'a> TpchExec<'a> {
         const CHUNK_SIZE: usize = 65536;
         let n = base.row_count;
         let num_chunks = (n + CHUNK_SIZE - 1) / CHUNK_SIZE;
-        let local_maps: Vec<std::collections::HashMap<u64, std::collections::HashSet<u64>>> = (0..num_chunks).into_par_iter().map(|chunk_idx| {
+        let local_maps: Vec<HashMap<u64, HashSet<u64>>> = (0..num_chunks).into_par_iter().map(|chunk_idx| {
             let start = chunk_idx * CHUNK_SIZE;
             let end = std::cmp::min(start + CHUNK_SIZE, n);
-            let mut local: std::collections::HashMap<u64, std::collections::HashSet<u64>> = std::collections::HashMap::new();
+            let mut local: HashMap<u64, HashSet<u64>> = HashMap::new();
             for i in start..end {
                 if mask[i] {
                     local.entry(eq_col[i]).or_default().insert(neq_col[i]);
@@ -1696,7 +1701,7 @@ impl<'a> TpchExec<'a> {
             local
         }).collect();
         // Merge local maps into final map
-        let mut map: std::collections::HashMap<u64, std::collections::HashSet<u64>> = std::collections::HashMap::new();
+        let mut map: HashMap<u64, HashSet<u64>> = HashMap::new();
         for local in local_maps {
             for (k, v) in local {
                 map.entry(k).or_default().extend(v);
@@ -3252,14 +3257,14 @@ impl<'a> TpchExec<'a> {
                     match r {
                         Ok(r) => {
                             if let Some(col) = r.columns.first() {
-                                let set: std::collections::HashSet<u64> = col.values.iter().copied().collect();
+                                let set: HashSet<u64> = col.values.iter().copied().collect();
                                 self.in_subquery_cache.borrow_mut().insert(ast_key, set);
                             }
                         }
                         Err(_) => {
                             // Correlated — mark as empty set so we don't retry.
                             // Per-row eval with outer context will handle it.
-                            self.in_subquery_cache.borrow_mut().insert(ast_key, std::collections::HashSet::new());
+                            self.in_subquery_cache.borrow_mut().insert(ast_key, HashSet::new());
                         }
                     }
                 }

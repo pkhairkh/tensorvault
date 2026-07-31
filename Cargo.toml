@@ -32,6 +32,9 @@ parking_lot = "0.12"
 # Global allocator — replaces glibc ptmalloc2 (50% of query time was in
 # malloc_consolidate + free). mimalloc has thread-local heaps.
 mimalloc = { version = "0.1", features = ["override"] }
+# Fast hashing — replaces std SipHash (9% of Q21 time) with hardware AES.
+# Used for all HashMap/HashSet in tpch.rs via type aliases.
+ahash = "0.8"
 # CPU detection
 raw-cpuid = "11.0"
 # Logging
