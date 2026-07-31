@@ -1926,6 +1926,10 @@ impl<'a> TpchExec<'a> {
             let end = std::cmp::min(start + CHUNK_SIZE, probe_row_count);
 
             let mut local_out: Vec<Vec<u64>> = (0..ncol).map(|_| Vec::with_capacity(CHUNK_SIZE * 2)).collect();
+            // Reuse matched_rows buffer across probe iterations to avoid
+            // per-probe malloc/free churn (was #1 perf bottleneck — 49% of
+            // time in malloc/free/memmove per perf profile).
+            let mut matched_rows: Vec<u32> = Vec::with_capacity(16);
 
             for p in start..end {
                 let probe_key = if keys.len() == 1 {
@@ -1951,7 +1955,6 @@ impl<'a> TpchExec<'a> {
                     }
                     continue;
                 }
-                let mut matched_rows: Vec<u32> = Vec::new();
                 build_hash.probe_all(probe_key, &mut matched_rows);
                 if matched_rows.is_empty() {
                     if jt == JoinType2::Left && !swapped {
@@ -1959,7 +1962,7 @@ impl<'a> TpchExec<'a> {
                         for c in 0..right.columns.len() { local_out[left_ncol + c].push(0); }
                     }
                 } else {
-                    for b in matched_rows {
+                    for &b in &matched_rows {
                         let b = b as usize;
                         if !swapped {
                             for (c, col) in left.columns.iter().enumerate() { local_out[c].push(col[p]); }
