@@ -241,6 +241,16 @@ impl TpchParser {
     fn parse_select_list(&mut self) -> Result<Vec<SelectItem2>, String> {
         let mut items = Vec::new();
         loop {
+            // Handle SELECT * — common in EXISTS subqueries.
+            // Treat as SELECT 1 (column values don't matter for EXISTS).
+            if let Token::Op(op) = self.peek() {
+                if op == "*" {
+                    self.next();
+                    items.push(SelectItem2 { expr: Expr2::Int(1), alias: None });
+                    if !self.match_comma() { break; }
+                    continue;
+                }
+            }
             let expr = self.parse_expr()?;
             let alias = if self.match_kw("AS") {
                 Some(self.parse_ident_name()?)
@@ -675,10 +685,17 @@ impl Value2 {
 }
 
 pub fn execute_tpch(query: &SelectQuery2, catalog: &Catalog) -> Result<QueryResult, Error> {
-    TpchExec { catalog }.execute(query)
+    TpchExec { catalog, outer: std::cell::Cell::new(None) }.execute(query)
 }
 
-struct TpchExec<'a> { catalog: &'a Catalog }
+struct TpchExec<'a> {
+    catalog: &'a Catalog,
+    /// Outer context for correlated subqueries: (outer_table_ptr, outer_row).
+    /// Set when entering a subquery eval, restored after. Uses raw pointer
+    /// for lifetime erasure (safe because the outer table is valid for the
+    /// duration of the synchronous subquery execution).
+    outer: std::cell::Cell<Option<(*const ExecTable, usize)>>,
+}
 
 impl<'a> TpchExec<'a> {
     fn execute(&self, query: &SelectQuery2) -> Result<QueryResult, Error> {
@@ -1006,6 +1023,14 @@ impl<'a> TpchExec<'a> {
                 self.collect_table_refs(expr, tables, refs);
                 for item in list { self.collect_table_refs(item, tables, refs); }
             }
+            Expr2::Subquery(_) | Expr2::Exists { .. } | Expr2::InSubquery { .. } => {
+                // Correlated subqueries can reference any outer table.
+                // Mark ALL tables as referenced so this expression is NOT
+                // applied as a single-table filter before the join.
+                for i in 0..tables.len() {
+                    refs.insert(i);
+                }
+            }
             Expr2::Case { whens, else_ } => {
                 for (c, r) in whens {
                     self.collect_table_refs(c, tables, refs);
@@ -1332,7 +1357,9 @@ impl<'a> TpchExec<'a> {
                             // Get pattern as string
                             let pat = if let Expr2::Str(s) = pattern.as_ref() { s.clone() }
                                 else { self.eval(pattern, t, 0).ok().and_then(|v| v.as_str().map(|s| s.to_string())).unwrap_or_default() };
-                            if !pat.is_empty() {
+                            if !pat.is_empty() && sc.len() >= t.row_count {
+                                // Only use StringSearchColumn if it has enough rows
+                                // (after a join, the string column may have the wrong length)
                                 let like_mask = self.like_mask(sc, &pat);
                                 for i in 0..t.row_count {
                                     if *negated { mask[i] = mask[i] && !like_mask[i]; }
@@ -1553,20 +1580,83 @@ impl<'a> TpchExec<'a> {
     fn eval(&self, expr: &Expr2, t: &ExecTable, row: usize) -> Result<Value2, Error> {
         match expr {
             Expr2::Col(name) => {
-                let idx = t.lookup_col(name).ok_or_else(|| Error::NotFound(format!("column '{}'", name)))?;
-                let cell = t.columns[idx].get(row).copied().unwrap_or(0);
-                Ok(match t.col_types[idx] {
-                    ColType::Int => Value2::Int(cell as i64),
-                    ColType::Float => Value2::Float(f64::from_bits(cell)),
-                    ColType::Date => Value2::Date(cell as u32 as i32),
-                    ColType::String => {
-                        if let Some(ref sc) = t.string_columns[idx] {
-                            Value2::Str(sc.get(row).to_string())
-                        } else {
-                            Value2::Int(cell as i64) // hash value after join
+                // Try current table first
+                if let Some(idx) = t.lookup_col(name) {
+                    let cell = t.columns[idx].get(row).copied().unwrap_or(0);
+                    return Ok(match t.col_types[idx] {
+                        ColType::Int => Value2::Int(cell as i64),
+                        ColType::Float => Value2::Float(f64::from_bits(cell)),
+                        ColType::Date => Value2::Date(cell as u32 as i32),
+                        ColType::String => {
+                            if let Some(ref sc) = t.string_columns[idx] {
+                                Value2::Str(sc.get(row).to_string())
+                            } else {
+                                Value2::Int(cell as i64)
+                            }
+                        }
+                    });
+                }
+                // Try qualified name: if name contains '.', try the part after '.'
+                if let Some(dot_pos) = name.rfind('.') {
+                    let short_name = &name[dot_pos+1..];
+                    if let Some(idx) = t.lookup_col(short_name) {
+                        let cell = t.columns[idx].get(row).copied().unwrap_or(0);
+                        return Ok(match t.col_types[idx] {
+                            ColType::Int => Value2::Int(cell as i64),
+                            ColType::Float => Value2::Float(f64::from_bits(cell)),
+                            ColType::Date => Value2::Date(cell as u32 as i32),
+                            ColType::String => {
+                                if let Some(ref sc) = t.string_columns[idx] {
+                                    Value2::Str(sc.get(row).to_string())
+                                } else {
+                                    Value2::Int(cell as i64)
+                                }
+                            }
+                        });
+                    }
+                }
+                // Check outer context (correlated subquery)
+                if let Some((outer_ptr, outer_row)) = self.outer.get() {
+                    // SAFETY: outer_ptr was set by our own code and points to
+                    // an ExecTable that is valid for the duration of this eval.
+                    let outer_t = unsafe { &*outer_ptr };
+                    // Try full name
+                    if let Some(idx) = outer_t.lookup_col(name) {
+                        let cell = outer_t.columns[idx].get(outer_row).copied().unwrap_or(0);
+                        return Ok(match outer_t.col_types[idx] {
+                            ColType::Int => Value2::Int(cell as i64),
+                            ColType::Float => Value2::Float(f64::from_bits(cell)),
+                            ColType::Date => Value2::Date(cell as u32 as i32),
+                            ColType::String => {
+                                if let Some(ref sc) = outer_t.string_columns[idx] {
+                                    Value2::Str(sc.get(outer_row).to_string())
+                                } else {
+                                    Value2::Int(cell as i64)
+                                }
+                            }
+                        });
+                    }
+                    // Try short name (after '.')
+                    if let Some(dot_pos) = name.rfind('.') {
+                        let short_name = &name[dot_pos+1..];
+                        if let Some(idx) = outer_t.lookup_col(short_name) {
+                            let cell = outer_t.columns[idx].get(outer_row).copied().unwrap_or(0);
+                            return Ok(match outer_t.col_types[idx] {
+                                ColType::Int => Value2::Int(cell as i64),
+                                ColType::Float => Value2::Float(f64::from_bits(cell)),
+                                ColType::Date => Value2::Date(cell as u32 as i32),
+                                ColType::String => {
+                                    if let Some(ref sc) = outer_t.string_columns[idx] {
+                                        Value2::Str(sc.get(outer_row).to_string())
+                                    } else {
+                                        Value2::Int(cell as i64)
+                                    }
+                                }
+                            });
                         }
                     }
-                })
+                }
+                Err(Error::NotFound(format!("column '{}'", name)))
             }
             Expr2::Int(i) => Ok(Value2::Int(*i)),
             Expr2::Float(f) => Ok(Value2::Float(*f)),
@@ -1636,7 +1726,12 @@ impl<'a> TpchExec<'a> {
                 Ok(self.substr(&sv, &st, &ln))
             }
             Expr2::Subquery(q) => {
-                let r = self.execute(q)?;
+                // Set outer context so correlated columns resolve to current row
+                let old_outer = self.outer.get();
+                self.outer.set(Some((t as *const ExecTable, row)));
+                let r = self.execute(q);
+                self.outer.set(old_outer);
+                let r = r?;
                 let val = r.columns.first().and_then(|c| c.values.first()).copied().unwrap_or(0);
                 let name = r.columns.first().map(|c| c.name.as_str()).unwrap_or("");
                 Ok(match self.infer_result_type(name) {
@@ -1645,13 +1740,21 @@ impl<'a> TpchExec<'a> {
                 })
             }
             Expr2::Exists { query, negated } => {
-                let r = self.execute(query)?;
+                let old_outer = self.outer.get();
+                self.outer.set(Some((t as *const ExecTable, row)));
+                let r = self.execute(query);
+                self.outer.set(old_outer);
+                let r = r?;
                 let ex = r.row_count > 0;
                 Ok(Value2::Int(if if *negated { !ex } else { ex } { 1 } else { 0 }))
             }
             Expr2::InSubquery { expr, query, negated } => {
                 let v = self.eval(expr, t, row)?;
-                let r = self.execute(query)?;
+                let old_outer = self.outer.get();
+                self.outer.set(Some((t as *const ExecTable, row)));
+                let r = self.execute(query);
+                self.outer.set(old_outer);
+                let r = r?;
                 let mut found = false;
                 if let Some(col) = r.columns.first() {
                     for &cell in &col.values {
@@ -2456,7 +2559,7 @@ mod tests {
 
     #[test]
     fn test_like_match() {
-        let cat = Catalog::new(); let exec = TpchExec { catalog: &cat };
+        let cat = Catalog::new(); let exec = TpchExec { catalog: &cat, outer: std::cell::Cell::new(None) };
         assert!(exec.like("hello world", "%hello%"));
         assert!(exec.like("hello", "hello"));
         assert!(exec.like("hello world", "hello%"));
