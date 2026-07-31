@@ -6,3 +6,4 @@ pub mod subquery;
 pub mod vectorized;
 pub mod bitmap;
 pub mod fm_index;
+pub mod join_hash_table;

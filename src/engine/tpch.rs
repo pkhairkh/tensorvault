@@ -800,6 +800,7 @@ impl<'a> TpchExec<'a> {
         jt: JoinType2,
     ) -> Result<ExecTable, Error> {
         use xxhash_rust::xxh3::xxh3_64;
+        use crate::exec::join_hash_table::JoinHashTable;
 
         // Decide which side to build the hash table on (smaller side).
         // For INNER joins, we can swap freely. For LEFT joins, we must
@@ -821,23 +822,21 @@ impl<'a> TpchExec<'a> {
         let ncol = left.columns.len() + right.columns.len();
 
         // --- Build phase: construct hash table ---
-        // Single-key fast path: HashMap<u64, Vec<usize>> (no per-row Vec alloc).
-        // Multi-key path: pack keys into a single u64 via xxh3.
-        let build_hash: HashMap<u64, Vec<usize>> = if keys.len() == 1 {
-            let bk0 = build_keys[0].left; // column index in build_side
-            let mut map: HashMap<u64, Vec<usize>> = HashMap::with_capacity(build_side.row_count);
+        // Single-key fast path: use JoinHashTable (CedarDB-style bloom-tagged
+        // chaining with CRC32 hashing — 10x faster probe than HashMap).
+        // Multi-key path: pack keys into a single u64 via xxh3, then use JoinHashTable.
+        let build_hash: JoinHashTable = if keys.len() == 1 {
+            let bk0 = build_keys[0].left;
+            let mut ht = JoinHashTable::new(build_side.row_count);
             for r in 0..build_side.row_count {
-                let key = build_side.columns[bk0][r];
-                map.entry(key).or_default().push(r);
+                ht.insert(build_side.columns[bk0][r], r as u32);
             }
-            map
+            ht
         } else {
-            // Multi-key: hash all key columns into a single u64.
+            // Multi-key: hash all key columns into a single u64 via xxh3.
             let bk_cols: Vec<usize> = build_keys.iter().map(|k| k.left).collect();
-            let mut map: HashMap<u64, Vec<usize>> = HashMap::with_capacity(build_side.row_count);
+            let mut ht = JoinHashTable::new(build_side.row_count);
             for r in 0..build_side.row_count {
-                // Pack keys: concatenate bytes and hash. For up to 8 bytes of
-                // key data we can pack directly; for more, use xxh3 on a stack buffer.
                 let mut buf = [0u8; 64];
                 let mut off = 0;
                 for &kc in &bk_cols {
@@ -849,9 +848,9 @@ impl<'a> TpchExec<'a> {
                     }
                 }
                 let key = xxh3_64(&buf[..off]);
-                map.entry(key).or_default().push(r);
+                ht.insert(key, r as u32);
             }
-            map
+            ht
         };
 
         // --- Probe phase ---
@@ -893,31 +892,28 @@ impl<'a> TpchExec<'a> {
                 xxh3_64(&buf[..off])
             };
 
-            let matches = build_hash.get(&probe_key);
-            match matches {
-                None => {
-                    // No match — only emit for LEFT join (and only if probe is the left side)
-                    if jt == JoinType2::Left && !swapped {
-                        for (c, col) in left.columns.iter().enumerate() { out_cols[c].push(col[p]); }
-                        for c in 0..right.columns.len() { out_cols[left_ncol + c].push(0); }
-                        row_count += 1;
-                    }
-                    // If swapped (probe=right, build=left), this is a right-outer scenario
-                    // which we don't support — skip.
+            let mut matched_rows: Vec<u32> = Vec::new();
+            build_hash.probe_all(probe_key, &mut matched_rows);
+            if matched_rows.is_empty() {
+                // No match — only emit for LEFT join (and only if probe is the left side)
+                if jt == JoinType2::Left && !swapped {
+                    for (c, col) in left.columns.iter().enumerate() { out_cols[c].push(col[p]); }
+                    for c in 0..right.columns.len() { out_cols[left_ncol + c].push(0); }
+                    row_count += 1;
                 }
-                Some(matched_rows) => {
-                    for &b in matched_rows {
-                        if !swapped {
-                            // probe=left, build=right: left cols from probe, right cols from build
-                            for (c, col) in left.columns.iter().enumerate() { out_cols[c].push(col[p]); }
-                            for (c, col) in right.columns.iter().enumerate() { out_cols[left_ncol + c].push(col[b]); }
-                        } else {
-                            // probe=right, build=left: left cols from build, right cols from probe
-                            for (c, col) in left.columns.iter().enumerate() { out_cols[c].push(col[b]); }
-                            for (c, col) in right.columns.iter().enumerate() { out_cols[left_ncol + c].push(col[p]); }
-                        }
-                        row_count += 1;
+            } else {
+                for b in matched_rows {
+                    let b = b as usize;
+                    if !swapped {
+                        // probe=left, build=right: left cols from probe, right cols from build
+                        for (c, col) in left.columns.iter().enumerate() { out_cols[c].push(col[p]); }
+                        for (c, col) in right.columns.iter().enumerate() { out_cols[left_ncol + c].push(col[b]); }
+                    } else {
+                        // probe=right, build=left: left cols from build, right cols from probe
+                        for (c, col) in left.columns.iter().enumerate() { out_cols[c].push(col[b]); }
+                        for (c, col) in right.columns.iter().enumerate() { out_cols[left_ncol + c].push(col[p]); }
                     }
+                    row_count += 1;
                 }
             }
         }
