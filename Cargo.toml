@@ -27,6 +27,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 anyhow = "1"
 thiserror = "1"
 # Concurrency
+rayon = "1"
 parking_lot = "0.12"
 # CPU detection
 raw-cpuid = "11.0"
