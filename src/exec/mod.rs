@@ -8,3 +8,4 @@ pub mod vectorized;
 pub mod bitmap;
 pub mod fm_index;
 pub mod join_hash_table;
+pub mod bloom_filter;
