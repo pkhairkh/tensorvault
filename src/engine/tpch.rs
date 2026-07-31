@@ -750,17 +750,13 @@ impl<'a> TpchExec<'a> {
         }
 
         // 2. Handle explicit JOINs on the first table.
-        // After each join, apply non-equi-join ON conditions (e.g. NOT LIKE)
-        // as a filter. The equi-join keys are handled by hash_join; the
-        // remaining conjuncts (LIKE, IN, <, >, etc.) are applied here.
-        // For LEFT JOIN, unmatched left rows have right cols = 0, which
-        // pass NOT LIKE filters (0 interpreted as Int, not matching %pattern%).
+        // hash_join now applies non-equi-join ON conditions (LIKE, IN, <, >)
+        // per-match during the join, with proper LEFT JOIN handling for
+        // unmatched left rows.
         for join in &query.joins {
             let right = self.resolve_from_item(&join.table)?;
             let left = tables.pop().unwrap();
-            let joined = self.hash_join(left, right, &join.on, join.join_type)?;
-            let filtered = self.apply_non_equi_join_filter(joined, &join.on)?;
-            tables.push(filtered);
+            tables.push(self.hash_join(left, right, &join.on, join.join_type)?);
         }
 
         // 3. Build base table — use hash joins for implicit multi-table joins.
@@ -1861,6 +1857,16 @@ impl<'a> TpchExec<'a> {
         let keys = self.extract_join_keys(on, &left, &right)?;
         if keys.is_empty() { return Ok(self.cross_join(left, right)); }
 
+        // Split ON into equi-join keys and non-equi-join conjuncts.
+        // Non-equi-join conjuncts (LIKE, IN, <, >, etc.) are applied per-match
+        // during the join — this ensures LEFT JOIN emits unmatched left rows
+        // when all matches are filtered out by the non-equi-join conditions.
+        let on_conjuncts = self.split_conjuncts(&Some(on.clone()));
+        let non_equi: Vec<Expr2> = on_conjuncts.iter().filter(|c| {
+            !matches!(c, Expr2::BinOp { op: BinOp2::Eq, left, right }
+                if matches!(left.as_ref(), Expr2::Col(_)) && matches!(right.as_ref(), Expr2::Col(_)))
+        }).cloned().collect();
+
         let mut build: HashMap<Vec<u64>, Vec<usize>> = HashMap::new();
         for r in 0..right.row_count {
             let key: Vec<u64> = keys.iter().map(|k| right.columns[k.right][r]).collect();
@@ -1877,19 +1883,50 @@ impl<'a> TpchExec<'a> {
         out_names.extend(right.column_names.clone());
         let mut row_count = 0;
 
+        let left_ncol = left.columns.len();
+
+        // Pre-build the combined col_map once (reused per match).
+        let combined_col_map: HashMap<String, usize> = {
+            let mut m = HashMap::new();
+            for (i, name) in out_names.iter().enumerate() {
+                m.entry(name.to_lowercase()).or_insert(i);
+            }
+            for (k, v) in &left.col_map { m.insert(k.clone(), *v); }
+            let off = left_ncol;
+            for (k, v) in &right.col_map { m.insert(k.clone(), *v + off); }
+            m
+        };
+
+        // Build a single combined row (left[l] + right[r]) for non-equi-join eval.
+        // We do this per match — non_equi is usually short (1-2 conjuncts).
         for l in 0..left.row_count {
             let key: Vec<u64> = keys.iter().map(|k| left.columns[k.left][l]).collect();
             let matches = build.get(&key).cloned().unwrap_or_default();
             if matches.is_empty() {
                 if jt == JoinType2::Left {
                     for (c, col) in left.columns.iter().enumerate() { out_cols[c].push(col[l]); }
-                    for c in 0..right.columns.len() { out_cols[left.columns.len() + c].push(0); }
+                    for c in 0..right.columns.len() { out_cols[left_ncol + c].push(0); }
                     row_count += 1;
                 }
             } else {
+                let mut any_match_passed = false;
                 for r in &matches {
+                    // Apply non-equi-join conjuncts per match.
+                    if !non_equi.is_empty() {
+                        if !self.eval_non_equi_match(&non_equi, &left, l, &right, *r, &out_names, &out_types, &combined_col_map, left_ncol, ncol)? {
+                            continue;
+                        }
+                    }
+                    any_match_passed = true;
                     for (c, col) in left.columns.iter().enumerate() { out_cols[c].push(col[l]); }
-                    for (c, col) in right.columns.iter().enumerate() { out_cols[left.columns.len() + c].push(col[*r]); }
+                    for (c, col) in right.columns.iter().enumerate() { out_cols[left_ncol + c].push(col[*r]); }
+                    row_count += 1;
+                }
+                // For LEFT JOIN: if no matches passed the non-equi-join filter,
+                // emit unmatched left row.
+                if !any_match_passed && jt == JoinType2::Left {
+                    for (c, col) in left.columns.iter().enumerate() { out_cols[c].push(col[l]); }
+                    for c in 0..right.columns.len() { out_cols[left_ncol + c].push(0); }
                     row_count += 1;
                 }
             }
@@ -1904,28 +1941,99 @@ impl<'a> TpchExec<'a> {
         Ok(ExecTable { columns: out_cols.into_iter().map(std::sync::Arc::new).collect(), column_names: out_names, col_types: out_types, string_columns: out_strings, row_count, col_map })
     }
 
-    /// Apply non-equi-join ON conditions (e.g. NOT LIKE, IN, <, >) as a filter
-    /// on the joined table. Equi-join keys (Col = Col) are skipped (already
-    /// handled by the hash join). For LEFT JOIN, unmatched left rows have
-    /// right cols = 0, which pass NOT LIKE filters.
-    fn apply_non_equi_join_filter(&self, joined: ExecTable, on: &Expr2) -> Result<ExecTable, Error> {
-        let conjuncts = self.split_conjuncts(&Some(on.clone()));
-        // Filter out pure equi-join keys (Col = Col where both are columns)
-        let non_equi: Vec<Expr2> = conjuncts.iter().filter(|c| {
-            !matches!(c, Expr2::BinOp { op: BinOp2::Eq, left, right }
-                if matches!(left.as_ref(), Expr2::Col(_)) && matches!(right.as_ref(), Expr2::Col(_)))
-        }).cloned().collect();
-        if non_equi.is_empty() {
-            return Ok(joined);
+    /// Evaluate non-equi-join conjuncts for a single (left[l], right[r]) match.
+    /// Returns true if all conjuncts pass.
+    ///
+    /// For conjuncts that only reference right columns, eval on right at row r
+    /// (preserves string_columns for LIKE/NOT LIKE).
+    /// For conjuncts that reference both tables, build a combined row.
+    fn eval_non_equi_match(
+        &self, non_equi: &[Expr2],
+        left: &ExecTable, l: usize,
+        right: &ExecTable, r: usize,
+        out_names: &[String], out_types: &[ColType],
+        combined_col_map: &HashMap<String, usize>,
+        left_ncol: usize, ncol: usize,
+    ) -> Result<bool, Error> {
+        for conj in non_equi {
+            // Check if this conjunct only references right columns
+            let refs_left = self.expr_refs_table(conj, left);
+            let refs_right = self.expr_refs_table(conj, right);
+            let pass = if refs_right && !refs_left {
+                // Only right columns — eval on right table at row r
+                let v = self.eval(conj, right, r)?;
+                self.truthy(&v)
+            } else if refs_left && !refs_right {
+                // Only left columns — eval on left table at row l
+                let v = self.eval(conj, left, l)?;
+                self.truthy(&v)
+            } else {
+                // Both tables — build combined row
+                let mut combined_cols: Vec<u64> = Vec::with_capacity(ncol);
+                for (c, col) in left.columns.iter().enumerate() { combined_cols.push(col[l]); }
+                for (c, col) in right.columns.iter().enumerate() { combined_cols.push(col[r]); }
+                // Build a mini StringSearchColumn for the right's string at row r
+                let mut combined_strings: Vec<Option<std::sync::Arc<StringSearchColumn>>> = (0..left_ncol).map(|_| None).collect();
+                for sc in &right.string_columns {
+                    if let Some(ref scol) = sc {
+                        if scol.len() > r {
+                            combined_strings.push(Some(std::sync::Arc::new(
+                                StringSearchColumn::new(vec![scol.get(r).to_string()])
+                            )));
+                        } else {
+                            combined_strings.push(None);
+                        }
+                    } else {
+                        combined_strings.push(None);
+                    }
+                }
+                let combined_t = ExecTable {
+                    columns: combined_cols.iter().map(|v| std::sync::Arc::new(vec![*v])).collect(),
+                    column_names: out_names.to_vec(),
+                    col_types: out_types.to_vec(),
+                    string_columns: combined_strings,
+                    row_count: 1,
+                    col_map: combined_col_map.clone(),
+                };
+                let v = self.eval(conj, &combined_t, 0)?;
+                self.truthy(&v)
+            };
+            if !pass { return Ok(false); }
         }
-        let mut mask = vec![true; joined.row_count];
-        for conj in &non_equi {
-            let mut cmask = mask.clone();
-            self.eval_bool_mask_vec(conj, &joined, &mut cmask)?;
-            for i in 0..joined.row_count { mask[i] = mask[i] && cmask[i]; }
+        Ok(true)
+    }
+
+    /// Check if an expression references any column in the given table.
+    fn expr_refs_table(&self, expr: &Expr2, table: &ExecTable) -> bool {
+        match expr {
+            Expr2::Col(name) => {
+                let short = name.rfind('.').map(|p| &name[p+1..]).unwrap_or(name.as_str());
+                table.lookup_col(name).is_some() || table.lookup_col(short).is_some()
+            }
+            Expr2::BinOp { left, right, .. } => {
+                self.expr_refs_table(left, table) || self.expr_refs_table(right, table)
+            }
+            Expr2::Case { whens, else_ } => {
+                whens.iter().any(|(c, r)| self.expr_refs_table(c, table) || self.expr_refs_table(r, table))
+                    || else_.as_ref().map(|e| self.expr_refs_table(e, table)).unwrap_or(false)
+            }
+            Expr2::Like { expr, pattern, .. } => {
+                self.expr_refs_table(expr, table) || self.expr_refs_table(pattern, table)
+            }
+            Expr2::Between { expr, low, high, .. } => {
+                self.expr_refs_table(expr, table) || self.expr_refs_table(low, table) || self.expr_refs_table(high, table)
+            }
+            Expr2::InList { expr, list, .. } => {
+                self.expr_refs_table(expr, table) || list.iter().any(|e| self.expr_refs_table(e, table))
+            }
+            Expr2::Neg(e) | Expr2::Not(e) | Expr2::Extract { expr: e, .. } => {
+                self.expr_refs_table(e, table)
+            }
+            Expr2::Substr { expr, start, len } => {
+                self.expr_refs_table(expr, table) || self.expr_refs_table(start, table) || self.expr_refs_table(len, table)
+            }
+            _ => false,
         }
-        let indices: Vec<usize> = (0..joined.row_count).filter(|&i| mask[i]).collect();
-        Ok(self.filter_table(&joined, &indices))
     }
 
     fn extract_join_keys(&self, on: &Expr2, left: &ExecTable, right: &ExecTable) -> Result<Vec<JoinKey2>, Error> {
@@ -2802,7 +2910,17 @@ impl<'a> TpchExec<'a> {
                 Expr2::CountStar => Some(LcAgg::CountAll),
                 Expr2::Agg { func, arg, distinct: false } => {
                     match func {
-                        AggFunc::Count => Some(LcAgg::CountAll),
+                        AggFunc::Count => {
+                            // count(Col) counts non-null (non-zero) values.
+                            // count(*) counts all rows.
+                            // The low_card path only supports CountAll (count(*)).
+                            // count(Col) falls back to the HashMap path.
+                            if let Some(_) = self.col_in(arg, t) {
+                                None
+                            } else {
+                                Some(LcAgg::CountAll)
+                            }
+                        }
                         AggFunc::Sum => {
                             if let Some(a) = self.col_in(arg, t) {
                                 if t.col_types[a] == ColType::Float { Some(LcAgg::SumCol(a)) } else { None }
@@ -3201,7 +3319,13 @@ impl<'a> TpchExec<'a> {
                 Expr2::CountStar => Some(FusedAgg::CountAll),
                 Expr2::Agg { func, arg, distinct: false } => {
                     match func {
-                        AggFunc::Count => Some(FusedAgg::CountAll),
+                        AggFunc::Count => {
+                            // count(Col) counts non-null (non-zero) values.
+                            // count(*) counts all rows.
+                            // The fused path only supports CountAll (count(*)).
+                            // count(Col) falls back to per-row eval_agg_expr.
+                            if self.col_in(arg, t).is_some() { None } else { Some(FusedAgg::CountAll) }
+                        }
                         AggFunc::Sum => {
                             if let Some(a) = self.col_in(arg, t) {
                                 if t.col_types[a] == ColType::Float { Some(FusedAgg::SumCol(a)) } else { None }
