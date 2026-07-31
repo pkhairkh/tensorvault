@@ -3740,39 +3740,74 @@ impl<'a> TpchExec<'a> {
             return Ok(result);
         }
 
-        // Fallback: HashMap-based grouping for high cardinality
+        // Fallback: HashMap-based grouping for high cardinality.
+        // PARALLEL: split into chunks, each thread builds a local HashMap,
+        // then merge. This is critical for Q3 (10k groups, 300k rows) which
+        // was serial and took ~200ms just for grouping.
         let indices: Vec<usize> = (0..t.row_count).filter(|&i| mask[i]).collect();
 
-        // Group rows — optimized: pre-resolve column indices, read u64 directly,
-        // use single u64 hash key instead of Vec<u64>.
+        // Pre-resolve GROUP BY column indices. For computed expressions
+        // (extract, substr), pre-evaluate per row (serial — needed because
+        // TpchExec is not Sync due to Cell/RefCell).
         let gb_cols: Vec<Option<usize>> = query.group_by.iter()
             .map(|gb| self.col_in(gb, t))
             .collect();
-        let mut group_map: HashMap<u64, usize> = HashMap::with_capacity(64);
-        let mut group_indices: Vec<Vec<usize>> = Vec::with_capacity(64);
-        for &idx in &indices {
-            // Compute single u64 hash key from GROUP BY column values.
-            // For simple columns, read u64 directly. For computed expressions
-            // (e.g. extract(year FROM l_shipdate)), eval per row.
-            let mut key_hash: u64 = 0;
-            for (gi, gb) in query.group_by.iter().enumerate() {
-                let v = if let Some(ci) = gb_cols[gi] {
-                    t.columns[ci][idx]
+        let has_computed_gb = gb_cols.iter().any(|c| c.is_none());
+        // Pre-compute GROUP BY values for computed expressions
+        let gb_values: Vec<Vec<u64>> = if has_computed_gb {
+            query.group_by.iter().enumerate().map(|(gi, gb)| {
+                if gb_cols[gi].is_some() {
+                    Vec::new() // will read from column directly
                 } else {
-                    // Computed GROUP BY expression — eval per row
-                    self.eval(gb, t, idx)?.to_u64()
-                };
-                key_hash = key_hash.wrapping_mul(0x517cc1b727220a95).wrapping_add(v);
+                    indices.iter().map(|&idx| self.eval(gb, t, idx).unwrap_or(Value2::Null).to_u64()).collect()
+                }
+            }).collect()
+        } else {
+            Vec::new()
+        };
+
+        // PARALLEL grouping: split indices into chunks, each thread builds
+        // a local HashMap<u64, Vec<usize>>, then merge.
+        const GROUP_CHUNK_SIZE: usize = 65536;
+        let n_indices = indices.len();
+        let num_chunks = (n_indices + GROUP_CHUNK_SIZE - 1) / GROUP_CHUNK_SIZE;
+
+        let local_maps: Vec<HashMap<u64, Vec<usize>>> = (0..num_chunks).into_par_iter().map(|chunk_idx| {
+            let start = chunk_idx * GROUP_CHUNK_SIZE;
+            let end = std::cmp::min(start + GROUP_CHUNK_SIZE, n_indices);
+            let mut local: HashMap<u64, Vec<usize>> = HashMap::with_capacity(1024);
+            for i in start..end {
+                let idx = indices[i];
+                let mut key_hash: u64 = 0;
+                for (gi, _) in query.group_by.iter().enumerate() {
+                    let v = if let Some(ci) = gb_cols[gi] {
+                        t.columns[ci][idx]
+                    } else {
+                        // Use pre-computed value
+                        gb_values[gi][i]
+                    };
+                    key_hash = key_hash.wrapping_mul(0x517cc1b727220a95).wrapping_add(v);
+                }
+                local.entry(key_hash).or_default().push(idx);
             }
-            let gid = if let Some(&existing) = group_map.get(&key_hash) {
-                existing
-            } else {
-                let new_id = group_indices.len();
-                group_map.insert(key_hash, new_id);
-                group_indices.push(Vec::new());
-                new_id
-            };
-            group_indices[gid].push(idx);
+            local
+        }).collect();
+
+        // Merge local maps into global group_indices
+        let mut group_map: HashMap<u64, usize> = HashMap::with_capacity(1024);
+        let mut group_indices: Vec<Vec<usize>> = Vec::with_capacity(1024);
+        for local in local_maps {
+            for (hash, rows) in local {
+                let gid = if let Some(&existing) = group_map.get(&hash) {
+                    existing
+                } else {
+                    let new_id = group_indices.len();
+                    group_map.insert(hash, new_id);
+                    group_indices.push(Vec::new());
+                    new_id
+                };
+                group_indices[gid].extend(rows);
+            }
         }
 
         let group_indices: Vec<&Vec<usize>> = group_indices.iter().collect();
