@@ -691,6 +691,7 @@ pub fn execute_tpch(query: &SelectQuery2, catalog: &Catalog) -> Result<QueryResu
         outer: std::cell::Cell::new(None),
         subquery_cache: std::cell::RefCell::new(HashMap::new()),
         exists_cache: std::cell::RefCell::new(HashMap::new()),
+        in_subquery_cache: std::cell::RefCell::new(HashMap::new()),
     }.execute(query)
 }
 
@@ -718,6 +719,11 @@ struct TpchExec<'a> {
     /// then check membership per outer row. This decorrelates the EXISTS,
     /// reducing ~25k subquery executions to 1 hash-set build + 25k lookups.
     exists_cache: std::cell::RefCell<HashMap<usize, std::collections::HashSet<u64>>>,
+    /// Cache for uncorrelated IN-subquery result sets: keyed by AST pointer.
+    /// When an IN-subquery is uncorrelated (e.g. Q20's `s_suppkey IN (SELECT
+    /// ps_suppkey FROM partsupp WHERE ...)`), we execute it ONCE and cache
+    /// the set of values. Then per-row eval just checks membership.
+    in_subquery_cache: std::cell::RefCell<HashMap<usize, std::collections::HashSet<u64>>>,
 }
 
 impl<'a> TpchExec<'a> {
@@ -2499,6 +2505,47 @@ impl<'a> TpchExec<'a> {
             }
             Expr2::InSubquery { expr, query, negated } => {
                 let v = self.eval(expr, t, row)?;
+                let ast_key = (query.as_ref() as *const SelectQuery2) as usize;
+                // Check uncorrelated IN-subquery cache first.
+                let need_build = !self.in_subquery_cache.borrow().contains_key(&ast_key);
+                if need_build {
+                    // Try executing with outer=None to detect uncorrelated.
+                    let old_outer = self.outer.get();
+                    self.outer.set(None);
+                    let r = self.execute(query);
+                    self.outer.set(old_outer);
+                    match r {
+                        Ok(r) => {
+                            if let Some(col) = r.columns.first() {
+                                let set: std::collections::HashSet<u64> = col.values.iter().copied().collect();
+                                self.in_subquery_cache.borrow_mut().insert(ast_key, set);
+                            }
+                        }
+                        Err(_) => {
+                            // Correlated — mark as empty set so we don't retry.
+                            // Per-row eval with outer context will handle it.
+                            self.in_subquery_cache.borrow_mut().insert(ast_key, std::collections::HashSet::new());
+                        }
+                    }
+                }
+                // Check cache. If the subquery was uncorrelated, the cache has
+                // the full result set. If correlated (cache is empty set), fall
+                // through to per-row execution.
+                let cache = self.in_subquery_cache.borrow();
+                if let Some(set) = cache.get(&ast_key) {
+                    if !set.is_empty() || self.outer.get().is_none() {
+                        // Uncorrelated — check membership.
+                        // Note: for correlated subqueries that returned empty
+                        // (no rows match), we can't distinguish from "correlated,
+                        // not yet executed". But if outer is None, it's top-level,
+                        // so empty means truly empty.
+                        let v_u64 = v.to_u64();
+                        let found = set.contains(&v_u64);
+                        return Ok(Value2::Int(if if *negated { !found } else { found } { 1 } else { 0 }));
+                    }
+                }
+                drop(cache);
+                // Correlated IN-subquery — execute per row with outer context.
                 let old_outer = self.outer.get();
                 self.outer.set(Some((t as *const ExecTable, row)));
                 let r = self.execute(query);
@@ -3925,7 +3972,7 @@ mod tests {
 
     #[test]
     fn test_like_match() {
-        let cat = Catalog::new(); let exec = TpchExec { catalog: &cat, outer: std::cell::Cell::new(None), subquery_cache: std::cell::RefCell::new(HashMap::new()), exists_cache: std::cell::RefCell::new(HashMap::new()) };
+        let cat = Catalog::new(); let exec = TpchExec { catalog: &cat, outer: std::cell::Cell::new(None), subquery_cache: std::cell::RefCell::new(HashMap::new()), exists_cache: std::cell::RefCell::new(HashMap::new()), in_subquery_cache: std::cell::RefCell::new(HashMap::new()) };
         assert!(exec.like("hello world", "%hello%"));
         assert!(exec.like("hello", "hello"));
         assert!(exec.like("hello world", "hello%"));
