@@ -691,6 +691,7 @@ pub fn execute_tpch(query: &SelectQuery2, catalog: &Catalog) -> Result<QueryResu
         outer: std::cell::Cell::new(None),
         subquery_cache: std::cell::RefCell::new(HashMap::new()),
         exists_cache: std::cell::RefCell::new(HashMap::new()),
+        exists_multi_cache: std::cell::RefCell::new(HashMap::new()),
         in_subquery_cache: std::cell::RefCell::new(HashMap::new()),
     }.execute(query)
 }
@@ -719,6 +720,11 @@ struct TpchExec<'a> {
     /// then check membership per outer row. This decorrelates the EXISTS,
     /// reducing ~25k subquery executions to 1 hash-set build + 25k lookups.
     exists_cache: std::cell::RefCell<HashMap<usize, std::collections::HashSet<u64>>>,
+    /// Cache for multi-column EXISTS: HashMap<equi_key, HashSet<ineq_col>>.
+    /// For Q21's `exists (SELECT * FROM lineitem l2 WHERE l2.l_orderkey = l1.l_orderkey
+    /// AND l2.l_suppkey <> l1.l_suppkey)`, we build a HashMap<l_orderkey, HashSet<l_suppkey>>
+    /// once, then for each outer row, check if any suppkey in the set != l1.l_suppkey.
+    exists_multi_cache: std::cell::RefCell<HashMap<usize, std::collections::HashMap<u64, std::collections::HashSet<u64>>>>,
     /// Cache for uncorrelated IN-subquery result sets: keyed by AST pointer.
     /// When an IN-subquery is uncorrelated (e.g. Q20's `s_suppkey IN (SELECT
     /// ps_suppkey FROM partsupp WHERE ...)`), we execute it ONCE and cache
@@ -1035,7 +1041,32 @@ impl<'a> TpchExec<'a> {
         match expr {
             Expr2::Col(name) => {
                 let short = name.rfind('.').map(|p| &name[p+1..]).unwrap_or(name.as_str());
-                if !inner_cols.contains(&short.to_lowercase()) {
+                // Check if this column is qualified with an inner table alias.
+                // For Q21: `l1.l_orderkey` (outer) vs `l2.l_orderkey` (inner).
+                // Both have short name "l_orderkey" which is in inner_cols.
+                // We must check the qualifier to distinguish.
+                let is_inner = if let Some(dot_pos) = name.find('.') {
+                    let qualifier = &name[..dot_pos].to_lowercase();
+                    // Check if qualifier matches an inner table alias/name.
+                    // If it does, this is an inner column (not correlated).
+                    // If it doesn't, it's a correlation column.
+                    // For now, check if the short name is in inner_cols AND
+                    // the qualifier resolves to an inner table.
+                    // Simple heuristic: if the short name is in inner_cols,
+                    // check if the outer table has this qualified name.
+                    // If outer_t has "qualifier.short", it's a correlation column.
+                    if inner_cols.contains(&short.to_lowercase()) {
+                        // Ambiguous: could be inner or outer. Check if outer_t
+                        // has this qualified name — if so, it's a correlation column.
+                        outer_t.lookup_col(name).is_none() && outer_t.lookup_col(short).is_none()
+                    } else {
+                        false
+                    }
+                } else {
+                    // Unqualified name: check if it's in inner_cols
+                    !inner_cols.contains(&short.to_lowercase())
+                };
+                if !is_inner {
                     if outer_t.lookup_col(name).is_some() || outer_t.lookup_col(short).is_some() {
                         if seen.insert(name.to_lowercase()) {
                             names.push(name.clone());
@@ -1074,6 +1105,69 @@ impl<'a> TpchExec<'a> {
                 self.collect_corr_names(expr, outer_t, inner_cols, names, seen);
                 self.collect_corr_names(start, outer_t, inner_cols, names, seen);
                 self.collect_corr_names(len, outer_t, inner_cols, names, seen);
+            }
+            Expr2::Subquery(_) | Expr2::Exists { .. } | Expr2::InSubquery { .. } => {}
+            _ => {}
+        }
+    }
+
+    /// Like collect_corr_names, but uses table qualifiers to distinguish
+    /// inner columns from outer correlation columns when both share the same
+    /// short name (e.g. Q21's l1.l_orderkey vs l2.l_orderkey).
+    fn collect_corr_names_qualified(
+        &self, expr: &Expr2, outer_t: &ExecTable,
+        inner_cols: &std::collections::HashSet<String>,
+        inner_aliases: &std::collections::HashSet<String>,
+        names: &mut Vec<String>, seen: &mut std::collections::HashSet<String>,
+    ) {
+        match expr {
+            Expr2::Col(name) => {
+                let is_inner = if let Some(dot_pos) = name.find('.') {
+                    let qualifier = name[..dot_pos].to_lowercase();
+                    inner_aliases.contains(&qualifier)
+                } else {
+                    inner_cols.contains(&name.to_lowercase())
+                };
+                if !is_inner {
+                    let short = name.rfind('.').map(|p| &name[p+1..]).unwrap_or(name.as_str());
+                    if outer_t.lookup_col(name).is_some() || outer_t.lookup_col(short).is_some() {
+                        if seen.insert(name.to_lowercase()) {
+                            names.push(name.clone());
+                        }
+                    }
+                }
+            }
+            Expr2::BinOp { left, right, .. } => {
+                self.collect_corr_names_qualified(left, outer_t, inner_cols, inner_aliases, names, seen);
+                self.collect_corr_names_qualified(right, outer_t, inner_cols, inner_aliases, names, seen);
+            }
+            Expr2::Case { whens, else_ } => {
+                for (c, r) in whens {
+                    self.collect_corr_names_qualified(c, outer_t, inner_cols, inner_aliases, names, seen);
+                    self.collect_corr_names_qualified(r, outer_t, inner_cols, inner_aliases, names, seen);
+                }
+                if let Some(e) = else_ { self.collect_corr_names_qualified(e, outer_t, inner_cols, inner_aliases, names, seen); }
+            }
+            Expr2::Like { expr, pattern, .. } => {
+                self.collect_corr_names_qualified(expr, outer_t, inner_cols, inner_aliases, names, seen);
+                self.collect_corr_names_qualified(pattern, outer_t, inner_cols, inner_aliases, names, seen);
+            }
+            Expr2::Between { expr, low, high, .. } => {
+                self.collect_corr_names_qualified(expr, outer_t, inner_cols, inner_aliases, names, seen);
+                self.collect_corr_names_qualified(low, outer_t, inner_cols, inner_aliases, names, seen);
+                self.collect_corr_names_qualified(high, outer_t, inner_cols, inner_aliases, names, seen);
+            }
+            Expr2::InList { expr, list, .. } => {
+                self.collect_corr_names_qualified(expr, outer_t, inner_cols, inner_aliases, names, seen);
+                for e in list { self.collect_corr_names_qualified(e, outer_t, inner_cols, inner_aliases, names, seen); }
+            }
+            Expr2::Neg(e) | Expr2::Not(e) | Expr2::Extract { expr: e, .. } => {
+                self.collect_corr_names_qualified(e, outer_t, inner_cols, inner_aliases, names, seen);
+            }
+            Expr2::Substr { expr, start, len } => {
+                self.collect_corr_names_qualified(expr, outer_t, inner_cols, inner_aliases, names, seen);
+                self.collect_corr_names_qualified(start, outer_t, inner_cols, inner_aliases, names, seen);
+                self.collect_corr_names_qualified(len, outer_t, inner_cols, inner_aliases, names, seen);
             }
             Expr2::Subquery(_) | Expr2::Exists { .. } | Expr2::InSubquery { .. } => {}
             _ => {}
@@ -1184,11 +1278,27 @@ impl<'a> TpchExec<'a> {
     }
 
     /// Check if a conjunct references a column not in `base` (i.e. correlated).
+    /// Uses table qualifiers to distinguish inner from outer columns.
     fn is_conjunct_correlated(&self, expr: &Expr2, base: &ExecTable) -> bool {
         match expr {
             Expr2::Col(name) => {
-                let short = name.rfind('.').map(|p| &name[p+1..]).unwrap_or(name.as_str());
-                base.lookup_col(name).is_none() && base.lookup_col(short).is_none()
+                if let Some(dot_pos) = name.find('.') {
+                    let qualifier = name[..dot_pos].to_lowercase();
+                    // If base has this qualified name, it's an inner column.
+                    if base.lookup_col(name).is_some() {
+                        return false;
+                    }
+                    // If the qualifier matches base's alias, the column is inner
+                    // (even if the short name doesn't resolve — shouldn't happen).
+                    if self.qualifier_matches_base(&qualifier, base) {
+                        return false;
+                    }
+                    // Qualifier doesn't match base — it's a correlation column.
+                    true
+                } else {
+                    // Unqualified: check if short name is in base.
+                    base.lookup_col(name).is_none()
+                }
             }
             Expr2::BinOp { left, right, .. } => {
                 self.is_conjunct_correlated(left, base) || self.is_conjunct_correlated(right, base)
@@ -1215,6 +1325,146 @@ impl<'a> TpchExec<'a> {
             Expr2::Subquery(_) | Expr2::Exists { .. } | Expr2::InSubquery { .. } => true,
             _ => false,
         }
+    }
+
+    /// Check if a table qualifier matches any of base's column_names prefixes.
+    /// The base table's col_map has entries like "alias.colname".
+    /// If the qualifier matches any such prefix, it's an inner column.
+    fn qualifier_matches_base(&self, qualifier: &str, base: &ExecTable) -> bool {
+        for name in &base.column_names {
+            // column_names don't have qualifiers — check col_map instead
+        }
+        // Check col_map for any key starting with "qualifier."
+        let prefix = format!("{}.", qualifier);
+        for key in base.col_map.keys() {
+            if key.starts_with(&prefix) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// For an EXISTS subquery with 2 correlation columns, find the equi-join
+    /// pair and the inequality pair. Returns (outer_eq, inner_eq, outer_neq, inner_neq).
+    ///
+    /// Q21 example: `exists (SELECT * FROM lineitem l2 WHERE l2.l_orderkey = l1.l_orderkey
+    /// AND l2.l_suppkey <> l1.l_suppkey)` → outer_eq=l1.l_orderkey, inner_eq=l2.l_orderkey,
+    /// outer_neq=l1.l_suppkey, inner_neq=l2.l_suppkey.
+    fn find_exists_multi_col(&self, subquery: &SelectQuery2, outer_t: &ExecTable) -> Option<(usize, usize, usize, usize)> {
+        // Build inner column name set and inner table aliases
+        let mut inner_cols: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut inner_aliases: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for item in &subquery.from {
+            if let FromItem::Table(t) = item {
+                inner_aliases.insert(t.name.to_lowercase());
+                if let Some(ref alias) = t.alias {
+                    inner_aliases.insert(alias.to_lowercase());
+                }
+                if let Some(table) = self.catalog.get(&t.name) {
+                    for cn in &table.column_names {
+                        inner_cols.insert(cn.to_lowercase());
+                    }
+                }
+            }
+        }
+        // Find correlation columns
+        let mut corr_names: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if let Some(ref wc) = subquery.where_clause {
+            self.collect_corr_names_qualified(wc, outer_t, &inner_cols, &inner_aliases, &mut corr_names, &mut seen);
+        }
+        if corr_names.len() != 2 {
+            return None;
+        }
+        // Find the equi-join conjunct (Col(inner) = Col(outer))
+        let wc = subquery.where_clause.as_ref()?;
+        let conjuncts = self.split_conjuncts(&Some(wc.clone()));
+        let mut eq_pair: Option<(usize, usize, String, String)> = None; // (outer_idx, inner_idx, outer_name, inner_name)
+        let mut neq_pair: Option<(usize, usize)> = None; // (outer_idx, inner_idx)
+        for conj in &conjuncts {
+            // Look for Col = Col (equi-join between inner and outer)
+            if let Expr2::BinOp { op: BinOp2::Eq, left: l, right: r } = conj {
+                if let (Expr2::Col(ln), Expr2::Col(rn)) = (l.as_ref(), r.as_ref()) {
+                    // Use qualifier to determine inner vs outer (not short name)
+                    let l_is_inner = self.col_is_inner(ln, &inner_aliases, &inner_cols);
+                    let r_is_inner = self.col_is_inner(rn, &inner_aliases, &inner_cols);
+                    if l_is_inner != r_is_inner {
+                        // One is inner, one is outer
+                        let (inner_name, outer_name) = if l_is_inner { (ln.clone(), rn.clone()) } else { (rn.clone(), ln.clone()) };
+                        let outer_short = outer_name.rfind('.').map(|p| &outer_name[p+1..]).unwrap_or(&outer_name).to_lowercase();
+                        let outer_idx = outer_t.lookup_col(&outer_name).or_else(|| outer_t.lookup_col(&outer_short))?;
+                        let inner_idx = self.resolve_inner_col_idx(&inner_name, subquery, outer_t)?;
+                        if eq_pair.is_none() {
+                            eq_pair = Some((outer_idx, inner_idx, outer_name.clone(), inner_name.clone()));
+                        }
+                    }
+                }
+            }
+            // Look for Col <> Col (inequality between inner and outer)
+            if let Expr2::BinOp { op: BinOp2::Ne, left: l, right: r } = conj {
+                if let (Expr2::Col(ln), Expr2::Col(rn)) = (l.as_ref(), r.as_ref()) {
+                    let l_is_inner = self.col_is_inner(ln, &inner_aliases, &inner_cols);
+                    let r_is_inner = self.col_is_inner(rn, &inner_aliases, &inner_cols);
+                    if l_is_inner != r_is_inner {
+                        let (inner_name, outer_name) = if l_is_inner { (ln.clone(), rn.clone()) } else { (rn.clone(), ln.clone()) };
+                        let outer_short = outer_name.rfind('.').map(|p| &outer_name[p+1..]).unwrap_or(&outer_name).to_lowercase();
+                        let outer_idx = outer_t.lookup_col(&outer_name).or_else(|| outer_t.lookup_col(&outer_short))?;
+                        let inner_idx = self.resolve_inner_col_idx(&inner_name, subquery, outer_t)?;
+                        if neq_pair.is_none() {
+                            neq_pair = Some((outer_idx, inner_idx));
+                        }
+                    }
+                }
+            }
+        }
+        let (outer_eq, inner_eq, _, _) = eq_pair?;
+        let (outer_neq, inner_neq) = neq_pair?;
+        Some((outer_eq, inner_eq, outer_neq, inner_neq))
+    }
+
+    /// Check if a column name refers to an inner table column.
+    /// Uses the qualifier (if present) to distinguish inner from outer.
+    fn col_is_inner(&self, name: &str, inner_aliases: &std::collections::HashSet<String>, inner_cols: &std::collections::HashSet<String>) -> bool {
+        if let Some(dot_pos) = name.find('.') {
+            let qualifier = name[..dot_pos].to_lowercase();
+            inner_aliases.contains(&qualifier)
+        } else {
+            inner_cols.contains(&name.to_lowercase())
+        }
+    }
+
+    /// Build HashMap<equi_key, HashSet<ineq_col>> from the subquery's inner
+    /// table, applying only uncorrelated conjuncts.
+    fn build_exists_multi_map(&self, subquery: &SelectQuery2, inner_eq_idx: usize, inner_neq_idx: usize) -> Result<std::collections::HashMap<u64, std::collections::HashSet<u64>>, Error> {
+        let mut tables: Vec<ExecTable> = Vec::new();
+        for item in &subquery.from {
+            tables.push(self.resolve_from_item(item)?);
+        }
+        let base = if tables.len() == 1 {
+            tables.into_iter().next().unwrap()
+        } else {
+            self.join_tables_smart(tables, &subquery.where_clause)?
+        };
+        let mask = if let Some(ref wc) = subquery.where_clause {
+            let conjuncts = self.split_conjuncts(&subquery.where_clause);
+            let mut mask = vec![true; base.row_count];
+            for conj in &conjuncts {
+                if self.is_conjunct_correlated(conj, &base) { continue; }
+                let mut cmask = vec![true; base.row_count];
+                self.eval_bool_mask_vec(conj, &base, &mut cmask)?;
+                for i in 0..base.row_count { mask[i] = mask[i] && cmask[i]; }
+            }
+            mask
+        } else { vec![true; base.row_count] };
+        let eq_col = &base.columns[inner_eq_idx];
+        let neq_col = &base.columns[inner_neq_idx];
+        let mut map: std::collections::HashMap<u64, std::collections::HashSet<u64>> = std::collections::HashMap::new();
+        for i in 0..base.row_count {
+            if mask[i] {
+                map.entry(eq_col[i]).or_default().insert(neq_col[i]);
+            }
+        }
+        Ok(map)
     }
 
     /// Estimate the number of distinct values in a column using a sampling
@@ -2696,6 +2946,26 @@ impl<'a> TpchExec<'a> {
                     if let Some(set) = cache.get(&ast_key) {
                         let outer_val = t.columns[outer_col_idx].get(row).copied().unwrap_or(0);
                         let exists = set.contains(&outer_val);
+                        return Ok(Value2::Int(if if *negated { !exists } else { exists } { 1 } else { 0 }));
+                    }
+                }
+                // Multi-column EXISTS fast path: if the subquery has 2 correlation
+                // columns — one equi-join (e.g. l_orderkey = l1.l_orderkey) and one
+                // inequality (e.g. l_suppkey <> l1.l_suppkey) — build a
+                // HashMap<equi_key, HashSet<ineq_col>> once, then check per row.
+                if let Some((outer_eq_idx, inner_eq_idx, outer_neq_idx, inner_neq_idx)) = self.find_exists_multi_col(query, t) {
+                    let need_build = !self.exists_multi_cache.borrow().contains_key(&ast_key);
+                    if need_build {
+                        let map = self.build_exists_multi_map(query, inner_eq_idx, inner_neq_idx)?;
+                        self.exists_multi_cache.borrow_mut().insert(ast_key, map);
+                    }
+                    let cache = self.exists_multi_cache.borrow();
+                    if let Some(map) = cache.get(&ast_key) {
+                        let outer_eq = t.columns[outer_eq_idx].get(row).copied().unwrap_or(0);
+                        let outer_neq = t.columns[outer_neq_idx].get(row).copied().unwrap_or(0);
+                        let exists = map.get(&outer_eq).map_or(false, |set| {
+                            set.iter().any(|&v| v != outer_neq)
+                        });
                         return Ok(Value2::Int(if if *negated { !exists } else { exists } { 1 } else { 0 }));
                     }
                 }
@@ -4193,7 +4463,7 @@ mod tests {
 
     #[test]
     fn test_like_match() {
-        let cat = Catalog::new(); let exec = TpchExec { catalog: &cat, outer: std::cell::Cell::new(None), subquery_cache: std::cell::RefCell::new(HashMap::new()), exists_cache: std::cell::RefCell::new(HashMap::new()), in_subquery_cache: std::cell::RefCell::new(HashMap::new()) };
+        let cat = Catalog::new(); let exec = TpchExec { catalog: &cat, outer: std::cell::Cell::new(None), subquery_cache: std::cell::RefCell::new(HashMap::new()), exists_cache: std::cell::RefCell::new(HashMap::new()), exists_multi_cache: std::cell::RefCell::new(HashMap::new()), in_subquery_cache: std::cell::RefCell::new(HashMap::new()) };
         assert!(exec.like("hello world", "%hello%"));
         assert!(exec.like("hello", "hello"));
         assert!(exec.like("hello world", "hello%"));
