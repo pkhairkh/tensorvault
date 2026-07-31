@@ -1013,6 +1013,57 @@ impl<'a> TpchExec<'a> {
     ///
     /// Q4 example: `exists (SELECT * FROM lineitem WHERE l_orderkey = o_orderkey
     /// AND l_commitdate < l_receiptdate)` → outer_col=o_orderkey, inner_col=l_orderkey.
+    /// Check if a conjunct references a column not in the inner tables.
+    /// Uses inner_cols (short names) and inner_aliases (table qualifiers)
+    /// to determine if a column reference is inner or correlated (outer).
+    fn is_conjunct_correlated_wrt_inner(
+        &self, expr: &Expr2,
+        inner_cols: &std::collections::HashSet<String>,
+        inner_aliases: &std::collections::HashSet<String>,
+    ) -> bool {
+        match expr {
+            Expr2::Col(name) => {
+                if let Some(dot_pos) = name.find('.') {
+                    let qualifier = name[..dot_pos].to_lowercase();
+                    // If qualifier matches an inner alias, it's inner.
+                    if inner_aliases.contains(&qualifier) {
+                        return false;
+                    }
+                    // Otherwise it's correlated.
+                    true
+                } else {
+                    // Unqualified: if short name is in inner_cols, it's inner.
+                    !inner_cols.contains(&name.to_lowercase())
+                }
+            }
+            Expr2::BinOp { left, right, .. } => {
+                self.is_conjunct_correlated_wrt_inner(left, inner_cols, inner_aliases)
+                    || self.is_conjunct_correlated_wrt_inner(right, inner_cols, inner_aliases)
+            }
+            Expr2::Case { whens, else_ } => {
+                whens.iter().any(|(c, r)| self.is_conjunct_correlated_wrt_inner(c, inner_cols, inner_aliases) || self.is_conjunct_correlated_wrt_inner(r, inner_cols, inner_aliases))
+                    || else_.as_ref().map(|e| self.is_conjunct_correlated_wrt_inner(e, inner_cols, inner_aliases)).unwrap_or(false)
+            }
+            Expr2::Like { expr, pattern, .. } => {
+                self.is_conjunct_correlated_wrt_inner(expr, inner_cols, inner_aliases) || self.is_conjunct_correlated_wrt_inner(pattern, inner_cols, inner_aliases)
+            }
+            Expr2::Between { expr, low, high, .. } => {
+                self.is_conjunct_correlated_wrt_inner(expr, inner_cols, inner_aliases) || self.is_conjunct_correlated_wrt_inner(low, inner_cols, inner_aliases) || self.is_conjunct_correlated_wrt_inner(high, inner_cols, inner_aliases)
+            }
+            Expr2::InList { expr, list, .. } => {
+                self.is_conjunct_correlated_wrt_inner(expr, inner_cols, inner_aliases) || list.iter().any(|e| self.is_conjunct_correlated_wrt_inner(e, inner_cols, inner_aliases))
+            }
+            Expr2::Neg(e) | Expr2::Not(e) | Expr2::Extract { expr: e, .. } => {
+                self.is_conjunct_correlated_wrt_inner(e, inner_cols, inner_aliases)
+            }
+            Expr2::Substr { expr, start, len } => {
+                self.is_conjunct_correlated_wrt_inner(expr, inner_cols, inner_aliases) || self.is_conjunct_correlated_wrt_inner(start, inner_cols, inner_aliases) || self.is_conjunct_correlated_wrt_inner(len, inner_cols, inner_aliases)
+            }
+            Expr2::Subquery(_) | Expr2::Exists { .. } | Expr2::InSubquery { .. } => true,
+            _ => false,
+        }
+    }
+
     /// Try to decorrelate a correlated scalar subquery by building a derived
     /// table: execute the subquery's FROM table with local (non-correlated)
     /// filters, GROUP BY the correlation columns, compute the aggregate, and
@@ -1038,6 +1089,13 @@ impl<'a> TpchExec<'a> {
         if !self.expr_has_agg(&subquery.select[0].expr) { return Ok(None); }
         if subquery.having.is_some() { return Ok(None); }
         if !subquery.group_by.is_empty() { return Ok(None); }
+
+        // Only decorrelate single-table subqueries (multi-table joins in the
+        // subquery make the derived table build expensive and error-prone).
+        // Q20's subquery is `SELECT 0.5*sum(l_quantity) FROM lineitem WHERE ...`
+        // (single table) — perfect for decorrelation.
+        // Q2's subquery has 4 FROM tables — not decorrelated (uses per-row cache).
+        if subquery.from.len() != 1 { return Ok(None); }
 
         // Build inner column name set and inner table aliases.
         let mut inner_cols: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1111,6 +1169,25 @@ impl<'a> TpchExec<'a> {
 
         // Build the derived table: load inner FROM, apply local (non-correlated)
         // conjuncts, GROUP BY inner correlation columns, compute aggregate.
+        // We must build a WHERE with correlated conjuncts REMOVED, so that
+        // join_tables_smart doesn't try to apply them as single-table filters
+        // (which would fail because the outer columns aren't in the inner tables).
+        // A conjunct is "correlated" if it references any column whose short name
+        // is NOT in the inner table column set AND whose qualifier is NOT an inner
+        // table alias. (For Q2: `p_partkey = ps_partkey` — p_partkey is correlated.)
+        let local_conjuncts: Vec<Expr2> = conjuncts.iter().filter(|c| {
+            !self.is_conjunct_correlated_wrt_inner(c, &inner_cols, &inner_aliases)
+        }).cloned().collect();
+        // Rebuild a WHERE clause from local conjuncts (ANDed together).
+        let local_where: Option<Expr2> = if local_conjuncts.is_empty() {
+            None
+        } else {
+            let mut w = local_conjuncts[0].clone();
+            for c in &local_conjuncts[1..] {
+                w = Expr2::BinOp { op: BinOp2::And, left: Box::new(w), right: Box::new(c.clone()) };
+            }
+            Some(w)
+        };
         let mut tables: Vec<ExecTable> = Vec::new();
         for item in &subquery.from {
             tables.push(self.resolve_from_item(item)?);
@@ -1118,14 +1195,13 @@ impl<'a> TpchExec<'a> {
         let base = if tables.len() == 1 {
             tables.into_iter().next().unwrap()
         } else {
-            self.join_tables_smart(tables, &subquery.where_clause)?
+            self.join_tables_smart(tables, &local_where)?
         };
 
         // Apply local (non-correlated) conjuncts only.
         let mask = {
             let mut m = vec![true; base.row_count];
-            for conj in &conjuncts {
-                if self.is_conjunct_correlated(conj, &base) { continue; }
+            for conj in &local_conjuncts {
                 let mut cm = vec![true; base.row_count];
                 self.eval_bool_mask_vec(conj, &base, &mut cm)?;
                 for i in 0..base.row_count { m[i] = m[i] && cm[i]; }
