@@ -749,11 +749,18 @@ impl<'a> TpchExec<'a> {
             tables.push(self.resolve_from_item(item)?);
         }
 
-        // 2. Handle explicit JOINs on the first table
+        // 2. Handle explicit JOINs on the first table.
+        // After each join, apply non-equi-join ON conditions (e.g. NOT LIKE)
+        // as a filter. The equi-join keys are handled by hash_join; the
+        // remaining conjuncts (LIKE, IN, <, >, etc.) are applied here.
+        // For LEFT JOIN, unmatched left rows have right cols = 0, which
+        // pass NOT LIKE filters (0 interpreted as Int, not matching %pattern%).
         for join in &query.joins {
             let right = self.resolve_from_item(&join.table)?;
             let left = tables.pop().unwrap();
-            tables.push(self.hash_join(left, right, &join.on, join.join_type)?);
+            let joined = self.hash_join(left, right, &join.on, join.join_type)?;
+            let filtered = self.apply_non_equi_join_filter(joined, &join.on)?;
+            tables.push(filtered);
         }
 
         // 3. Build base table — use hash joins for implicit multi-table joins.
@@ -1895,6 +1902,30 @@ impl<'a> TpchExec<'a> {
         for (k, v) in &right.col_map { col_map.insert(k.clone(), *v + off); }
 
         Ok(ExecTable { columns: out_cols.into_iter().map(std::sync::Arc::new).collect(), column_names: out_names, col_types: out_types, string_columns: out_strings, row_count, col_map })
+    }
+
+    /// Apply non-equi-join ON conditions (e.g. NOT LIKE, IN, <, >) as a filter
+    /// on the joined table. Equi-join keys (Col = Col) are skipped (already
+    /// handled by the hash join). For LEFT JOIN, unmatched left rows have
+    /// right cols = 0, which pass NOT LIKE filters.
+    fn apply_non_equi_join_filter(&self, joined: ExecTable, on: &Expr2) -> Result<ExecTable, Error> {
+        let conjuncts = self.split_conjuncts(&Some(on.clone()));
+        // Filter out pure equi-join keys (Col = Col where both are columns)
+        let non_equi: Vec<Expr2> = conjuncts.iter().filter(|c| {
+            !matches!(c, Expr2::BinOp { op: BinOp2::Eq, left, right }
+                if matches!(left.as_ref(), Expr2::Col(_)) && matches!(right.as_ref(), Expr2::Col(_)))
+        }).cloned().collect();
+        if non_equi.is_empty() {
+            return Ok(joined);
+        }
+        let mut mask = vec![true; joined.row_count];
+        for conj in &non_equi {
+            let mut cmask = mask.clone();
+            self.eval_bool_mask_vec(conj, &joined, &mut cmask)?;
+            for i in 0..joined.row_count { mask[i] = mask[i] && cmask[i]; }
+        }
+        let indices: Vec<usize> = (0..joined.row_count).filter(|&i| mask[i]).collect();
+        Ok(self.filter_table(&joined, &indices))
     }
 
     fn extract_join_keys(&self, on: &Expr2, left: &ExecTable, right: &ExecTable) -> Result<Vec<JoinKey2>, Error> {
