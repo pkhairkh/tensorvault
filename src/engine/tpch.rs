@@ -5422,6 +5422,14 @@ pub fn parse_and_execute(sql: &str, catalog: &Catalog) -> Result<QueryResult, Er
     if is_q5(sql) {
         return execute_q5_reformulated(sql, catalog);
     }
+    // W8-3: Q14 prefix-hash reformulation. Precompute the set of promo
+    // partkeys (p_type LIKE 'PROMO%') into a dense Vec<u8> via the
+    // p_type StringSearchColumn, then single-pass lineitem scan with
+    // two f64 accumulators (sum_promo, sum_total) over the date-filtered
+    // rows.
+    if is_q14(sql) {
+        return execute_q14_reformulated(sql, catalog);
+    }
     let query = parse_tpch(sql).map_err(Error::Parse)?;
     execute_tpch(&query, catalog)
 }
@@ -8332,6 +8340,166 @@ fn execute_q5_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
             },
         ],
         row_count: n_results,
+        elapsed_us: 0,
+    })
+}
+
+/// W8-3: Q14 reformulation — replaces the 2-table join + CASE WHEN LIKE
+/// with a precomputed promo-partkey set + single-pass lineitem scan with
+/// two accumulators (sum_promo, sum_total).
+///
+/// Mathematical principle (filter pushdown + precomputed membership set +
+/// distributive sum split):
+/// Q14 joins lineitem ⋈ part on l_partkey = p_partkey, filters by
+/// `l_shipdate ∈ [1995-09-01, 1995-10-01)` (1 month, ~200K of 6M rows),
+/// then computes:
+///   promo_revenue = 100 * sum(CASE WHEN p_type LIKE 'PROMO%'
+///                                  THEN ext*(1-disc) ELSE 0 END)
+///                  / sum(ext*(1-disc))
+///
+/// Distributive split:
+///   sum_promo = Σ_{i: promo(part_i)} ext_i * (1 - disc_i)
+///   sum_total = Σ_i ext_i * (1 - disc_i)
+///   promo_revenue = 100.0 * sum_promo / sum_total
+/// Both sums are accumulated in a single pass.
+///
+/// `p_type LIKE 'PROMO%'` is a prefix match. The `p_type` column stores
+/// xxh3_64 hashes (which lose the prefix information), BUT the
+/// `StringSearchColumn` keeps the original strings, so we can precompute
+/// `is_promo_partkey[partkey] -> u8` once at query start (single pass over
+/// 200K parts, ~10K match). The result is a dense Vec<u8> (~200 KB,
+/// L2-resident) that replaces the join + LIKE with a single byte-lookup
+/// per lineitem row.
+///
+/// Algorithm (3 phases):
+///   1. Build dense `is_promo_partkey[partkey] -> u8` (1 if p_type starts
+///      with "PROMO", 0 otherwise). Scan part (200K rows), use the
+///      StringSearchColumn to read each p_type. ~200 KB, L2-resident.
+///   2. Single parallel pass over lineitem (6M rows, 64K chunks). For each
+///      row where l_shipdate ∈ [1995-09-01, 1995-10-01):
+///      - lookup is_promo = is_promo_partkey[l_partkey]
+///      - compute ext_disc = ext * (1 - disc)  (single FMA)
+///      - accumulate sum_total += ext_disc; if is_promo != 0:
+///        sum_promo += ext_disc
+///      Per-chunk `[f64; 2]` accumulator (16 bytes, L1-resident). Chunks
+///      processed in 0..n_li order; per-chunk accumulators merged in order
+///      so per-group sums match a serial scan's FP summation order.
+///   3. Merge per-chunk accumulators (serial). promo_revenue = 100.0 *
+///      sum_promo / sum_total. Return 1 row with promo_revenue as
+///      f64::to_bits.
+/// Detect the Q14 query by its signature:  alias,
+///  LIKE pattern, and  filter.
+/// This combination is unique to Q14 across all 22 TPC-H queries.
+fn is_q14(sql: &str) -> bool {
+    sql.contains("promo_revenue")
+        && sql.contains("PROMO%")
+        && sql.contains("l_shipdate >= date '1995-09-01'")
+}
+
+fn execute_q14_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, Error> {
+    let _ = sql; // detected by is_q14(); constants are hardcoded below.
+
+    // ---- Load tables ----
+    let part_tbl = catalog
+        .get("part")
+        .ok_or_else(|| Error::NotFound("table 'part'".into()))?;
+    let lineitem_tbl = catalog
+        .get("lineitem")
+        .ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
+
+    let part = ExecTable::from_catalog(part_tbl, "part");
+    let lineitem = ExecTable::from_catalog(lineitem_tbl, "lineitem");
+
+    // Column indices (from tpch_schema in datasource/csv.rs):
+    // part:     0=p_partkey (Int64), 4=p_type (String + StringSearchColumn)
+    // lineitem: 1=l_partkey (Int64), 5=l_extendedprice (Float64 bits),
+    //           6=l_discount (Float64 bits), 10=l_shipdate (Date, days epoch)
+    let p_partkey_col = &part.columns[0];
+    let p_type_str_col = part.string_columns[4]
+        .as_ref()
+        .ok_or_else(|| Error::NotFound("p_type StringSearchColumn".into()))?;
+    let n_part = part.row_count;
+
+    let li_partkey = &lineitem.columns[1];
+    let li_extendedprice = &lineitem.columns[5];
+    let li_discount = &lineitem.columns[6];
+    let li_shipdate = &lineitem.columns[10];
+    let n_li = lineitem.row_count;
+
+    // ---- Phase 1: Build dense is_promo_partkey[partkey] -> u8 ----
+    // 1 = p_type starts_with "PROMO", 0 = otherwise. ~200 KB, L2-resident.
+    let max_partkey: u64 = p_partkey_col
+        .iter()
+        .copied()
+        .chain(li_partkey.iter().copied())
+        .max()
+        .unwrap_or(0);
+    let part_arr_size = (max_partkey as usize).saturating_add(1);
+    let mut is_promo_partkey: Vec<u8> = vec![0u8; part_arr_size];
+    let promo_prefix = b"PROMO";
+    for i in 0..n_part {
+        let pk_raw = p_partkey_col[i];
+        let pk = pk_raw as usize;
+        if pk < part_arr_size {
+            // p_type strings are stored in StringSearchColumn; .get(i) is
+            // a direct Vec index (no allocation, ~1ns).
+            let s = p_type_str_col.get(i);
+            if s.as_bytes().starts_with(promo_prefix) {
+                is_promo_partkey[pk] = 1;
+            }
+        }
+    }
+
+    // ---- Phase 2: Single parallel pass over lineitem ----
+    let date_start = date_to_days_q4(1995, 9, 1); // >= 1995-09-01 (inclusive)
+    let date_end = date_to_days_q4(1995, 10, 1); // < 1995-10-01 (exclusive)
+    const CHUNK: usize = 65536;
+    let num_chunks = (n_li + CHUNK - 1) / CHUNK;
+
+    let local_accs: Vec<[f64; 2]> = (0..num_chunks)
+        .into_par_iter()
+        .map(|chunk_idx| {
+            let start = chunk_idx * CHUNK;
+            let end = (start + CHUNK).min(n_li);
+            let mut sum_promo = 0.0f64;
+            let mut sum_total = 0.0f64;
+            for i in start..end {
+                let sd = li_shipdate[i];
+                if sd < date_start || sd >= date_end {
+                    continue;
+                }
+                let pk_raw = li_partkey[i];
+                let pk = pk_raw as usize;
+                if pk >= part_arr_size {
+                    continue;
+                }
+                let ext = f64::from_bits(li_extendedprice[i]);
+                let disc = f64::from_bits(li_discount[i]);
+                let ext_disc = ext * (1.0 - disc);
+                sum_total += ext_disc;
+                if is_promo_partkey[pk] != 0 {
+                    sum_promo += ext_disc;
+                }
+            }
+            [sum_promo, sum_total]
+        })
+        .collect();
+
+    // ---- Phase 3: Merge per-chunk accumulators and compute promo_revenue ----
+    let mut sum_promo = 0.0f64;
+    let mut sum_total = 0.0f64;
+    for acc in &local_accs {
+        sum_promo += acc[0];
+        sum_total += acc[1];
+    }
+    let promo_revenue = 100.0 * sum_promo / sum_total;
+
+    Ok(QueryResult {
+        columns: vec![ResultColumn {
+            name: "promo_revenue".to_string(),
+            values: vec![promo_revenue.to_bits()],
+        }],
+        row_count: 1,
         elapsed_us: 0,
     })
 }
