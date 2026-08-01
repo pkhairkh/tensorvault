@@ -56,6 +56,10 @@ fxhash = "0.2.1"
 # Portable SIMD wrappers (f64x8, u64x8) with safe fallback on non-AVX512.
 # Wave 3: SIMD aggregation kernels.
 wide = "0.7"
+# SIMD-accelerated byte-level substring search (memmem::find). Wave 10-1:
+# Q13 LIKE filter on 1.5M o_comment rows — replaces str::find + from_utf8
+# validation with SIMD byte search, ~3-5 ms saved.
+memchr = "2"
 
 [dev-dependencies]
 tempfile = "3.10"
