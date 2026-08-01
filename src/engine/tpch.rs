@@ -4413,22 +4413,83 @@ impl<'a> TpchExec<'a> {
             let mut gb_vals: Vec<u64> = vec![0; select.len()];
             let mut gb_found: Vec<bool> = vec![false; select.len()];
 
-            for &i in indices {
+            // W3: per-plan SIMD dispatch for large groups; scalar per-row for
+            // small groups. The SIMD kernels have ~30 cycles of setup
+            // (8 zero accumulators + horizontal reduce) which is only
+            // amortized when the group has enough rows to fill >= 1 full
+            // 4-accumulator iteration (32 rows). Below this threshold the
+            // scalar per-row loop is faster. See W-MATH-RESEARCH trick #3.
+            //
+            // Q3 (~10K groups x 2 rows each) hits the scalar path entirely;
+            // Q5 (5 groups x ~100K rows) and Q18 (57 groups, mixed) hit the
+            // SIMD path for their large groups.
+            let n = indices.len();
+            if n >= 32 {
+                use crate::exec::simd_agg;
                 for (j, plan) in plans.iter().enumerate() {
                     match plan.as_ref().unwrap() {
                         FusedAgg::GroupByCol(idx) => {
-                            if !gb_found[j] { gb_vals[j] = t.columns[*idx][i]; gb_found[j] = true; }
+                            if n > 0 { gb_vals[j] = t.columns[*idx][indices[0]]; gb_found[j] = true; }
                         }
-                        FusedAgg::CountAll => { counts[j] += 1; }
-                        FusedAgg::SumCol(a) => { sums[j] += f64::from_bits(t.columns[*a][i]); }
-                        FusedAgg::SumColCol(a, b) => { sums[j] += f64::from_bits(t.columns[*a][i]) * f64::from_bits(t.columns[*b][i]); }
-                        FusedAgg::SumColSubOne(a, b) => { sums[j] += f64::from_bits(t.columns[*a][i]) * (1.0 - f64::from_bits(t.columns[*b][i])); }
+                        FusedAgg::CountAll => { counts[j] = n as u64; }
+                        FusedAgg::SumCol(a) => {
+                            sums[j] = simd_agg::sum_f64_by_idx(&t.columns[*a], indices);
+                        }
+                        FusedAgg::SumColCol(a, b) => {
+                            sums[j] = simd_agg::sum_a_mul_b_by_idx(&t.columns[*a], &t.columns[*b], indices);
+                        }
+                        FusedAgg::SumColSubOne(a, b) => {
+                            // Distributive: sum(a) - sum(a*b) - two FMA chains.
+                            sums[j] = simd_agg::sum_a_mul_one_minus_b_by_idx(&t.columns[*a], &t.columns[*b], indices);
+                        }
                         FusedAgg::SumColSubOneAddOne(a, b, c) => {
-                            sums[j] += f64::from_bits(t.columns[*a][i]) * (1.0 - f64::from_bits(t.columns[*b][i])) * (1.0 + f64::from_bits(t.columns[*c][i]));
+                            // Distributive: sum_a + sum(a*c) - sum(a*b) - sum(a*b*c).
+                            sums[j] = simd_agg::sum_a_mul_one_minus_b_mul_one_plus_c_by_idx(
+                                &t.columns[*a], &t.columns[*b], &t.columns[*c], indices);
                         }
-                        FusedAgg::AvgCol(a) => { sums[j] += f64::from_bits(t.columns[*a][i]); counts[j] += 1; }
-                        FusedAgg::MinCol(a) => { let v = f64::from_bits(t.columns[*a][i]); if v < mins[j] { mins[j] = v; } }
-                        FusedAgg::MaxCol(a) => { let v = f64::from_bits(t.columns[*a][i]); if v > maxs[j] { maxs[j] = v; } }
+                        FusedAgg::AvgCol(a) => {
+                            sums[j] = simd_agg::sum_f64_by_idx(&t.columns[*a], indices);
+                            counts[j] = n as u64;
+                        }
+                        FusedAgg::MinCol(a) => {
+                            let col = &t.columns[*a];
+                            let mut m = f64::INFINITY;
+                            for &i in indices {
+                                let v = f64::from_bits(col[i]);
+                                if v < m { m = v; }
+                            }
+                            mins[j] = m;
+                        }
+                        FusedAgg::MaxCol(a) => {
+                            let col = &t.columns[*a];
+                            let mut m = f64::NEG_INFINITY;
+                            for &i in indices {
+                                let v = f64::from_bits(col[i]);
+                                if v > m { m = v; }
+                            }
+                            maxs[j] = m;
+                        }
+                    }
+                }
+            } else {
+                // Scalar per-row path for small groups (avoids SIMD setup overhead).
+                for &i in indices {
+                    for (j, plan) in plans.iter().enumerate() {
+                        match plan.as_ref().unwrap() {
+                            FusedAgg::GroupByCol(idx) => {
+                                if !gb_found[j] { gb_vals[j] = t.columns[*idx][i]; gb_found[j] = true; }
+                            }
+                            FusedAgg::CountAll => { counts[j] += 1; }
+                            FusedAgg::SumCol(a) => { sums[j] += f64::from_bits(t.columns[*a][i]); }
+                            FusedAgg::SumColCol(a, b) => { sums[j] += f64::from_bits(t.columns[*a][i]) * f64::from_bits(t.columns[*b][i]); }
+                            FusedAgg::SumColSubOne(a, b) => { sums[j] += f64::from_bits(t.columns[*a][i]) * (1.0 - f64::from_bits(t.columns[*b][i])); }
+                            FusedAgg::SumColSubOneAddOne(a, b, c) => {
+                                sums[j] += f64::from_bits(t.columns[*a][i]) * (1.0 - f64::from_bits(t.columns[*b][i])) * (1.0 + f64::from_bits(t.columns[*c][i]));
+                            }
+                            FusedAgg::AvgCol(a) => { sums[j] += f64::from_bits(t.columns[*a][i]); counts[j] += 1; }
+                            FusedAgg::MinCol(a) => { let v = f64::from_bits(t.columns[*a][i]); if v < mins[j] { mins[j] = v; } }
+                            FusedAgg::MaxCol(a) => { let v = f64::from_bits(t.columns[*a][i]); if v > maxs[j] { maxs[j] = v; } }
+                        }
                     }
                 }
             }

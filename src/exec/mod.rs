@@ -11,3 +11,4 @@ pub mod join_hash_table;
 pub mod bloom_filter;
 pub mod zone_map;
 pub mod fixed_agg;
+pub mod simd_agg;
