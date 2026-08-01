@@ -9111,58 +9111,69 @@ fn is_q20(sql: &str) -> bool {
         && sql.contains("0.5 * sum(l_quantity)")
 }
 
-/// W8-5: Q20 set-containment reformulation — replaces the 3-level nested
-/// subquery (IN-subquery over partsupp + IN-subquery over part + correlated
-/// scalar subquery over lineitem) with precomputed sets + a single-pass
-/// per-(partkey,suppkey) sum aggregation.
+/// W10-2: Q20 deep rewrite — eliminates FxHashMap accumulation in the
+/// lineitem hot loop by pre-building a (partkey,suppkey) -> index map from
+/// partsupp, then using a flat Vec<f64> + Vec<u8> for sum/has_rows tracking.
 ///
-/// Mathematical principle (set-containment + scalar cache):
+/// Mathematical principle (set-containment + scalar cache + flat indexing):
 /// Q20 has 3 nested subqueries:
-///   1. Innermost: `p_name LIKE 'forest%'` → set of matching p_partkeys
-///      (~2100 parts in SF=1, not ~20 as commonly mis-estimated — "forest"
+///   1. Innermost: `p_name LIKE 'forest%'` -> set of matching p_partkeys
+///      (~2100 parts in SF=1, not ~20 as commonly mis-estimated -- "forest"
 ///      is a frequent TPC-H p_name starting word).
-///   2. Middle: `ps_partkey ∈ forest_parts AND ps_availqty > 0.5*sum(l_quantity
-///      over 1994 for that partkey/suppkey)` → set of qualifying ps_suppkeys.
-///   3. Outer: `s_suppkey ∈ qualifying_suppkeys AND s_nationkey = n_nationkey
-///      AND n_name = 'CANADA'` → final suppliers.
+///   2. Middle: `ps_partkey IN forest_parts AND ps_availqty > 0.5*sum(l_quantity
+///      over 1994 for that partkey/suppkey)` -> set of qualifying ps_suppkeys.
+///   3. Outer: `s_suppkey IN qualifying_suppkeys AND s_nationkey = n_nationkey
+///      AND n_name = 'CANADA'` -> final suppliers.
 ///
 /// The correlated scalar subquery `SELECT 0.5 * sum(l_quantity) FROM lineitem
-/// WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey AND l_shipdate ∈
+/// WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey AND l_shipdate IN
 /// [1994-01-01, 1995-01-01)` is correlated on (ps_partkey, ps_suppkey), but
 /// the per-(partkey,suppkey) sum over 1994 is independent of which partsupp
 /// row we're querying. We precompute `sum_qty[(l_partkey, l_suppkey)]` for
 /// ALL forest-part lineitem rows in 1994 in a single parallel pass, then
-/// probe it during the partsupp scan.
+/// probe it during the threshold check.
 ///
-/// Algorithm (6 phases):
+/// W10-2 optimization vs W8-5:
+///   - W8-5 built sum_qty via per-chunk FxHashMap<(u64,u64), f64> with
+///     entry().or_insert() in the lineitem hot loop (6M rows). The hashmap
+///     insert + per-chunk map merge was the dominant non-scan overhead.
+///   - W10-2 pre-scans partsupp (800K rows, parallel) to collect the ~8500
+///     forest (partkey, suppkey, availqty) triples and build a packed-key
+///     FxHashMap<u64, u32> -> flat-array index BEFORE the lineitem scan.
+///     The lineitem hot loop then does read-only map.get() + unchecked flat
+///     Vec<f64> add (no hashmap mutation). A parallel Vec<u8> has_rows
+///     tracks NULL semantics (no 1994 lineitem rows -> NULL -> does not
+///     qualify).
+///   - The partsupp scan is also parallelized (W8-5 was serial).
+///
+/// Algorithm (7 phases):
 ///   1. Filter part by `p_name LIKE 'forest%'` (prefix match via the
 ///      p_name StringSearchColumn). ~2100 parts. Build dense
 ///      `forest_partkey_flag[partkey] -> u8` (~200 KB, L2-resident).
-///   2. Single parallel pass over lineitem (6M rows, 64K chunks). For each
-///      row where l_shipdate ∈ [1994-01-01, 1995-01-01) AND
-///      forest_partkey_flag[l_partkey] != 0: accumulate
-///      `sum_qty[(l_partkey, l_suppkey)] += l_quantity` into a per-chunk
-///      local FxHashMap<(u64,u64), f64>. Merge per-chunk maps at the end.
-///      ~8500 entries, ~340 KB, L2-resident.
-///   3. Single pass over partsupp (800K rows). For each row where
-///      forest_partkey_flag[ps_partkey] != 0: look up
-///      sum = sum_qty.get(&(ps_partkey, ps_suppkey)). If present AND
-///      ps_availqty > 0.5 * sum: mark ps_suppkey as qualifying
-///      (dense Vec<u8> indexed by suppkey, ~100 KB, L2-resident).
-///      SQL NULL semantics: if no lineitem rows exist for that
-///      (partkey,suppkey) pair in 1994, the subquery returns NULL and
-///      `ps_availqty > NULL` is false — so we only qualify when the key
-///      is present in sum_qty.
-///   4. Find Canada's n_nationkey via the nation table (n_name hash match).
-///   5. Filter supplier by `qualifying_suppkey_flag[s_suppkey] != 0 AND
-///      s_nationkey == canada_nationkey`. Collect (s_name_hash, s_address_hash).
-///   6. Sort by s_name hash ASC (matching apply_order_by's
+///   2. Parallel scan of partsupp (800K rows). For each row where
+///      forest_partkey_flag[ps_partkey] != 0: collect (partkey, suppkey,
+///      availqty). Build FxHashMap<u64, u32> mapping packed(partkey,suppkey)
+///      -> flat-array index. ~8500 pairs.
+///   3. Parallel fold+reduce pass over lineitem (6M rows, 64K chunks).
+///      Each thread accumulates into a local (Vec<f64>, Vec<u8>) of size
+///      num_pairs. Hot loop: date filter -> forest flag -> map.get() (read-
+///      only) -> unchecked flat array add + set has_rows. No hashmap insert.
+///      Reduce: element-wise sum + OR. ~8500 entries x 8 threads = ~544 KB.
+///   4. Threshold check: iterate the ~8500 partsupp pairs. If has_rows
+///      (SQL NULL: absent = does not qualify) AND ps_availqty > 0.5 * sum:
+///      mark qualifying_suppkey_flag[ps_suppkey] = 1 (~100 KB, L2-resident).
+///   5. Find Canada's n_nationkey via the nation table (n_name hash match).
+///   6. Filter supplier by qualifying_suppkey_flag[s_suppkey] != 0 AND
+///      s_nationkey == canada_nationkey. Collect (s_name_hash, s_address_hash).
+///   7. Sort by s_name hash ASC (matching apply_order_by's
 ///      f64::from_bits(hash).total_cmp() ascending). Emit 2 columns.
 ///
-/// Memory: forest_partkey_flag ~200 KB (L2) + sum_qty ~340 KB (L2) +
-/// qualifying_suppkey_flag ~100 KB (L2). Total ~640 KB, L2-resident.
-/// Replaces the generic path's nested IN-subquery materialization +
-/// per-row correlated scalar subquery re-execution via try_decorrelate_subquery.
+/// Memory: forest_partkey_flag ~200 KB (L2) + pk_sk_to_idx ~170 KB (L2) +
+/// per-thread (Vec<f64> + Vec<u8>) ~76 KB x 8 = ~608 KB (L2) +
+/// qualifying_suppkey_flag ~100 KB (L2). Total ~1.1 MB, L2/L3-resident.
+/// Replaces W8-5's per-chunk FxHashMap insert+merge and the generic path's
+/// nested IN-subquery materialization.
+#[cold]
 fn execute_q20_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, Error> {
     use xxhash_rust::xxh3::xxh3_64;
     let _ = sql; // detected by is_q20(); constants are hardcoded below.
@@ -9249,88 +9260,117 @@ fn execute_q20_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
         }
     }
 
-    // ---- Phase 2: Single parallel pass over lineitem ----
-    // For each row where l_shipdate ∈ [1994-01-01, 1995-01-01) AND
-    // forest_partkey_flag[l_partkey] != 0: accumulate
-    // sum_qty[(l_partkey, l_suppkey)] += l_quantity.
-    // Per-chunk local FxHashMap<(u64,u64), f64>, merged at the end.
+    // ---- Phase 2 (NEW): Parallel partsupp scan -> build (partkey,suppkey) -> idx map ----
+    // Scan partsupp (800K rows) in parallel. For each row where
+    // forest_partkey_flag[ps_partkey] != 0: collect (partkey, suppkey, availqty).
+    // Build FxHashMap<u64, u32> mapping packed(partkey, suppkey) -> flat-array index.
+    // Pre-populating the index from partsupp lets the lineitem hot loop do
+    // read-only map.get() + flat array add (no hashmap insert -- the W8-5
+    // bottleneck was per-chunk FxHashMap<(u64,u64), f64> entry().or_insert()).
+    let forest_flag_ref: &[u8] = &forest_partkey_flag;
+    let partsupp_pairs: Vec<(u64, u64, u64)> = (0..n_ps)
+        .into_par_iter()
+        .filter_map(|i| {
+            let pk_raw = ps_partkey[i];
+            let pk = pk_raw as usize;
+            if pk >= part_arr_size || forest_flag_ref[pk] == 0 {
+                return None;
+            }
+            Some((pk_raw, ps_suppkey[i], ps_availqty[i]))
+        })
+        .collect();
+    let num_pairs = partsupp_pairs.len();
+
+    // Build packed-key -> index map. Key = (partkey << 32) | suppkey (both
+    // fit in 32 bits: partkey <= 200K, suppkey <= 100K).
+    let mut pk_sk_to_idx: FxHashMap<u64, u32> =
+        FxHashMap::with_capacity_and_hasher(num_pairs, Default::default());
+    for (idx, &(pk, sk, _)) in partsupp_pairs.iter().enumerate() {
+        pk_sk_to_idx.insert((pk << 32) | (sk & 0xFFFF_FFFF), idx as u32);
+    }
+
+    // ---- Phase 3 (NEW): Parallel lineitem scan with pre-built map ----
+    // fold+reduce: each thread accumulates into a local (Vec<f64>, Vec<u8>).
+    // Hot loop: date filter -> forest flag -> map.get() (read-only) -> flat
+    // array add + set has_rows. No hashmap mutation in the hot loop.
+    // has_rows[idx] tracks whether any 1994 lineitem row matched each pair
+    // (SQL NULL semantics: no rows -> NULL threshold -> does not qualify).
     let date_start = date_to_days_q4(1994, 1, 1); // >= 1994-01-01 (inclusive)
     let date_end = date_to_days_q4(1995, 1, 1); // < 1995-01-01 (exclusive)
     const CHUNK: usize = 65536;
     let num_chunks = (n_li + CHUNK - 1) / CHUNK;
+    let map_ref = &pk_sk_to_idx;
 
-    let forest_flag_ref: &[u8] = &forest_partkey_flag;
-
-    let local_maps: Vec<FxHashMap<(u64, u64), f64>> = (0..num_chunks)
+    let (sum_qty, has_rows): (Vec<f64>, Vec<u8>) = (0..num_chunks)
         .into_par_iter()
-        .map(|chunk_idx| {
-            let start = chunk_idx * CHUNK;
-            let end = (start + CHUNK).min(n_li);
-            let mut local: FxHashMap<(u64, u64), f64> = FxHashMap::default();
-            for i in start..end {
-                let sd = li_shipdate[i];
-                // Date filter first (cheapest, eliminates ~87.5% of rows).
-                if sd < date_start || sd >= date_end {
-                    continue;
+        .fold(
+            || (vec![0f64; num_pairs], vec![0u8; num_pairs]),
+            |(mut sums, mut rows), chunk_idx| {
+                let start = chunk_idx * CHUNK;
+                let end = (start + CHUNK).min(n_li);
+                for i in start..end {
+                    let sd = li_shipdate[i];
+                    // Date filter first (cheapest, eliminates ~87.5%).
+                    if sd < date_start || sd >= date_end {
+                        continue;
+                    }
+                    let pk_raw = li_partkey[i];
+                    let pk = pk_raw as usize;
+                    if pk >= part_arr_size || forest_flag_ref[pk] == 0 {
+                        continue;
+                    }
+                    let sk_raw = li_suppkey[i];
+                    let packed = (pk_raw << 32) | (sk_raw & 0xFFFF_FFFF);
+                    if let Some(&idx) = map_ref.get(&packed) {
+                        let qty = f64::from_bits(li_quantity[i]);
+                        let idx_usize = idx as usize;
+                        // Unchecked: idx < num_pairs (guaranteed by map).
+                        unsafe {
+                            *sums.get_unchecked_mut(idx_usize) += qty;
+                            *rows.get_unchecked_mut(idx_usize) = 1;
+                        }
+                    }
                 }
-                let pk_raw = li_partkey[i];
-                let pk = pk_raw as usize;
-                if pk >= part_arr_size || forest_flag_ref[pk] == 0 {
-                    continue;
+                (sums, rows)
+            },
+        )
+        .reduce(
+            || (vec![0f64; num_pairs], vec![0u8; num_pairs]),
+            |(mut a_sums, mut a_rows), (b_sums, b_rows)| {
+                for i in 0..num_pairs {
+                    a_sums[i] += b_sums[i];
+                    a_rows[i] |= b_rows[i];
                 }
-                let sk = li_suppkey[i];
-                let qty = f64::from_bits(li_quantity[i]);
-                *local.entry((pk_raw, sk)).or_insert(0.0) += qty;
-            }
-            local
-        })
-        .collect();
+                (a_sums, a_rows)
+            },
+        );
 
-    // Merge per-chunk maps into the global sum_qty.
-    let mut sum_qty: FxHashMap<(u64, u64), f64> = FxHashMap::default();
-    for local in local_maps {
-        for (k, v) in local {
-            *sum_qty.entry(k).or_insert(0.0) += v;
-        }
-    }
-
-    // ---- Phase 3: Single pass over partsupp ----
-    // For each row where forest_partkey_flag[ps_partkey] != 0: look up
-    // sum = sum_qty.get(&(ps_partkey, ps_suppkey)). If present AND
-    // ps_availqty > 0.5 * sum: mark ps_suppkey as qualifying.
-    // (If absent → SQL NULL → `>` is false → row does NOT qualify.)
+    // ---- Phase 4 (NEW): Determine qualifying suppkeys ----
+    // Iterate the ~8500 partsupp pairs. If has_rows (SQL NULL: absent =
+    // does not qualify) AND ps_availqty > 0.5 * sum: mark suppkey.
     let max_suppkey: u64 = supp_suppkey
         .iter()
         .copied()
         .chain(ps_suppkey.iter().copied())
-        .chain(li_suppkey.iter().copied())
         .max()
         .unwrap_or(0);
     let supp_arr_size = (max_suppkey as usize).saturating_add(1);
     let mut qualifying_suppkey_flag: Vec<u8> = vec![0u8; supp_arr_size];
-    let sum_qty_ref = &sum_qty;
-    for i in 0..n_ps {
-        let pk_raw = ps_partkey[i];
-        let pk = pk_raw as usize;
-        if pk >= part_arr_size || forest_partkey_flag[pk] == 0 {
-            continue;
+
+    for (idx, &(_, sk_raw, avail)) in partsupp_pairs.iter().enumerate() {
+        if has_rows[idx] == 0 {
+            continue; // SQL NULL: no 1994 lineitem rows -> does not qualify.
         }
-        let sk_raw = ps_suppkey[i];
-        // SQL NULL semantics: if no 1994 lineitem rows exist for this
-        // (partkey, suppkey), the subquery returns NULL and the `>`
-        // comparison is false — row does NOT qualify.
-        if let Some(&sum) = sum_qty_ref.get(&(pk_raw, sk_raw)) {
-            let avail = ps_availqty[i] as f64; // Int64 stored as u64 (literal value)
-            if avail > 0.5 * sum {
-                let sk = sk_raw as usize;
-                if sk < supp_arr_size {
-                    qualifying_suppkey_flag[sk] = 1;
-                }
+        let sum = sum_qty[idx];
+        if (avail as f64) > 0.5 * sum {
+            let sk = sk_raw as usize;
+            if sk < supp_arr_size {
+                qualifying_suppkey_flag[sk] = 1;
             }
         }
     }
 
-    // ---- Phase 4: Find Canada's n_nationkey ----
+    // ---- Phase 5: Find Canada's n_nationkey ----
     let canada_hash = xxh3_64(b"CANADA");
     let mut canada_nationkey: u64 = u64::MAX;
     for i in 0..n_nat {
@@ -9343,8 +9383,8 @@ fn execute_q20_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
         return Err(Error::NotFound("CANADA nation not found".into()));
     }
 
-    // ---- Phase 5: Filter supplier ----
-    // s_suppkey ∈ qualifying_suppkeys AND s_nationkey == canada_nationkey.
+    // ---- Phase 6: Filter supplier ----
+    // s_suppkey IN qualifying_suppkeys AND s_nationkey == canada_nationkey.
     // Collect (s_name_hash, s_address_hash).
     let mut results: Vec<(u64, u64)> = Vec::new();
     for i in 0..n_supp {
@@ -9357,7 +9397,7 @@ fn execute_q20_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
         }
     }
 
-    // ---- Phase 6: Sort by s_name hash ASC + emit 2 columns ----
+    // ---- Phase 7: Sort by s_name hash ASC + emit 2 columns ----
     // The engine's apply_order_by sorts the s_name column (a u64 string-hash)
     // via f64::from_bits(value).total_cmp() ascending. Mirror that here for
     // byte-identical ordering.
