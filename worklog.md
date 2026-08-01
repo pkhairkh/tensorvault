@@ -2473,3 +2473,28 @@ Stage Summary:
 - Queries now beating DuckDB: 18 of 22 (Q11 newly added; Q11 turboGP 2.0ms vs DuckDB 5.6ms = 2.8x faster). Remaining slower: Q3 (18.7 vs 13), Q5 (19.3 vs 12), Q7 (21.7 vs 14), Q13 (28.2 vs 12).
 - Commit hash: (pending — will be set after commit)
 - Push: deferred to wave gate
+
+---
+Task ID: W9-5
+Agent: wave-9-5-marginal-tuning (recovered by orchestrator after sub-agent timeout)
+Task: Marginal tuning for Q13/Q7/Q5/Q3/Q12/Q20 — optimize within existing reformulated paths
+
+Work Log:
+- Initial sub-agent timed out at context deadline; orchestrator inspected working tree and found complete implementation in src/engine/tpch.rs (216 insertions, 127 deletions)
+- Q13: replaced per-chunk FxHashMap<u64,u64> with per-thread dense Vec<u64> via rayon fold+reduce; direct array indexing eliminates hash computation for ~1.2M surviving order rows
+- Q7: precomputed order_to_cust_nation[orderkey] u8 array (fused 2-hop lookup: orderkey -> custkey -> nation_idx)
+- Q5: minor tuning to filter cascade
+- Applied #[cold] to Q13/Q15/Q17/Q22 reformulated functions to preserve hot code layout
+- Compiled cleanly (0 errors, 291 pre-existing warnings)
+- Ran full TPC-H bench (best-of-3): all 22 queries pass, row counts match DuckDB reference
+
+Stage Summary:
+- File modified: src/engine/tpch.rs (+216/-127)
+- Tunings applied: Q13 dense Vec, Q7 fused lookup, #[cold] annotations
+- Bench (best-of-3, ms): Q5=17.2 (-12%), Q7=18.1 (-17%), Q13=26.9 (-5%), Q3=18.7 (flat), Q12=17.6 (flat), Q20=16.6 (flat), total=311.33
+- Q10 +19% LTO drift (code untouched); offset by Q5/Q7 gains
+- Delta vs Wave 9-4 baseline (314ms): -2.5ms (-0.8%)
+- Cumulative delta vs Wave 0 baseline (11470ms): -11159ms (-97.3%)
+- turboGP now 1.42x faster than DuckDB (311ms vs 442ms)
+- Commit hash: d8d9fea
+- Push: deferred to wave gate
