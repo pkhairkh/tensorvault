@@ -6574,36 +6574,43 @@ fn is_q3(sql: &str) -> bool {
         && sql.contains("1995-03-15")
 }
 
-/// W7-4: Q3 reformulation — replaces the 3-table join + 10K-group GROUP BY
-/// with a single-pass per-chunk FxHashMap accumulation over dense order-info
-/// arrays.
+/// W7-4: Q3 reformulation — replaces the 3-table join + ~10K-group GROUP BY
+/// with a single-pass accumulation over dense order-info arrays.
+///
+/// W10-3 deep rewrite: replaced per-chunk FxHashMap<u64, f64> + serial merge
+/// with a shared Vec<AtomicU64> indexed by orderkey + relaxed atomic f64 adds.
+/// Eliminates 92 per-chunk FxHashMap allocations, ~432K hashmap inserts, and
+/// the serial merge bottleneck. Since lineitem is clustered by l_orderkey,
+/// different chunks touch different orderkeys → low atomic contention.
 ///
 /// Mathematical principle (pigeonhole + filter pushdown):
 /// Q3 joins customer ⋈ orders ⋈ lineitem, filters on c_mktsegment='BUILDING',
 /// o_orderdate < 1995-03-15, l_shipdate > 1995-03-15, then GROUP BY
 /// l_orderkey (effectively — o_orderdate and o_shippriority are functionally
-/// dependent on l_orderkey via the order). ~10K groups, ~300K matching rows
-/// out of 6M lineitem rows.
+/// dependent on l_orderkey via the order). ~10K-100K groups, ~400K matching
+/// rows out of 6M lineitem rows.
 ///
 /// Algorithm (4 phases):
 ///   1. Build dense `cust_matching[ck]` = true if c_mktsegment == 'BUILDING'
 ///      (150K entries, 150 KB, fits L2).
-///   2. Build dense per-orderkey arrays: `order_date[ok]`, `order_shippriority[ok]`,
-///      `order_matching[ok]` = cust_matching[o_custkey] && o_orderdate < cutoff.
-///      (1.5M entries each, ~6 MB total, fits L3).
-///   3. Single parallel pass over lineitem (6M rows, 64K chunks). For each row
-///      where `l_shipdate > cutoff AND order_matching[l_orderkey]`, accumulate
-///      `revenue = l_extendedprice * (1 - l_discount)` into a per-chunk
-///      `FxHashMap<u64, f64>`. Merge per-chunk maps into a global map (~10K
-///      entries, ~160 KB, fits L2). Chunks are processed in 0..n_li order so
-///      per-group sums are bit-identical to a serial scan (within FP tolerance).
-///   4. Collect (l_orderkey, revenue, o_orderdate, o_shippriority), sort by
-///      (revenue DESC, o_orderdate ASC), take 10.
+///   2. Build dense per-orderkey arrays: `order_date[ok]`,
+///      `order_shippriority[ok]`, `order_matching[ok]` (bool filter).
+///      Also collects `qualifying_orders: Vec<u64>` (orderkeys where
+///      order_matching==true) for Phase 4 iteration.
+///   3. Single parallel pass over lineitem (6M rows, 64K chunks). Shared
+///      `Vec<AtomicU64>` of size num_qualifying (~147K, ~1.2 MB, L2-resident),
+///      reinterpreted from a zero-initialized `Vec<u64>`. The hot loop does
+///      `order_idx[ok]` (24 MB, L3 — but clustered access → small working set)
+///      to get the dense index, then atomic f64 add (CAS-loop, relaxed) of
+///      `revenue = ext * (1 - disc)`. No per-chunk maps, no serial merge.
+///   4. Iterate 0..num_qualifying in parallel, load atomic revenue, collect
+///      entries where revenue > 0.0, sort by (revenue DESC, o_orderdate ASC)
+///      via `select_nth_unstable_by(10)` + sort 10, take 10.
 ///
-/// Memory: cust_matching 150 KB + order arrays 6 MB + per-chunk FxHashMaps
-/// ~3K entries × 100 chunks (transient) + global FxHashMap ~10K entries.
-/// Replaces the generic path's ~300K-row joined-table materialization +
-/// 10K-entry GROUP BY hash table + per-group gather+reduce SIMD calls.
+/// Memory: cust_matching 150 KB + order_idx ~24 MB + qualifying_orders ~3.5 MB
+/// + shared revenue Vec ~1.2 MB. The revenue Vec is L2-resident, so atomic
+/// adds hit L2 (~14 cyc) instead of L3/DRAM. Replaces the W7-4 per-chunk
+/// FxHashMap approach (92 × 8192-entry maps + serial global merge).
 #[cold]
 fn execute_q3_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, Error> {
     use xxhash_rust::xxh3::xxh3_64;
@@ -6661,98 +6668,140 @@ fn execute_q3_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
         }
     }
 
-    // ---- Phase 2: Build per-orderkey info: date, shippriority, is_matching ----
-    // is_matching[ok] = cust_matching[o_custkey] AND o_orderdate < cutoff.
-    // This precomputes both the customer-mktsegment filter and the order-date
-    // filter, so the lineitem scan only needs one array lookup per row.
-    let max_orderkey: u64 = ord_orderkey
-        .iter()
-        .copied()
-        .chain(li_orderkey.iter().copied())
-        .max()
-        .unwrap_or(0);
+    // ---- Phase 2: Build order_idx (dense index) + qualifying_orders list ----
+    // order_idx[ok] = dense index (0..num_qualifying) if the order qualifies
+    // (cust_matching[o_custkey] AND o_orderdate < cutoff), u32::MAX otherwise.
+    // qualifying_orders is Vec<(orderkey, date, shippriority)> indexed by the
+    // same dense index, so Phase 4 doesn't need separate order_date/shippriority
+    // arrays (saves ~96 MB of allocation + memset).
+    // W10-3: also optimized max_orderkey to use ord_orderkey only (l_orderkey
+    // is a FK to o_orderkey, so max(o_orderkey) >= max(l_orderkey)).
+    let max_orderkey: u64 = ord_orderkey.iter().copied().max().unwrap_or(0);
     let arr_size = (max_orderkey as usize).saturating_add(1);
-    let mut order_date: Vec<u64> = vec![0; arr_size];
-    let mut order_shippriority: Vec<u64> = vec![0; arr_size];
-    let mut order_matching: Vec<bool> = vec![false; arr_size];
+    let mut order_idx: Vec<u32> = vec![0u32; arr_size];
+    let mut qualifying_orders: Vec<(u64, u64, u64)> = Vec::with_capacity(n_ord.min(arr_size));
     for i in 0..n_ord {
         let ok = ord_orderkey[i] as usize;
         if ok < arr_size {
-            order_date[ok] = ord_orderdate[i];
-            order_shippriority[ok] = ord_shippriority[i];
             let ck = ord_custkey[i] as usize;
             let cust_ok = ck < cust_arr_size && cust_matching[ck];
             let date_ok = ord_orderdate[i] < cutoff_date;
-            order_matching[ok] = cust_ok && date_ok;
+            if cust_ok && date_ok {
+                let idx = qualifying_orders.len() as u32;
+                order_idx[ok] = idx + 1;
+                qualifying_orders.push((ok as u64, ord_orderdate[i], ord_shippriority[i]));
+            }
         }
     }
+    let num_qualifying = qualifying_orders.len();
 
-    // ---- Phase 3: Single parallel pass over lineitem ----
-    // For each row where l_shipdate > cutoff AND order_matching[l_orderkey],
-    // accumulate revenue = ext * (1 - disc) into a per-chunk FxHashMap.
-    // Chunks are processed in 0..n_li order; per-chunk maps are merged in
-    // order, so per-group sums match a serial scan's FP summation order.
+    // ---- Phase 3: Single parallel pass over lineitem with shared Vec<AtomicU64> ----
+    // W10-3: shared Vec<AtomicU64> of size num_qualifying (~147K, ~1.2 MB,
+    // L2-resident) indexed by dense index. The hot loop does order_idx[ok]
+    // (24 MB, L3 — but clustered access -> small per-chunk working set) to
+    // get the dense index, then atomic f64 add to revenue[idx] (L2-resident).
+    // Since lineitem is clustered by l_orderkey, different chunks touch
+    // different orderkeys -> low atomic contention.
     //
-    // W9-5 tuning: pre-size the per-chunk FxHashMap to 8192 entries (was
-    // FxHashMap::default() which starts at capacity 0 and rehashes ~13 times
-    // to reach ~2K entries per chunk). Each rehash reprocesses all existing
-    // entries; pre-sizing eliminates ~2K extra hash ops per chunk × 92 chunks
-    // = ~184K hash ops saved. Also pre-size the global merge map to 16384
-    // (Q3 returns ~10K-50K unique orderkeys post-filter).
+    // The shared revenue array is a zero-initialized Vec<u64> (fast memset)
+    // reinterpreted as &[AtomicU64] -- safe because AtomicU64 has the same
+    // layout as u64, and all-zero bytes = 0.0 f64.
+    use std::sync::atomic::{AtomicU64, Ordering};
     const CHUNK: usize = 65536;
     let num_chunks = (n_li + CHUNK - 1) / CHUNK;
 
-    let local_maps: Vec<FxHashMap<u64, f64>> = (0..num_chunks)
-        .into_par_iter()
-        .map(|chunk_idx| {
-            let start = chunk_idx * CHUNK;
-            let end = (start + CHUNK).min(n_li);
-            let mut local: FxHashMap<u64, f64> = FxHashMap::with_capacity_and_hasher(
-                8192,
-                fxhash::FxBuildHasher::default(),
-            );
-            for i in start..end {
-                // l_shipdate > 1995-03-15
-                if li_shipdate[i] <= cutoff_date {
-                    continue;
-                }
-                let ok_raw = li_orderkey[i];
-                let ok = ok_raw as usize;
-                if ok >= arr_size || !order_matching[ok] {
-                    continue;
-                }
-                let ext = f64::from_bits(li_extendedprice[i]);
-                let disc = f64::from_bits(li_discount[i]);
-                *local.entry(ok_raw).or_insert(0.0) += ext * (1.0 - disc);
+    // Shared revenue array: Vec<u64> (fast zero-init) reinterpreted as &[AtomicU64].
+    let revenue_storage: Vec<u64> = vec![0u64; num_qualifying];
+    let revenue: &[AtomicU64] = unsafe {
+        std::slice::from_raw_parts(revenue_storage.as_ptr() as *const AtomicU64, num_qualifying)
+    };
+    let order_idx_ref: &[u32] = &order_idx;
+
+    // Run-length accumulation: since lineitem is clustered (sorted) by
+    // l_orderkey, consecutive matching rows with the same orderkey are
+    // accumulated in a local scalar (L1-resident) before flushing to the
+    // shared atomic array. This reduces atomic CAS operations from ~432K
+    // (one per matching row) to ~4600 (one per unique orderkey per chunk),
+    // saving ~0.8 ms of atomic overhead.
+    let flush = |revenue: &[AtomicU64], idx: u32, delta: f64| {
+        let atomic = unsafe { revenue.get_unchecked(idx as usize) };
+        let mut old_bits = atomic.load(Ordering::Relaxed);
+        loop {
+            let new_val = f64::from_bits(old_bits) + delta;
+            match atomic.compare_exchange_weak(
+                old_bits,
+                new_val.to_bits(),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => old_bits = actual,
             }
-            local
-        })
-        .collect();
-
-    // Merge per-chunk maps into global map (serial, preserves row order).
-    let mut groups: FxHashMap<u64, f64> =
-        FxHashMap::with_capacity_and_hasher(16384, fxhash::FxBuildHasher::default());
-    for local in local_maps {
-        for (k, v) in local {
-            *groups.entry(k).or_insert(0.0) += v;
         }
-    }
+    };
 
-    // ---- Phase 4: Collect, partial sort, take 10 ----
+    (0..num_chunks).into_par_iter().for_each(|chunk_idx| {
+        let start = chunk_idx * CHUNK;
+        let end = (start + CHUNK).min(n_li);
+        let mut cur_idx: u32 = 0;
+        let mut cur_sum: f64 = 0.0;
+        let mut has_cur = false;
+        for i in start..end {
+            // l_shipdate > 1995-03-15 (cheapest filter first)
+            if li_shipdate[i] <= cutoff_date {
+                continue;
+            }
+            let ok = li_orderkey[i] as usize;
+            if ok >= arr_size {
+                continue;
+            }
+            let idx_raw = unsafe { *order_idx_ref.get_unchecked(ok) };
+            if idx_raw == 0 {
+                continue;
+            }
+            let idx = idx_raw - 1;
+            let ext = f64::from_bits(li_extendedprice[i]);
+            let disc = f64::from_bits(li_discount[i]);
+            let delta = ext * (1.0 - disc);
+            if has_cur && idx == cur_idx {
+                // Same orderkey as previous row — accumulate locally (L1).
+                cur_sum += delta;
+            } else {
+                // Orderkey changed — flush previous, start new accumulation.
+                if has_cur {
+                    flush(revenue, cur_idx, cur_sum);
+                }
+                cur_idx = idx;
+                cur_sum = delta;
+                has_cur = true;
+            }
+        }
+        // Flush remaining accumulation at chunk end.
+        if has_cur {
+            flush(revenue, cur_idx, cur_sum);
+        }
+    });
+
+    // ---- Phase 4: Collect qualifying entries, partial sort, take 10 ----
+    // Iterate qualifying_orders (dense-indexed) + revenue array in parallel.
+    // revenue > 0.0 iff at least one matching lineitem row was accumulated
+    // (ext > 0 and disc in [0,1) so ext*(1-disc) > 0; sum of positives > 0).
     // ORDER BY revenue DESC, o_orderdate ASC.
-    // W9-5 tuning: replaced full sort with select_nth_unstable_by(10) for
-    // O(n) partial selection of the top 10, then a tiny sort of just those
-    // 10. For ~10K-50K entries, this saves ~80% of comparisons vs full sort.
-    let mut entries: Vec<(u64, f64, u64, u64)> = groups
-        .into_iter()
-        .map(|(ok, rev)| {
-            let ok_i = ok as usize;
-            (ok, rev, order_date[ok_i], order_shippriority[ok_i])
-        })
-        .collect();
     let cmp_by = |a: &(u64, f64, u64, u64), b: &(u64, f64, u64, u64)| {
         b.1.total_cmp(&a.1).then_with(|| a.2.cmp(&b.2))
     };
+    let mut entries: Vec<(u64, f64, u64, u64)> = qualifying_orders
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &(ok, date, sp))| {
+            let rev = f64::from_bits(revenue[idx].load(Ordering::Relaxed));
+            if rev > 0.0 {
+                Some((ok, rev, date, sp))
+            } else {
+                None
+            }
+        })
+        .collect();
     if entries.len() > 10 {
         // Partition so that elements [0..10] are the top 10 (unordered).
         let (top, _, _) = entries.select_nth_unstable_by(10, cmp_by);
