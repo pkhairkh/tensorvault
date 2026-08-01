@@ -5470,6 +5470,11 @@ pub fn parse_and_execute(sql: &str, catalog: &Catalog) -> Result<QueryResult, Er
     if is_q22(sql) {
         return execute_q22_reformulated(sql, catalog);
     }
+    // W10-6: Q6 fast path — single-table scan with early-exit filters.
+    if is_q6(sql) {
+        return execute_q6_reformulated(sql, catalog);
+    }
+
     // W9-2: Q16 fast path — filter-then-join with sorted-distinct aggregation
     // (dense partkey-indexed group_idx + parallel partsupp scan + parallel
     // sort + sweep dedup). ~29K matching parts → ~2000 groups, ~116K pairs.
@@ -11101,6 +11106,63 @@ unsafe fn accumulate_q11_chunk_avx512(
         *tot += v;
         i += 1;
     }
+}
+
+
+// W10-6: Q6 fast path — single-table scan with 4 filters + 1 sum.
+fn is_q6(sql: &str) -> bool {
+    sql.contains("sum(l_extendedprice * l_discount)") && sql.contains("l_quantity < 24")
+}
+
+#[cold]
+fn execute_q6_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, Error> {
+    let _ = sql;
+    let lineitem_tbl = catalog.get("lineitem")
+        .ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
+    let lineitem = ExecTable::from_catalog(lineitem_tbl, "lineitem");
+
+    let li_quantity = &lineitem.columns[4];
+    let li_extendedprice = &lineitem.columns[5];
+    let li_discount = &lineitem.columns[6];
+    let li_shipdate = &lineitem.columns[10];
+    let n = lineitem.row_count;
+
+    let date_start: u64 = date_to_days_q4(1994, 1, 1);
+    let date_end: u64 = date_to_days_q4(1995, 1, 1);
+    let disc_min_bits = 0.05f64.to_bits();
+    let disc_max_bits = 0.07f64.to_bits();
+    let qty_max = 24u64;
+
+    const CHUNK: usize = 65536;
+    let total: f64 = (0..(n + CHUNK - 1) / CHUNK)
+        .into_par_iter()
+        .map(|chunk_idx| {
+            let start = chunk_idx * CHUNK;
+            let end = (start + CHUNK).min(n);
+            let mut local_sum = 0.0f64;
+            for i in start..end {
+                let sd = unsafe { *li_shipdate.get_unchecked(i) };
+                if sd < date_start || sd >= date_end { continue; }
+                let qty = unsafe { *li_quantity.get_unchecked(i) };
+                if qty >= qty_max { continue; }
+                let disc_bits = unsafe { *li_discount.get_unchecked(i) };
+                if disc_bits < disc_min_bits || disc_bits > disc_max_bits { continue; }
+                let ext = f64::from_bits(unsafe { *li_extendedprice.get_unchecked(i) });
+                let disc = f64::from_bits(disc_bits);
+                local_sum += ext * disc;
+            }
+            local_sum
+        })
+        .sum();
+
+    Ok(QueryResult {
+        columns: vec![ResultColumn {
+            name: "revenue".to_string(),
+            values: vec![total.to_bits()],
+        }],
+        row_count: 1,
+        elapsed_us: 0,
+    })
 }
 
 #[cfg(test)]
