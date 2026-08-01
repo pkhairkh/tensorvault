@@ -1509,3 +1509,54 @@ Stage Summary:
   * Q4: 11.81ms -> 11.9ms (+0.8%, within noise)
 - Commit hash: 2953dec (local only, NOT pushed — orchestrator pushes final)
 - Push: deferred to wave gate
+
+Task ID: W7-5
+Agent: wave-7-5-q9-reformulation
+Task: Q9 6-table join (part⋈partsupp⋈lineitem⋈orders⋈supplier⋈nation) reformulation via filter pushdown + distributive-split single-pass aggregation
+
+Work Log:
+- Read /home/z/my-project/worklog.md (W0-W6 + W-MATH-RESEARCH + W7-0/1/2/3/4). Wave 7-4 baseline = 2876.4ms best-of-3 cross-run, all 22 queries pass. HEAD at a5eb8b7 (post-W7-4 worklog commit). Q9 = 465.9ms (best-of-3), the largest remaining single-query target (16% of total). W7-4 pattern: `is_q{N}` SQL-text detector dispatches to `execute_q{N}_reformulated`, replacing the generic join+groupby path with filter pushdown + dense-array lookups + per-chunk FxHashMap accumulation. Q3/Q12/Q18 each crushed 93-97% via this pattern.
+- Q9 structure: 6-table join with `p_name LIKE '%green%'` (filters part 200K→~700), computed column `amount = l_ext*(1-l_disc) - ps_supplycost*l_qty`, GROUP BY (nation, o_year) → 175 groups, ORDER BY nation ASC, o_year DESC. DuckDB Q9 = 41ms; turboGP was 11x slower (466ms).
+- Verified SSH access. Confirmed HEAD = a5eb8b7 on main. Located dispatch in `parse_and_execute` (src/engine/tpch.rs:5355) and the 6 wave-specific reformulations (q19/q21/q4/q13/q17/q3/q12/q18).
+- Inspected tpch_schema column indices: part[0=p_partkey,1=p_name(String+StringSearchColumn)], partsupp[0=ps_partkey,1=ps_suppkey,3=ps_supplycost(Float64)], lineitem[0=l_orderkey,1=l_partkey,2=l_suppkey,4=l_quantity,5=l_extendedprice,6=l_discount], orders[0=o_orderkey,4=o_orderdate(Date)], supplier[0=s_suppkey,3=s_nationkey], nation[0=n_nationkey,1=n_name(String)].
+- Inspected StringSearchColumn API: `like_contains_mask(pattern) -> Vec<bool>` (memchr-based substring search) for p_name LIKE; `get(i) -> &str` for reverse hash→name mapping in verification.
+- Inspected `days_since_epoch_to_year` (src/types/datetime.rs:29, Howard Hinnant's civil_from_days, 6-8 integer ops) for the extract(year) fast path.
+- Correctness baseline discovery: built `examples/verify_q9.rs` to dump the generic-path Q9 result. Found that the generic `execute_grouped` path returns the GROUP-BY combined-hash key (not the actual n_name/year values) in the `nation` and `o_year` result columns — a latent bug (sum_profit column was correct). Row count 175 was correct, so the bench (which only checks row_count) never caught it. Captured DuckDB ground truth (`/tmp/duckdb_q9.csv`, 175 rows) via `duckdb tpch_sf1.duckdb -csv` for proper correctness comparison.
+- Implemented `is_q9(sql)` (matches `sum_profit` + `o_year` + `p_name LIKE '%green%'` + `ps_supplycost * l_quantity` — unique to Q9) and `execute_q9_reformulated` in src/engine/tpch.rs (inserted after `execute_q18_reformulated`, before `#[cfg(test)]`), dispatched from `parse_and_execute` after the q18 check.
+- Algorithm (6 phases, mirroring the task spec):
+  1. Filter part by p_name LIKE '%green%' via `StringSearchColumn::like_contains_mask("green")` → scatter into dense `matching_part[partkey]` bool array (~200KB, L2-resident). ~700 matching parts.
+  2. Build `supplycost_map: FxHashMap<(partkey<<20|suppkey), f64>` from the ~2800 partsupp rows whose partkey matches (~67KB). Key packing: suppkey < 2^20.
+  3. Build dense lookup arrays: `supp_nationkey[suppkey]` (~800KB), `nation_hash_by_key[nationkey]` + `nation_name_by_key[nationkey]` (25 entries), `order_date[orderkey]` (~12MB, L3-resident).
+  4. Single parallel pass over lineitem (6M rows, 64K chunks). Per row: `matching_part[l_partkey]` L2 bool lookup (filters 99.65%); for ~21K survivors, `(l_partkey,l_suppkey)` hashmap probe → supplycost; `nation_name_hash[supp_nationkey[l_suppkey]]`; year via `days_since_epoch_to_year(order_date[l_orderkey])`; accumulate two per-group sums `(ext_disc, supp_qty)` into per-chunk `FxHashMap<(nationkey, year), (f64, f64)>`.
+  5. Merge per-chunk maps (serial, preserves CSV row order for FP stability).
+  6. Compute `sum_profit = ext_disc - supp_qty` (distributive split: `sum(amount) = sum(ext*(1-disc)) - sum(supplycost*qty)`). Sort by (nation_name ASC, o_year DESC). Return 3 columns.
+- Fixed two compile errors during dev: (a) `nation_name_by_key` declared as `Vec<String>` but assigned `Vec<Option<String>>` → changed type to `Vec<Option<String>>`; (b) resulting `.unwrap_or_default()` on `Option<String>`.
+- Correctness verification (vs DuckDB ground truth, NOT the buggy generic path): `examples/verify_q9.rs` maps nation hash→name via the nation table's StringSearchColumn and prints (nation, o_year, sum_profit) sorted by (name, -year). `diff` against DuckDB's 175-row CSV = EMPTY — turboGP Q9 now matches DuckDB EXACTLY (all 175 rows × 3 columns, sum_profit to 4 decimal places). The reformulation also FIXES the generic path's latent nation/year-columns-are-group-hash bug. 3 sample rows: (ALGERIA, 1998, 27136900.1803), (ALGERIA, 1997, 48611833.4962), (ALGERIA, 1996, 48285482.6782).
+- `cargo build --release` succeeds (291 warnings, 0 errors — warnings are pre-existing).
+- Bench (6 runs, each = best-of-3 internal). Q9 best-of-3-cross-run = 35.5ms (runs: 35.5, 35.9, 36.0, 35.9, ...). Total best = 2403.39ms.
+- Best-of-3 cross-run per-query (min across runs), ms:
+    Q1=22.3, Q2=200.1, Q3=23.7, Q4=11.8, Q5=177.1, Q6=9.6, Q7=565.4, Q8=81.5,
+    Q9=35.5, Q10=325.1, Q11=11.1, Q12=17.4, Q13=27.6, Q14=288.5, Q15=54.1,
+    Q16=70.4, Q17=3.9, Q18=20.2, Q19=4.8, Q20=361.3, Q21=32.2, Q22=56.5.
+    Total (best single run) = 2403.39ms.
+- Comparison vs Wave 7-4 baseline (Q9=465.9ms, total=2876.4ms):
+  * Q9: 465.9ms -> 35.5ms = -430.4ms (-92.4%, 13.1x speedup) — far exceeds ≥60% target (≤187ms) AND the ≤80ms stretch goal. Now 1.15x FASTER than DuckDB (41ms) — turboGP beats DuckDB on Q9 for the first time.
+  * Total: 2876.4ms -> 2403.39ms = -473.0ms (-16.4%)
+  * Q14: 329.2ms -> 288.5ms (-12.4%, -40.7ms — fat-LTO binary-layout drift favored Q14 this build; Q14 code path untouched)
+  * Q18: 20.1ms -> 20.2ms (+0.5%, within noise; run-1 spike to 22.0 was noise, settled to 20.2-20.3)
+  * All other queries within ±5% of W7-4 baseline (Q5 +0.9%, Q7 +1.1%, Q15 +0.6%, Q21 +0.3% — all within historical noise). No query regresses >5%. ✓
+- Root cause of Q9 speedup: the generic DP-join path materialized 6 intermediate joined tables (part⋈partsupp → ~2.8K rows, ⋈lineitem → ~21K but probed all 6M, ⋈orders/supplier/nation) with per-row column copies and a 175-group hash table + per-group gather/reduce. The reformulation does ONE 6M-row lineitem scan with a single L2-resident bool-array lookup per row (filtering 99.65% to ~21K survivors) + dense-array nation/year lookups + per-chunk FxHashMap two-accumulator aggregation. No intermediate table materialization. The distributive split (two independent sums) avoids per-row subtraction.
+- Memory: matching_part 200KB (L2) + supplycost_map 67KB + supp_nationkey 800KB + nation arrays ~1KB + order_date 12MB (L3) + per-chunk FxHashMaps ~175 entries × 93 chunks (transient). All L2/L3-resident. Replaces generic path's 6 joined-table materializations.
+
+Stage Summary:
+- Files modified: src/engine/tpch.rs (+232 lines: is_q9 + execute_q9_reformulated + parse_and_execute dispatch), examples/verify_q9.rs (new, correctness-vs-DuckDB tool, mirrors verify_q7.rs)
+- Functions added: is_q9, execute_q9_reformulated
+- Algorithm: Filter pushdown (p_name LIKE → dense bool array) + dense lookup arrays (supp→nation, nation→name/hash, order→date) + single-pass parallel lineitem scan with per-chunk FxHashMap<(nationkey,year),(ext_disc,supp_qty)> + distributive-split sum_profit = ext_disc - supp_qty.
+- Bench (best-of-3 cross-run, ms): Q9=35.5, total=2403.39
+- Q9 result (175 rows, EXACT match to DuckDB — fixes generic path's nation/year group-hash bug). Top 3: (ALGERIA, 1998, 27136900.1803), (ALGERIA, 1997, 48611833.4962), (ALGERIA, 1996, 48285482.6782).
+- Delta vs Wave 7-4 baseline (Q9=465.9ms, total=2876.4ms):
+  * Q9: 465.9ms -> 35.5ms = -430.4ms (-92.4%, 13.1x speedup, 1.15x faster than DuckDB)
+  * Total: 2876.4ms -> 2403.39ms = -473.0ms (-16.4%)
+  * No query regresses >5% (Q18 +0.5%, all others within ±3% noise)
+- Commit hash: f844510 (local only, NOT pushed — orchestrator pushes final)
+- Push: deferred to wave gate
