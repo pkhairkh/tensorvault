@@ -150,6 +150,47 @@ impl Bitmap {
         bm
     }
 
+    /// In-place bitwise AND: `self &= other` (length = min).
+    /// AVX-512BW fast path processes 64 bytes (512 bits) per iteration.
+    #[inline]
+    pub fn and_inplace(&mut self, other: &Bitmap) {
+        let n = self.bits.len().min(other.bits.len());
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+            unsafe { and_inplace_avx512(&mut self.bits[..n], &other.bits[..n]); }
+            return;
+        }
+        for i in 0..n {
+            self.bits[i] &= other.bits[i];
+        }
+    }
+
+    /// In-place bitwise OR: `self |= other` (length = min).
+    /// AVX-512BW fast path processes 64 bytes (512 bits) per iteration.
+    #[inline]
+    pub fn or_inplace(&mut self, other: &Bitmap) {
+        let n = self.bits.len().min(other.bits.len());
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+            unsafe { or_inplace_avx512(&mut self.bits[..n], &other.bits[..n]); }
+            return;
+        }
+        for i in 0..n {
+            self.bits[i] |= other.bits[i];
+        }
+    }
+
+    /// Write the bitmap's bits into a caller-supplied bool slice
+    /// (1 byte per row). Avoids the `Vec<bool>` allocation of
+    /// `to_bool_vec` when the caller already has a reusable buffer.
+    #[inline]
+    pub fn to_bool_slice(&self, out: &mut [bool]) {
+        debug_assert!(out.len() >= self.len, "to_bool_slice: out too small");
+        for i in 0..self.len {
+            out[i] = (self.bits[i >> 3] >> (i & 7)) & 1 != 0;
+        }
+    }
+
     /// Read-only access to the packed byte buffer.
     pub fn as_bytes(&self) -> &[u8] { &self.bits }
 
@@ -609,6 +650,58 @@ unsafe fn or_into_bool_avx512(bm: &Bitmap, mask: &mut [bool]) {
     }
     while i < n {
         if (bits[i >> 3] >> (i & 7)) & 1 != 0 { *mask.get_unchecked_mut(i) = true; }
+        i += 1;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512dq,avx512bw,avx512vl")]
+unsafe fn and_inplace_avx512(dst: &mut [u8], src: &[u8]) {
+    let n = dst.len();
+    let mut i = 0usize;
+    // 64-byte (512-bit) blocks — 4 cache lines, 1 vpandq + 1 store.
+    while i + 64 <= n {
+        let d = _mm512_loadu_epi8(dst.as_ptr().add(i) as *const i8);
+        let s = _mm512_loadu_epi8(src.as_ptr().add(i) as *const i8);
+        let r = _mm512_and_si512(d, s);
+        _mm512_storeu_epi8(dst.as_mut_ptr().add(i) as *mut i8, r);
+        i += 64;
+    }
+    // 16-byte tail.
+    while i + 16 <= n {
+        let d = _mm_loadu_si128(dst.as_ptr().add(i) as *const __m128i);
+        let s = _mm_loadu_si128(src.as_ptr().add(i) as *const __m128i);
+        let r = _mm_and_si128(d, s);
+        _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, r);
+        i += 16;
+    }
+    while i < n {
+        *dst.get_unchecked_mut(i) &= *src.get_unchecked(i);
+        i += 1;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512dq,avx512bw,avx512vl")]
+unsafe fn or_inplace_avx512(dst: &mut [u8], src: &[u8]) {
+    let n = dst.len();
+    let mut i = 0usize;
+    while i + 64 <= n {
+        let d = _mm512_loadu_epi8(dst.as_ptr().add(i) as *const i8);
+        let s = _mm512_loadu_epi8(src.as_ptr().add(i) as *const i8);
+        let r = _mm512_or_si512(d, s);
+        _mm512_storeu_epi8(dst.as_mut_ptr().add(i) as *mut i8, r);
+        i += 64;
+    }
+    while i + 16 <= n {
+        let d = _mm_loadu_si128(dst.as_ptr().add(i) as *const __m128i);
+        let s = _mm_loadu_si128(src.as_ptr().add(i) as *const __m128i);
+        let r = _mm_or_si128(d, s);
+        _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, r);
+        i += 16;
+    }
+    while i < n {
+        *dst.get_unchecked_mut(i) |= *src.get_unchecked(i);
         i += 1;
     }
 }

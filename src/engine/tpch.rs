@@ -782,6 +782,49 @@ struct TpchExec<'a> {
     decorrelated_cache: std::cell::RefCell<HashMap<usize, (FxHashMap<u64, Value2>, Vec<usize>)>>,
 }
 
+// =============================================================================
+// W2: Reusable bool-mask buffer pool.
+//
+// `eval_bool_mask_vec`'s AND arm previously cloned the running mask per
+// conjunct (`mask.to_vec()`, 6 MB for a 6 M-row lineitem scan); the OR
+// fallback arm allocated two fresh `vec![true; N]` masks per call. Both
+// paths are now backed by this thread-local pool, eliminating the
+// malloc/free overhead in the hot WHERE-evaluation loop.
+//
+// The pool is a stack of `Vec<bool>` buffers. `take_mask_buf(n)` pops a
+// buffer (or allocates if the pool is empty) and resizes it to at least
+// `n`; `return_mask_buf(buf)` pushes it back. Recursion (AND inside OR
+// inside AND, etc.) is safe: a recursive `take_mask_buf` simply pops a
+// different buffer or allocates if the pool is exhausted. After warmup
+// the pool size equals the max recursion depth, and no further
+// allocations occur.
+// ============================================================================
+
+thread_local! {
+    static MASK_POOL: std::cell::RefCell<Vec<Vec<bool>>> =
+        std::cell::RefCell::new(Vec::new());
+}
+
+/// Take a `Vec<bool>` of length >= `n` from the thread-local pool
+/// (allocating if necessary). The caller MUST return it via
+/// `return_mask_buf` to avoid re-allocating on the next call.
+fn take_mask_buf(n: usize) -> Vec<bool> {
+    MASK_POOL.with(|cell| {
+        let mut pool = cell.borrow_mut();
+        let mut buf = pool.pop().unwrap_or_else(|| Vec::with_capacity(n));
+        if buf.len() < n { buf.resize(n, false); }
+        buf
+    })
+}
+
+/// Return a buffer to the thread-local pool for reuse by the next
+/// `take_mask_buf` call on this thread.
+fn return_mask_buf(buf: Vec<bool>) {
+    MASK_POOL.with(|cell| {
+        cell.borrow_mut().push(buf);
+    });
+}
+
 impl<'a> TpchExec<'a> {
     fn execute(&self, query: &SelectQuery2) -> Result<QueryResult, Error> {
         // Pre-execute uncorrelated scalar subqueries found in WHERE/HAVING/SELECT.
@@ -840,11 +883,15 @@ impl<'a> TpchExec<'a> {
             let mask = if multi_table.is_empty() {
                 vec![true; base.row_count]
             } else {
+                // W2: evaluate each multi-table conjunct directly into the
+                // running mask. The simplified AND arm + fixed OR arm in
+                // `eval_bool_mask_vec` preserve the incoming mask (every
+                // leaf ANDs into it), so the previous per-conjunct
+                // `mask.clone()` (6 MB for a 6 M-row base table) is no
+                // longer needed.
                 let mut mask = vec![true; base.row_count];
                 for conj in &multi_table {
-                    let mut cmask = mask.clone();
-                    self.eval_bool_mask_vec(conj, &base, &mut cmask)?;
-                    for i in 0..base.row_count { mask[i] = mask[i] && cmask[i]; }
+                    self.eval_bool_mask_vec(conj, &base, &mut mask)?;
                 }
                 mask
             };
@@ -1237,12 +1284,12 @@ impl<'a> TpchExec<'a> {
         };
 
         // Apply local (non-correlated) conjuncts only.
+        // W2: evaluate each conjunct directly into `m` (the simplified
+        // AND/OR arms in `eval_bool_mask_vec` preserve the incoming mask).
         let mask = {
             let mut m = vec![true; base.row_count];
             for conj in &local_conjuncts {
-                let mut cm = vec![true; base.row_count];
-                self.eval_bool_mask_vec(conj, &base, &mut cm)?;
-                for i in 0..base.row_count { m[i] = m[i] && cm[i]; }
+                self.eval_bool_mask_vec(conj, &base, &mut m)?;
             }
             m
         };
@@ -1497,6 +1544,8 @@ impl<'a> TpchExec<'a> {
             self.join_tables_smart(tables, &subquery.where_clause)?
         };
         // Apply the subquery's WHERE conjuncts, EXCEPT the correlated equi-join.
+        // W2: evaluate each conjunct directly into `mask` (the simplified
+        // AND/OR arms in `eval_bool_mask_vec` preserve the incoming mask).
         let mask = if let Some(ref wc) = subquery.where_clause {
             let conjuncts = self.split_conjuncts(&subquery.where_clause);
             let mut mask = vec![true; base.row_count];
@@ -1504,9 +1553,7 @@ impl<'a> TpchExec<'a> {
                 if self.is_conjunct_correlated(conj, &base) {
                     continue;
                 }
-                let mut cmask = vec![true; base.row_count];
-                self.eval_bool_mask_vec(conj, &base, &mut cmask)?;
-                for i in 0..base.row_count { mask[i] = mask[i] && cmask[i]; }
+                self.eval_bool_mask_vec(conj, &base, &mut mask)?;
             }
             mask
         } else { vec![true; base.row_count] };
@@ -1705,14 +1752,14 @@ impl<'a> TpchExec<'a> {
         } else {
             self.join_tables_smart(tables, &subquery.where_clause)?
         };
+        // W2: evaluate each conjunct directly into `mask` (the simplified
+        // AND/OR arms in `eval_bool_mask_vec` preserve the incoming mask).
         let mask = if let Some(ref wc) = subquery.where_clause {
             let conjuncts = self.split_conjuncts(&subquery.where_clause);
             let mut mask = vec![true; base.row_count];
             for conj in &conjuncts {
                 if self.is_conjunct_correlated(conj, &base) { continue; }
-                let mut cmask = vec![true; base.row_count];
-                self.eval_bool_mask_vec(conj, &base, &mut cmask)?;
-                for i in 0..base.row_count { mask[i] = mask[i] && cmask[i]; }
+                self.eval_bool_mask_vec(conj, &base, &mut mask)?;
             }
             mask
         } else { vec![true; base.row_count] };
@@ -2839,13 +2886,17 @@ impl<'a> TpchExec<'a> {
     fn eval_bool_mask_vec(&self, expr: &Expr2, t: &ExecTable, mask: &mut [bool]) -> Result<(), Error> {
         match expr {
             Expr2::BinOp { op: BinOp2::And, left, right } => {
+                // W2: evaluate left then right directly into the same mask.
+                // All leaf comparisons AND into the mask in place (via
+                // `bitmap::and_into_bool`), the OR arm has been fixed to
+                // AND its disjunction into the mask, and the per-row
+                // fallback paths still early-exit on `if !mask[i] { continue; }`
+                // so rows already filtered out by the left side are
+                // skipped on the right side. This eliminates the previous
+                // `mask.to_vec()` allocation (6 MB for a 6 M-row lineitem
+                // scan) per conjunct.
                 self.eval_bool_mask_vec(left, t, mask)?;
-                // Start rmask from the current mask so that the right side's
-                // per-row eval can skip rows already filtered out by the left
-                // side. This is critical for Q17's correlated subquery.
-                let mut rmask = mask.to_vec();
-                self.eval_bool_mask_vec(right, t, &mut rmask)?;
-                for i in 0..t.row_count { mask[i] = mask[i] && rmask[i]; }
+                self.eval_bool_mask_vec(right, t, mask)?;
                 Ok(())
             }
             Expr2::BinOp { op: BinOp2::Or, left, right } => {
@@ -2856,13 +2907,23 @@ impl<'a> TpchExec<'a> {
                 if self.try_nation_pair_or_lut(expr, t, mask)? {
                     return Ok(());
                 }
-                // Generic OR fallback: allocate 2 fresh masks (ignoring the
-                // incoming mask, which the outer conjunct loop re-ANDs).
-                let mut lmask = vec![true; t.row_count];
-                self.eval_bool_mask_vec(left, t, &mut lmask)?;
-                let mut rmask = vec![true; t.row_count];
-                self.eval_bool_mask_vec(right, t, &mut rmask)?;
-                for i in 0..t.row_count { mask[i] = lmask[i] || rmask[i]; }
+                // W2: generic OR fallback — reuse thread-local pool buffers
+                // instead of allocating 2 fresh `vec![true; N]` masks per
+                // call. The disjunction is AND-ed into the incoming mask
+                // (previously the OR arm OVERWROTE mask, relying on the
+                // outer conjunct loop to re-AND — a latent bug if
+                // eval_bool_mask_vec was ever called on an OR expression
+                // with a non-trivial incoming mask).
+                let n = t.row_count;
+                let mut lmask = take_mask_buf(n);
+                lmask[..n].fill(true);
+                self.eval_bool_mask_vec(left, t, &mut lmask[..n])?;
+                let mut rmask = take_mask_buf(n);
+                rmask[..n].fill(true);
+                self.eval_bool_mask_vec(right, t, &mut rmask[..n])?;
+                for i in 0..n { mask[i] = mask[i] && (lmask[i] || rmask[i]); }
+                return_mask_buf(lmask);
+                return_mask_buf(rmask);
                 Ok(())
             }
             Expr2::BinOp { op, left, right } => {
@@ -2871,25 +2932,74 @@ impl<'a> TpchExec<'a> {
                 Ok(())
             }
             Expr2::Between { expr, low, high, negated } => {
-                // Vectorized BETWEEN: Col >= low AND Col <= high
+                // W2: vectorized BETWEEN via two AVX-512 bitmap filters
+                // (filter_ge_* + filter_le_*) composed with Bitmap::and,
+                // then folded into the running mask via and_into_bool.
+                // Matches the leaf-comparison fast path already used by
+                // `apply_comparison` for `Col op Lit`. For NOT BETWEEN
+                // we compose `col < lo OR col > hi` instead.
                 if let Some(col_idx) = self.col_in(expr, t) {
+                    use crate::exec::bitmap::{self, Bitmap};
                     let lo_val = self.eval_const(low, t)?;
                     let hi_val = self.eval_const(high, t)?;
-                    let col = &t.columns[col_idx];
-                    let is_float = t.col_types[col_idx] == ColType::Float;
-                    for i in 0..t.row_count {
-                        if !mask[i] { continue; }
-                        let v = col[i];
-                        let in_range = if is_float {
-                            let fv = f64::from_bits(v);
-                            let flo = lo_val.as_f64().unwrap_or(f64::NEG_INFINITY);
-                            let fhi = hi_val.as_f64().unwrap_or(f64::INFINITY);
-                            fv >= flo && fv <= fhi
-                        } else {
-                            v >= lo_val.as_u64().unwrap_or(0) && v <= hi_val.as_u64().unwrap_or(u64::MAX)
-                        };
-                        mask[i] = mask[i] && (*negated != in_range);
-                    }
+                    let col: &[u64] = &t.columns[col_idx];
+                    let col_type = t.col_types[col_idx];
+                    let n = t.row_count;
+                    let bm: Bitmap = match col_type {
+                        ColType::Int => {
+                            let lo = lo_val.as_i64().unwrap_or(i64::MIN);
+                            let hi = hi_val.as_i64().unwrap_or(i64::MAX);
+                            if *negated {
+                                let bm_lt = bitmap::filter_lt_i64(col, lo);
+                                let bm_gt = bitmap::filter_gt_i64(col, hi);
+                                bm_lt.or(&bm_gt)
+                            } else {
+                                let bm_ge = bitmap::filter_ge_i64(col, lo);
+                                let bm_le = bitmap::filter_le_i64(col, hi);
+                                bm_ge.and(&bm_le)
+                            }
+                        }
+                        ColType::Date => {
+                            let lo = lo_val.as_u64().unwrap_or(0);
+                            let hi = hi_val.as_u64().unwrap_or(u64::MAX);
+                            if *negated {
+                                let bm_lt = bitmap::filter_lt_u64(col, lo);
+                                let bm_gt = bitmap::filter_gt_u64(col, hi);
+                                bm_lt.or(&bm_gt)
+                            } else {
+                                let bm_ge = bitmap::filter_ge_u64(col, lo);
+                                let bm_le = bitmap::filter_le_u64(col, hi);
+                                bm_ge.and(&bm_le)
+                            }
+                        }
+                        ColType::Float => {
+                            let lo = lo_val.as_f64().unwrap_or(f64::NEG_INFINITY);
+                            let hi = hi_val.as_f64().unwrap_or(f64::INFINITY);
+                            if *negated {
+                                let bm_lt = bitmap::filter_lt_f64(col, lo);
+                                let bm_gt = bitmap::filter_gt_f64(col, hi);
+                                bm_lt.or(&bm_gt)
+                            } else {
+                                let bm_ge = bitmap::filter_ge_f64(col, lo);
+                                let bm_le = bitmap::filter_le_f64(col, hi);
+                                bm_ge.and(&bm_le)
+                            }
+                        }
+                        ColType::String => {
+                            // String hashes are not order-comparable;
+                            // fall back to a per-row scalar loop.
+                            let mut bm = Bitmap::all_ones(n);
+                            let lo = lo_val.as_u64().unwrap_or(0);
+                            let hi = hi_val.as_u64().unwrap_or(u64::MAX);
+                            for i in 0..n {
+                                let v = col[i];
+                                let in_range = v >= lo && v <= hi;
+                                if *negated == in_range { bm.clear(i); }
+                            }
+                            bm
+                        }
+                    };
+                    bitmap::and_into_bool(&bm, &mut mask[..n]);
                     Ok(())
                 } else {
                     // Fallback: per-row eval
