@@ -6717,6 +6717,20 @@ fn execute_q3_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
     };
     let order_idx_ref: &[u32] = &order_idx;
 
+    // W10-6: Build a bitmap of qualifying orderkeys for L2-cache-friendly
+    // pre-filtering. The order_idx array is 4 bytes/entry (~6MB for 1.5M orders)
+    // and lives in L3. The bitmap is 1 bit/entry (~187KB) and fits in L2.
+    // Checking the bitmap first (14 cycles L2) avoids the order_idx lookup
+    // (40+ cycles L3) for ~85% of lineitem rows that don't match.
+    let bitmap_size = (arr_size + 63) / 64;
+    let mut order_bitmap: Vec<u64> = vec![0u64; bitmap_size];
+    for &(ok, _, _) in &qualifying_orders {
+        unsafe {
+            *order_bitmap.get_unchecked_mut((ok / 64) as usize) |= 1u64 << (ok % 64);
+        }
+    }
+    let order_bitmap_ref: &[u64] = &order_bitmap;
+
     // Run-length accumulation: since lineitem is clustered (sorted) by
     // l_orderkey, consecutive matching rows with the same orderkey are
     // accumulated in a local scalar (L1-resident) before flushing to the
@@ -6752,7 +6766,11 @@ fn execute_q3_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
                 continue;
             }
             let ok = li_orderkey[i] as usize;
-            if ok >= arr_size {
+            // W10-6: bitmap pre-filter (L2, ~14 cycles) before order_idx (L3, ~40 cycles)
+            let bit = unsafe {
+                (*order_bitmap_ref.get_unchecked(ok >> 6) >> (ok & 63)) & 1
+            };
+            if bit == 0 {
                 continue;
             }
             let idx_raw = unsafe { *order_idx_ref.get_unchecked(ok) };
