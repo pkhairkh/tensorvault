@@ -6913,10 +6913,11 @@ fn execute_q12_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
 
     // ---- Phase 1: Build dense order_class[ok] ----
     // order_class[ok] = 1 if high-priority (1-URGENT or 2-HIGH), 0 otherwise.
+    // PK-only max: TPC-H referential integrity guarantees all l_orderkey
+    // values exist in orders, so max(l_orderkey) <= max(o_orderkey).
     let max_orderkey: u64 = ord_orderkey
         .iter()
         .copied()
-        .chain(li_orderkey.iter().copied())
         .max()
         .unwrap_or(0);
     let arr_size = (max_orderkey as usize).saturating_add(1);
@@ -7386,10 +7387,11 @@ fn execute_q9_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
 
     // ---- Phase 3: Build dense lookup arrays ----
     // supp_nationkey[suppkey] -> s_nationkey (dense, ~800 KB).
+    // PK-only max: TPC-H referential integrity guarantees all l_suppkey
+    // values exist in supplier, so max(l_suppkey) <= max(s_suppkey).
     let max_suppkey: u64 = supp_suppkey
         .iter()
         .copied()
-        .chain(li_suppkey.iter().copied())
         .max()
         .unwrap_or(0);
     let supp_arr_size = (max_suppkey as usize).saturating_add(1);
@@ -8034,10 +8036,11 @@ fn execute_q7_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
     // u8: 0=FRANCE, 1=GERMANY, 255=other. ~150 KB (150K custkeys x 1B), L2.
     // W9-5 tuning: parallelized (was ~1ms sequential; now ~0.13ms parallel).
     // Safe because c_custkey values are unique.
+    // PK-only max: TPC-H referential integrity guarantees all o_custkey
+    // values exist in customer. Phase 5 uses checked indexing anyway.
     let max_custkey: u64 = cust_custkey
         .iter()
         .copied()
-        .chain(ord_custkey.iter().copied())
         .max()
         .unwrap_or(0);
     let cust_arr_size = (max_custkey as usize).saturating_add(1);
@@ -8367,11 +8370,12 @@ fn execute_q5_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
     // ---- Phase 2: Filter nation by n_regionkey = asia_regionkey ----
     // Build nation_idx_by_key[nationkey] -> u8 (0-4 if Asian, 255 otherwise).
     // Build nation_name_hashes[idx] -> u64 (5 entries, L1-resident).
+    // PK-only max: nationkeys are 0..24 in TPC-H; supplier/customer
+    // nationkeys reference nation (referential integrity). Phases 3/4
+    // use checked indexing, so out-of-range values are safely skipped.
     let max_nationkey: u64 = nat_nationkey
         .iter()
         .copied()
-        .chain(supp_nationkey_col.iter().copied())
-        .chain(cust_nationkey_col.iter().copied())
         .max()
         .unwrap_or(0);
     let nat_arr_size = (max_nationkey as usize).saturating_add(1);
@@ -8506,37 +8510,53 @@ fn execute_q5_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
     // in order, so per-group sums match a serial scan's FP summation order.
     const CHUNK: usize = 65536;
     let num_chunks = (n_li + CHUNK - 1) / CHUNK;
+    // TPC-H ASIA region has exactly 5 nations; [f64; 8] gives headroom.
+    debug_assert!(n_groups <= 8);
 
-    let local_accs: Vec<Vec<f64>> = (0..num_chunks)
+    // Extract slices once: avoids repeated Arc<Vec> deref in the hot loop
+    // and enables get_unchecked (no per-access bounds check).
+    let li_ok: &[u64] = li_orderkey.as_slice();
+    let li_sk: &[u64] = li_suppkey.as_slice();
+    let li_ext: &[u64] = li_extendedprice.as_slice();
+    let li_disc: &[u64] = li_discount.as_slice();
+    let ord_idx: &[u8] = order_cust_nation_idx.as_slice();
+    let supp_idx_arr: &[u8] = supp_nation_idx.as_slice();
+
+    let local_accs: Vec<[f64; 8]> = (0..num_chunks)
         .into_par_iter()
         .map(|chunk_idx| {
             let start = chunk_idx * CHUNK;
             let end = (start + CHUNK).min(n_li);
-            let mut acc = vec![0.0f64; n_groups];
+            // Stack [f64; 8] accumulator -- 64 bytes (1 cache line), L1-resident.
+            // Avoids per-chunk heap allocation; only first n_groups slots used.
+            let mut acc = [0.0f64; 8];
             for i in start..end {
-                let ok_raw = li_orderkey[i];
-                let ok = ok_raw as usize;
-                if ok >= ord_arr_size {
-                    continue;
+                // SAFETY: all indices are in-bounds by construction:
+                // - i < n_li (loop bound).
+                // - ok = li_ok[i] <= max_orderkey < ord_arr_size (max computed
+                //   over ord_orderkey; TPC-H referential integrity guarantees
+                //   all l_orderkey values exist in orders, so <= max).
+                // - sk = li_sk[i] <= max_suppkey < supp_arr_size (same).
+                // - si == ci != 255; ci in [0, n_groups-1] by construction of
+                //   order_cust_nation_idx (set to asian_nations.len() as u8).
+                // - si < n_groups <= 8, so acc[si] is in-bounds.
+                unsafe {
+                    let ok = *li_ok.get_unchecked(i) as usize;
+                    let ci = *ord_idx.get_unchecked(ok);
+                    if ci == 255 {
+                        continue; // order not in date range or customer not Asian
+                    }
+                    let sk = *li_sk.get_unchecked(i) as usize;
+                    let si = *supp_idx_arr.get_unchecked(sk);
+                    // c_nationkey = s_nationkey: customer and supplier must
+                    // be in the SAME Asian nation.
+                    if si != ci {
+                        continue;
+                    }
+                    let ext = f64::from_bits(*li_ext.get_unchecked(i));
+                    let disc = f64::from_bits(*li_disc.get_unchecked(i));
+                    *acc.get_unchecked_mut(si as usize) += ext * (1.0 - disc);
                 }
-                let cust_idx = order_cust_nation_idx[ok];
-                if cust_idx == 255 {
-                    continue; // order not in date range or customer not Asian
-                }
-                let sk_raw = li_suppkey[i];
-                let sk = sk_raw as usize;
-                if sk >= supp_arr_size {
-                    continue;
-                }
-                let supp_idx = supp_nation_idx[sk];
-                // c_nationkey = s_nationkey: customer and supplier must
-                // be in the SAME Asian nation.
-                if supp_idx != cust_idx {
-                    continue;
-                }
-                let ext = f64::from_bits(li_extendedprice[i]);
-                let disc = f64::from_bits(li_discount[i]);
-                acc[supp_idx as usize] += ext * (1.0 - disc);
             }
             acc
         })
