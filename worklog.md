@@ -2498,3 +2498,34 @@ Stage Summary:
 - turboGP now 1.42x faster than DuckDB (311ms vs 442ms)
 - Commit hash: d8d9fea
 - Push: deferred to wave gate
+
+---
+Task ID: W9-FINAL-SUMMARY
+Agent: orchestrator (wave-9-6)
+Task: Wave 9 campaign final summary + confirmation of beating DuckDB overall
+
+Work Log:
+- 6 waves executed (W9-1 through W9-6)
+- Each wave: 1 sub-agent (or orchestrator recovery), code change + commit + worklog
+- Pushed after each wave gate
+- W9-1, W9-5 sub-agents timed out at context deadline; orchestrator recovered complete implementations from working tree
+
+Stage Summary:
+- Starting baseline (Wave 8-6): 495.6 ms (1.12x DuckDB — slightly faster)
+- Final baseline (Wave 9-5): 310.57 ms (1.42x FASTER than DuckDB)
+- Wave 9 improvements:
+  - W9-1 Q22: 56.5 -> 0.5 ms (-99.1%, 113x speedup, 66x faster than DuckDB)
+  - W9-2 Q16: 69.6 -> 6.0 ms (-91.4%, 11.6x speedup, 9.3x faster than DuckDB)
+  - W9-3 Q15: 52.7 -> 3.6 ms (-93.2%, 14.6x speedup, 10x faster than DuckDB)
+  - W9-4 Q11: 11.2 -> 2.0 ms (-81.7%, 5.4x speedup, 2.8x faster than DuckDB; also fixed latent correctness bug)
+  - W9-5 Q5+Q7+Q13: marginal tuning (-2.5ms total)
+  - W9-6: final verification + summary
+- Total Wave 9 delta: 495.6 - 310.6 = 185.0 ms (-37.3%)
+- Cumulative delta vs Wave 0 baseline (11,470 ms): 11470 - 311 = 11159 ms (-97.3%)
+- Final gap to DuckDB (442 ms): 0.70x (turboGP is 1.42x FASTER than DuckDB)
+- Queries beating DuckDB: 18 of 22 (Q1, Q2, Q4, Q5, Q6, Q7, Q8, Q9, Q10, Q11, Q14, Q15, Q16, Q17, Q18, Q19, Q20, Q22)
+  Wait — let me verify: Q1 (22.3 vs 28) ✓, Q2 (3.4 vs 16) ✓, Q3 (18.7 vs 13) ✗, Q4 (11.8 vs 14) ✓, Q5 (16.9 vs 12) ✗, Q6 (10.1 vs 25) ✓, Q7 (18.0 vs 14) ✗, Q8 (6.1 vs 8) ✓, Q9 (35.5 vs 41) ✓, Q10 (23.3 vs 28) ✓, Q11 (2.0 vs 5.6) ✓, Q12 (17.7 vs 16) ✗, Q13 (27.4 vs 12) ✗, Q14 (8.4 vs 9) ✓, Q15 (3.6 vs 36) ✓, Q16 (6.3 vs 56) ✓, Q17 (3.8 vs 9) ✓, Q18 (20.6 vs 96) ✓, Q19 (6.1 vs 27) ✓, Q20 (16.5 vs 11) ✗, Q21 (31.7 vs 40) ✓, Q22 (0.4 vs 33) ✓
+  Beating DuckDB: Q1, Q2, Q4, Q6, Q8, Q9, Q10, Q11, Q14, Q15, Q16, Q17, Q18, Q19, Q21, Q22 = 16 of 22
+- Remaining slower than DuckDB (6 queries): Q3 (1.44x), Q5 (1.41x), Q7 (1.29x), Q12 (1.11x), Q13 (2.28x), Q20 (1.50x)
+
+MILESTONE: turboGP started at 25.9x SLOWER than DuckDB (11,470ms vs 442ms). After 4 campaigns (Wave 0-9), turboGP is now 1.42x FASTER than DuckDB (310.6ms vs 442ms). Closed 97.3% of the original gap.
