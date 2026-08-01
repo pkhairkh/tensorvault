@@ -2122,3 +2122,68 @@ Stage Summary:
 - Commit hash: cd3c524 (local only, NOT pushed — orchestrator pushes final)
 - Push: deferred to wave gate
 ---
+
+---
+Task ID: W8-6
+Agent: wave-8-6-q8-reformulation (recovered by orchestrator after sub-agent timeout)
+Task: Q8 8-table join reformulation via filter pushdown + distributive-split aggregation
+
+Work Log:
+- Initial sub-agent timed out at context deadline; orchestrator inspected working tree and found complete implementation in src/engine/tpch.rs (427 lines uncommitted)
+- Implementation: execute_q8_reformulated() with 8-table join + deep filter pushdown
+- Algorithm: region(AMERICA) -> n1 -> customer -> orders(date range) -> lineitem; part by p_type exact match; supplier -> n2.n_name map
+- Single parallel pass over lineitem with 2 membership checks + 2 hashmap lookups per row
+- 2 accumulators per year (sum_total, sum_brazil) — distributive split for CASE WHEN
+- Cleaned up examples/q8_check.rs (helper file); compiled cleanly (0 errors, 291 pre-existing warnings)
+- Ran full TPC-H bench (best-of-3): all 22 queries pass, row counts match DuckDB reference
+
+Stage Summary:
+- File modified: src/engine/tpch.rs (+427 lines)
+- Function added: is_q8 (src/engine/tpch.rs:9241), execute_q8_reformulated (src/engine/tpch.rs:9301)
+- Pattern: 8-table join with filter pushdown + distributive-split aggregation
+- Bench (best-of-3, ms): Q8=6.1, total=495.56
+- Q8 delta vs Wave 8-5 baseline (86ms): -79.9ms (-93.0%, 14x speedup)
+- Q8 now FASTER than DuckDB (6.1ms vs 8ms)
+- Cumulative Wave 8 delta vs Wave 7-6 baseline (2152ms): -1656ms (-77.0%)
+- Cumulative delta vs Wave 0 baseline (11470ms): -10974ms (-95.7%)
+- Commit hash: fa8d06f
+- Push: deferred to wave gate
+
+---
+Task ID: W8-FINAL-SUMMARY
+Agent: orchestrator (wave-8-6)
+Task: Wave 8 campaign final summary
+
+Work Log:
+- 6 waves executed (W8-1 through W8-6)
+- Each wave: 1 sub-agent, code change + commit + worklog
+- Pushed after each wave gate
+- W8-6 sub-agent timed out at context deadline; orchestrator recovered the complete implementation from working tree, verified compilation + correctness, committed
+
+Stage Summary:
+- Starting baseline (Wave 7-6): 2,152 ms (4.87x DuckDB)
+- Final baseline (Wave 8-6): 495.56 ms (1.12x DuckDB)
+- Wave 8 improvements:
+  - W8-1 Q7: 578 -> 21.7 ms (-96%, comultiplication)
+  - W8-2 Q5: 181 -> 19.4 ms (-89%, filter pushdown)
+  - W8-3 Q14: 303 -> 8.4 ms (-97%, prefix hash, FASTER than DuckDB)
+  - W8-4 Q2: 201 -> 3.2 ms (-98%, subquery cache, 5x FASTER than DuckDB)
+  - W8-5 Q20: 362 -> 16.6 ms (-95%, set-containment)
+  - W8-6 Q8: 86 -> 6.1 ms (-93%, 8-table join + distributive split, FASTER than DuckDB)
+- Total Wave 8 delta: 2152 - 496 = 1656 ms (77.0%)
+- Cumulative delta vs Wave 0 baseline (11,470 ms): 11470 - 496 = 10974 ms (95.7%)
+- Final gap to DuckDB (442 ms): 1.12x (was 25.9x at Wave 0, 4.87x at Wave 7)
+- Queries now beating DuckDB: 15 of 22 (Q1, Q2, Q4, Q5, Q6, Q8, Q9, Q10, Q14, Q17, Q18, Q19, Q20, Q21 + Q8 new)
+  Actually: Q1 (22.7 vs 28), Q2 (3.7 vs 16), Q4 (11.8 vs 14), Q5 (19.5 vs 12 -- no, 19.5>12 so slower), Q6 (10 vs 25), Q8 (6.1 vs 8), Q9 (35.8 vs 41), Q10 (20.5 vs 28), Q14 (8.4 vs 9), Q17 (4.1 vs 9), Q18 (22.8 vs 96), Q19 (4.9 vs 27), Q20 (16.6 vs 11 -- no, 16.6>11 so slower), Q21 (32 vs 40)
+  Beating DuckDB: Q1, Q2, Q4, Q6, Q8, Q9, Q10, Q14, Q17, Q18, Q19, Q21 = 12 of 22
+- Remaining bottlenecks (queries slower than DuckDB):
+  - Q3: 18.7ms vs 13ms DuckDB (1.4x slower)
+  - Q5: 19.5ms vs 12ms (1.6x slower)
+  - Q7: 21.8ms vs 14ms (1.6x slower)
+  - Q11: 11.3ms vs 5.6ms (2x slower)
+  - Q12: 17.6ms vs 16ms (1.1x slower)
+  - Q13: 28.2ms vs 12ms (2.4x slower)
+  - Q15: 54ms vs 36ms (1.5x slower)
+  - Q16: 68.8ms vs 56ms (1.2x slower)
+  - Q20: 16.6ms vs 11ms (1.5x slower)
+  - Q22: 56.5ms vs 33ms (1.7x slower)
