@@ -9,6 +9,34 @@ use crate::Error;
 use time::{Date as TimeDate, Month, PrimitiveDateTime, Time as TimeTime};
 use time::format_description::well_known::Iso8601;
 
+/// Convert days-since-epoch (1970-01-01) to Gregorian year using
+/// Howard Hinnant's `civil_from_days` algorithm (O(1) integer math).
+/// <https://howardhinnant.github.io/date_algorithms.html#civil_from_days>
+///
+/// For TPC-H date ranges (1992-2003, plus the 5-year forward window to 2069)
+/// this takes ~8 integer ops vs `time::Date::from_julian_day`'s ~30 ops +
+/// branches. Q7/Q8/Q9 extract year from ~6M lineitem rows.
+///
+/// Hinnant's algorithm models the year as starting on March 1 (so that leap
+/// days fall at year-end, simplifying the math). For January and February
+/// dates (doy >= 306 in Hinnant's calendar), the actual Gregorian year is
+/// `y + 1`.
+///
+/// Correct for d ∈ [-2557, 36525] (1963-01-01 through 2069-12-31) and well
+/// beyond — verified bit-exact with `time::Date::from_julian_day(d + 2440588).year()`
+/// across 1900-2100 in unit tests.
+#[inline(always)]
+pub fn days_since_epoch_to_year(d: i64) -> i32 {
+    let z = d + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;                                       // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;  // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);                // [0, 365]
+    // January or February (doy >= 306) → Gregorian year is y + 1
+    if doy >= 306 { (y + 1) as i32 } else { y as i32 }
+}
+
 /// A calendar date stored as days-since-epoch (i32 in low 32 bits of u64).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Date(pub i32);
@@ -27,6 +55,17 @@ impl Date {
     pub fn to_ymd(&self) -> (i32, u32, u32) {
         let d = TimeDate::from_julian_day(self.0 + 2_440_588).expect("julian day in range");
         (d.year(), d.month() as u32, d.day() as u32)
+    }
+
+    /// Fast path for `extract(year FROM ...)` — returns the Gregorian year
+    /// without going through `to_ymd()` (which calls
+    /// `time::Date::from_julian_day`, ~30 ops + branches per row).
+    ///
+    /// Delegates to [`days_since_epoch_to_year`] (Howard Hinnant's
+    /// `civil_from_days` algorithm — 6-8 integer ops).
+    #[inline(always)]
+    pub fn year(&self) -> i32 {
+        days_since_epoch_to_year(self.0 as i64)
     }
 
     pub fn to_u64(&self) -> u64 { self.0 as u32 as u64 }
@@ -262,6 +301,115 @@ fn day_of_year(year: i32, month: u32, day: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------- W1-C: days_since_epoch_to_year tests ----------
+
+    /// Cross-check days_since_epoch_to_year against the slow path
+    /// (time::Date::from_julian_day + .year()) for a single Y-M-D.
+    fn check_year_against_time(year: i32, month: u32, day: u32) {
+        let date = Date::from_ymd(year, month, day).unwrap();
+        let slow = date.to_ymd().0;
+        let fast = days_since_epoch_to_year(date.0 as i64);
+        assert_eq!(fast, slow,
+                   "mismatch for {year:04}-{month:02}-{day:02}: fast={fast}, slow={slow}, d={}",
+                   date.0);
+    }
+
+    #[test]
+    fn w1c_year_epoch_1970_01_01() {
+        // d = 0 → year 1970
+        assert_eq!(days_since_epoch_to_year(0), 1970);
+        check_year_against_time(1970, 1, 1);
+    }
+
+    #[test]
+    fn w1c_year_2000_02_29_leap() {
+        // Leap day — January-February branch in Hinnant's calendar.
+        check_year_against_time(2000, 2, 29);
+    }
+
+    #[test]
+    fn w1c_year_2000_03_01_leap_boundary() {
+        // Day after leap day — March 1 starts Hinnant's civil year.
+        check_year_against_time(2000, 3, 1);
+    }
+
+    #[test]
+    fn w1c_year_2024_12_31() {
+        check_year_against_time(2024, 12, 31);
+    }
+
+    #[test]
+    fn w1c_year_1900_03_01_negative_d() {
+        // Pre-epoch date with negative d (1900-03-01).
+        check_year_against_time(1900, 3, 1);
+    }
+
+    #[test]
+    fn w1c_year_1900_01_01_negative_d() {
+        // Pre-epoch January (negative d, Jan/Feb branch).
+        check_year_against_time(1900, 1, 1);
+    }
+
+    #[test]
+    fn w1c_year_2099_12_31() {
+        check_year_against_time(2099, 12, 31);
+    }
+
+    #[test]
+    fn w1c_year_tpch_range_1992_1998() {
+        // Sweep every year boundary in the TPC-H date range plus a few
+        // leap days — bit-exact check against time::Date.
+        for year in 1992..=1998 {
+            for (m, d) in [(1, 1), (2, 28), (3, 1), (12, 31)] {
+                check_year_against_time(year, m, d);
+            }
+        }
+    }
+
+    #[test]
+    fn w1c_year_tpch_forward_window_1998_2003() {
+        // 5-year forward window per TPC-H spec.
+        for year in 1998..=2003 {
+            for (m, d) in [(1, 1), (2, 28), (3, 1), (12, 31)] {
+                check_year_against_time(year, m, d);
+            }
+        }
+    }
+
+    #[test]
+    fn w1c_year_constraint_bounds_1963_2069() {
+        // W1-C task constraint: d ∈ [-2557, 36525] (1963-01-01 through 2069-12-31).
+        // Sweep every year boundary + Jan 1 + Feb 28/29 + Mar 1 + Dec 31.
+        for year in 1963..=2069 {
+            check_year_against_time(year, 1, 1);
+            check_year_against_time(year, 2, 28);
+            // Feb 29 only on leap years
+            let leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+            if leap {
+                check_year_against_time(year, 2, 29);
+            }
+            check_year_against_time(year, 3, 1);
+            check_year_against_time(year, 12, 31);
+        }
+    }
+
+    #[test]
+    fn w1c_year_random_100_days_1970_2030() {
+        // Pseudo-random sample of 100 days in 1970-2030.
+        // Deterministic LCG (no rand dep).
+        let mut state: u64 = 0x1234_5678_9abc_def0;
+        for _ in 0..100 {
+            // LCG step (Numerical Recipes constants).
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let year = 1970 + (state % 61) as i32;             // 1970..=2030
+            let month = 1 + ((state >> 32) % 12) as u32;
+            let day = 1 + ((state >> 48) % 28) as u32;         // safe for any month
+            check_year_against_time(year, month, day);
+        }
+    }
+
+    // ---------- end W1-C tests ----------
 
     #[test]
     fn date_from_ymd_round_trip() {

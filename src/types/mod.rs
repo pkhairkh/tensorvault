@@ -36,7 +36,7 @@ pub mod string_col;
 mod tests;
 
 pub use cxl_ref::CxlRef;
-pub use datetime::{Date, Interval, Time, Timestamp};
+pub use datetime::{Date, Interval, Time, Timestamp, days_since_epoch_to_year};
 pub use null::{NullBitmap, TriBool};
 pub use raft_ref::RaftRef;
 pub use string_col::{StringColumn, StringHeap};

@@ -3471,10 +3471,18 @@ impl<'a> TpchExec<'a> {
             Value2::Date(d) => *d, Value2::Int(i) => *i as i32,
             Value2::Float(f) => *f as i32, _ => return Value2::Null,
         };
+        let lower = field.to_lowercase();
+        // W1-C: Fast path for `extract(year FROM ...)` — uses Howard Hinnant's
+        // `civil_from_days` algorithm (~8 integer ops) instead of
+        // `time::Date::from_julian_day` (~30 ops + branches per row).
+        // Q7/Q8/Q9 each extract year from ~6M lineitem rows.
+        if lower == "year" {
+            return Value2::Int(crate::types::days_since_epoch_to_year(days as i64) as i64);
+        }
         let date = crate::types::Date::from_u64(days as u64);
         let (y, m, d) = date.to_ymd();
-        let r = match field.to_lowercase().as_str() {
-            "year" => y as i64, "month" => m as i64, "day" => d as i64, _ => y as i64,
+        let r = match lower.as_str() {
+            "month" => m as i64, "day" => d as i64, _ => y as i64,
         };
         Value2::Int(r)
     }
