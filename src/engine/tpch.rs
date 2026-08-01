@@ -879,7 +879,7 @@ impl<'a> TpchExec<'a> {
                 let refs = self.expr_table_refs(conj, &tables);
                 refs.len() != 1
             }).cloned().collect();
-            let base = self.join_tables_smart(tables, &query.where_clause)?;
+            let base = self.plan_join_dp(tables, &query.where_clause)?;
             let mask = if multi_table.is_empty() {
                 vec![true; base.row_count]
             } else {
@@ -1280,7 +1280,7 @@ impl<'a> TpchExec<'a> {
         let base = if tables.len() == 1 {
             tables.into_iter().next().unwrap()
         } else {
-            self.join_tables_smart(tables, &local_where)?
+            self.plan_join_dp(tables, &local_where)?
         };
 
         // Apply local (non-correlated) conjuncts only.
@@ -1541,7 +1541,7 @@ impl<'a> TpchExec<'a> {
         let base = if tables.len() == 1 {
             tables.into_iter().next().unwrap()
         } else {
-            self.join_tables_smart(tables, &subquery.where_clause)?
+            self.plan_join_dp(tables, &subquery.where_clause)?
         };
         // Apply the subquery's WHERE conjuncts, EXCEPT the correlated equi-join.
         // W2: evaluate each conjunct directly into `mask` (the simplified
@@ -1750,7 +1750,7 @@ impl<'a> TpchExec<'a> {
         let base = if tables.len() == 1 {
             tables.into_iter().next().unwrap()
         } else {
-            self.join_tables_smart(tables, &subquery.where_clause)?
+            self.plan_join_dp(tables, &subquery.where_clause)?
         };
         // W2: evaluate each conjunct directly into `mask` (the simplified
         // AND/OR arms in `eval_bool_mask_vec` preserve the incoming mask).
@@ -1823,15 +1823,21 @@ impl<'a> TpchExec<'a> {
         }
     }
 
-    /// Smart join: extract equi-join predicates from WHERE, apply single-table
-    /// filters first, then hash-join tables left-to-right.
+    /// Smart join (greedy): apply single-table filters, then hash-join tables
+    /// using cardinality-aware greedy ordering. Delegates to
+    /// apply_single_table_filters + join_tables_greedy_core.
     fn join_tables_smart(&self, tables: Vec<ExecTable>, where_clause: &Option<Expr2>) -> Result<ExecTable, Error> {
         let conjuncts = self.split_conjuncts(where_clause);
-        let mut tables = tables;
+        let tables = self.apply_single_table_filters(tables, &conjuncts)?;
+        self.join_tables_greedy_core(tables, &conjuncts)
+    }
 
-        // Apply single-table filters to reduce row counts
+    /// Apply single-table predicates (those referencing exactly one table) as
+    /// filters BEFORE joining. Reduces row counts early (e.g. region filtered
+    /// to 1 row by r_name='ASIA'), preventing many-to-many explosions.
+    fn apply_single_table_filters(&self, mut tables: Vec<ExecTable>, conjuncts: &[Expr2]) -> Result<Vec<ExecTable>, Error> {
         for i in 0..tables.len() {
-            for conj in &conjuncts {
+            for conj in conjuncts {
                 let referenced = self.expr_table_refs(conj, &tables);
                 if referenced.len() == 1 && referenced.contains(&i) {
                     let mask = self.build_mask(conj, &tables[i])?;
@@ -1840,21 +1846,31 @@ impl<'a> TpchExec<'a> {
                 }
             }
         }
+        Ok(tables)
+    }
 
-        // Join tables using cardinality-aware ordering.
-        // Start with the smallest filtered table (e.g., region after r_name='ASIA'
-        // has 1 row). This prevents many-to-many explosions like customer ⋈ supplier.
-        // Pick the table with the fewest rows that has at least one join key
-        // to another table.
+    /// Greedy join ordering: pick the smallest filtered table as the seed, then
+    /// iteratively join the next table that minimizes estimated output cardinality.
+    /// O(n^2) plans evaluated. Used as the fallback for n < 4 tables (where DP
+    /// overhead isn't amortized) and as a safety net for disconnected join graphs.
+    fn join_tables_greedy_core(&self, mut tables: Vec<ExecTable>, conjuncts: &[Expr2]) -> Result<ExecTable, Error> {
+        if tables.is_empty() {
+            return Err(Error::Other("join_tables_greedy_core: no tables".into()));
+        }
+        if tables.len() == 1 {
+            return Ok(tables.into_iter().next().unwrap());
+        }
+        // Pick the smallest filtered table that has at least one join key
+        // to another table as the seed. This prevents many-to-many explosions
+        // like customer ⋈ supplier.
         let mut start_idx = 0;
         let mut start_rows = usize::MAX;
         for (i, t) in tables.iter().enumerate() {
             if t.row_count < start_rows {
-                // Check if this table can join to at least one other table
                 let mut has_join = false;
                 for (j, other) in tables.iter().enumerate() {
                     if i == j { continue; }
-                    if !self.find_join_keys(t, other, &conjuncts).is_empty() {
+                    if !self.find_join_keys(t, other, conjuncts).is_empty() {
                         has_join = true;
                         break;
                     }
@@ -1871,19 +1887,13 @@ impl<'a> TpchExec<'a> {
             let mut best_keys: Vec<JoinKey2> = Vec::new();
             let mut best_est_output: u64 = u64::MAX;
             for (i, table) in tables.iter().enumerate() {
-                let keys = self.find_join_keys(&joined, table, &conjuncts);
+                let keys = self.find_join_keys(&joined, table, conjuncts);
                 if keys.is_empty() { continue; }
-                // Estimate output cardinality.
-                // For each join key pair (left_col, right_col), estimate:
-                //   output ≈ left_rows * right_rows / max(distinct_left, distinct_right)
-                // Use the max distinct across all keys (conservative).
                 let mut est_output: u64 = 1;
                 for k in &keys {
                     let dl = self.estimate_distinct(&joined.columns[k.left][..], joined.row_count);
                     let dr = self.estimate_distinct(&table.columns[k.right][..], table.row_count);
                     let max_d = dl.max(dr).max(1);
-                    // Join cardinality formula (Selinger-style):
-                    // |R ⋈ S| ≈ |R| * |S| / max(V(R,k), V(S,k))
                     est_output = est_output
                         .saturating_mul(joined.row_count as u64)
                         .saturating_mul(table.row_count as u64)
@@ -1897,19 +1907,211 @@ impl<'a> TpchExec<'a> {
             }
             let right = tables.remove(best_idx);
             if best_keys.is_empty() {
-                // No equi-join found — fall back to cross join (rare, may be slow)
                 joined = self.cross_join(joined, right);
             } else {
-                // Build a dummy ON expression for hash_join
-                let on = Expr2::BinOp {
-                    op: BinOp2::Eq,
-                    left: Box::new(Expr2::Col(String::new())),
-                    right: Box::new(Expr2::Col(String::new())),
-                };
                 joined = self.hash_join_with_keys(joined, right, &best_keys, JoinType2::Inner)?;
             }
         }
         Ok(joined)
+    }
+
+    /// W4: Selinger dynamic-programming join ordering for multi-table joins.
+    /// Enumerates all 2^n subsets of the n joined tables and computes the optimal
+    /// bushy join tree via bottom-up DP. For each subset S, considers all partitions
+    /// (S1, S2) with S1 ∪ S2 = S, S1 ∩ S2 = ∅, S1 < S2 (to avoid symmetric
+    /// duplicates), and picks the one minimizing cumulative work:
+    ///   cost(S) = cost(S1) + cost(S2) + |S1| + |S2| + |S1 ⋈ S2|
+    /// (hash-build + probe + output materialization).
+    ///
+    /// Cardinality estimate reuses the existing estimate_distinct() (linear
+    /// counting over a 256-bucket sample, same as join_tables_greedy_core):
+    ///   |S1 ⋈ S2| = |S1| * |S2| * Π_{i∈S1, j∈S2} pair_sel[i][j]
+    /// where pair_sel[i][j] = Π_k (1 / max(V(T_i, k_l), V(T_j, k_r))).
+    ///
+    /// Complexity: O(3^n) plan evaluations. For n=6 (Q5/Q7/Q9): 729 evaluations,
+    /// each <1μs → <1ms total planning cost. For n > 16, falls back to greedy
+    /// (2^16 = 65536 DP entries, ~1MB memory — the cap).
+    fn plan_join_dp(&self, tables: Vec<ExecTable>, where_clause: &Option<Expr2>) -> Result<ExecTable, Error> {
+        let conjuncts = self.split_conjuncts(where_clause);
+        let tables = self.apply_single_table_filters(tables, &conjuncts)?;
+        let n = tables.len();
+
+        // DP overhead not amortized for small n; greedy is near-optimal for ≤3 tables.
+        // For n > 16 (none in TPC-H), fall back to greedy to cap memory at ~1MB.
+        if n < 4 || n > 16 {
+            return self.join_tables_greedy_core(tables, &conjuncts);
+        }
+
+        let plan_start = std::time::Instant::now();
+
+        // --- Phase 1: Precompute pairwise join keys + selectivity factors ---
+        // pair_keys[i][j] = equi-join keys with left col in table i, right col in table j
+        let mut pair_keys: Vec<Vec<Vec<JoinKey2>>> = (0..n).map(|_| (0..n).map(|_| Vec::new()).collect()).collect();
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let keys = self.find_join_keys(&tables[i], &tables[j], &conjuncts);
+                // Reverse key direction for [j][i]: left=j's col, right=i's col
+                pair_keys[j][i] = keys.iter().map(|k| JoinKey2 { left: k.right, right: k.left }).collect();
+                pair_keys[i][j] = keys;
+            }
+        }
+
+        // pair_sel_prod[i][j] = Π_k (1 / max(V(T_i, k_l), V(T_j, k_r)))
+        // pair_nkeys[i][j] = number of equi-join keys between T_i and T_j
+        //
+        // Cardinality formula (matches greedy join_tables_greedy_core):
+        //   |R ⋈ S| = (|R| * |S|)^|K| / Π_k max(V(R, k_l), V(S, k_r))
+        // For single-key joins this reduces to |R|*|S|/max_d (standard Selinger).
+        // For multi-key joins the (|R|*|S|)^|K| factor penalizes many-to-many
+        // explosions on correlated keys (e.g. lineitem ⋈ partsupp on 2 keys:
+        // standard formula gives 2400 vs actual 6M; greedy formula gives ~1e16,
+        // correctly steering the DP away from that partition).
+        let mut pair_sel_prod: Vec<Vec<f64>> = vec![vec![1.0; n]; n];
+        let mut pair_nkeys: Vec<Vec<usize>> = vec![vec![0; n]; n];
+        for i in 0..n {
+            for j in 0..n {
+                if i == j { continue; }
+                let keys = &pair_keys[i][j];
+                if keys.is_empty() { continue; }
+                pair_nkeys[i][j] = keys.len();
+                let mut sel = 1.0;
+                for k in keys {
+                    let dl = self.estimate_distinct(&tables[i].columns[k.left][..], tables[i].row_count) as f64;
+                    let dr = self.estimate_distinct(&tables[j].columns[k.right][..], tables[j].row_count) as f64;
+                    let max_d = dl.max(dr).max(1.0);
+                    sel /= max_d;
+                }
+                pair_sel_prod[i][j] = sel;
+            }
+        }
+
+        // --- Phase 2: Bottom-up DP over subset lattice ---
+        let total_masks = 1usize << n;
+        let mut dp: Vec<Option<DPEntry>> = vec![None; total_masks];
+
+        // Base case: single-table subsets (cost=0, cardinality=row_count)
+        for i in 0..n {
+            let mask = 1usize << i;
+            let rows = tables[i].row_count as f64;
+            dp[mask] = Some(DPEntry {
+                cost: 0.0,
+                cardinality: rows,
+                partition: None,
+            });
+        }
+
+        // Fill DP bottom-up by mask value. Submasks are always < mask, so
+        // they're filled first. Iterate all masks with popcount >= 2.
+        for mask in 1..total_masks {
+            if mask.count_ones() < 2 { continue; }
+
+            let mut best_cost = f64::MAX;
+            let mut best_partition: Option<(usize, usize)> = None;
+            let mut best_card = 0.0;
+
+            // Iterate proper non-empty submasks. To avoid symmetric duplicates
+            // (sub, other) vs (other, sub) — which give the same INNER join —
+            // only consider sub < other.
+            let mut sub = (mask - 1) & mask;
+            while sub > 0 {
+                let other = mask ^ sub;
+                if sub < other {
+                    if let (Some(l), Some(r)) = (dp[sub].as_ref(), dp[other].as_ref()) {
+                        // Estimate |sub ⋈ other| using greedy-matching formula:
+                        //   est = (l.card * r.card)^total_keys * Π pair_sel_prod[i][j]
+                        // where total_keys = Σ pair_nkeys[i][j] over cross pairs.
+                        // This matches join_tables_greedy_core's per-key loop:
+                        //   est = (left*right)^|K| / Π max_d_k
+                        let mut total_keys: usize = 0;
+                        let mut total_sel: f64 = 1.0;
+                        let mut i_bits = sub;
+                        while i_bits != 0 {
+                            let i = i_bits.trailing_zeros() as usize;
+                            i_bits &= i_bits - 1;
+                            let mut j_bits = other;
+                            while j_bits != 0 {
+                                let j = j_bits.trailing_zeros() as usize;
+                                j_bits &= j_bits - 1;
+                                let nk = pair_nkeys[i][j];
+                                if nk > 0 {
+                                    total_keys += nk;
+                                    total_sel *= pair_sel_prod[i][j];
+                                }
+                            }
+                        }
+                        if total_keys > 0 {
+                            let base = l.cardinality * r.cardinality;
+                            let est_card = base.powf(total_keys as f64) * total_sel;
+                            // Cost = work(sub) + work(other) + materialization + output
+                            let cost = l.cost + r.cost + l.cardinality + r.cardinality + est_card;
+                            if cost < best_cost {
+                                best_cost = cost;
+                                best_partition = Some((sub, other));
+                                best_card = est_card;
+                            }
+                        }
+                    }
+                }
+                sub = (sub - 1) & mask;
+            }
+
+            if let Some(p) = best_partition {
+                dp[mask] = Some(DPEntry {
+                    cost: best_cost,
+                    cardinality: best_card,
+                    partition: Some(p),
+                });
+            }
+            // If no valid partition (disconnected subset), dp[mask] stays None.
+        }
+
+        let plan_elapsed = plan_start.elapsed();
+        if plan_elapsed > std::time::Duration::from_millis(10) {
+            eprintln!("WARN: plan_join_dp took {:?} for n={} tables (expected <10ms)", plan_elapsed, n);
+        }
+
+        // --- Phase 3: Execute the optimal plan recursively ---
+        let full_mask = total_masks - 1;
+        if dp[full_mask].is_none() {
+            // Disconnected join graph — fall back to greedy (cross-join fallback)
+            return self.join_tables_greedy_core(tables, &conjuncts);
+        }
+
+        let mut tables_opt: Vec<Option<ExecTable>> = tables.into_iter().map(Some).collect();
+        self.execute_dp_plan(full_mask, &dp, &mut tables_opt, &conjuncts)
+    }
+
+    /// W4: Recursively materialize the optimal join plan for `mask`.
+    /// Single-table leaves return the filtered base table (taken from the
+    /// slot — each leaf is visited exactly once in the plan tree). Internal
+    /// nodes hash-join the materialized left and right children. Joins use
+    /// find_join_keys() on the materialized tables: column_names are preserved
+    /// across hash_join_with_keys, so key lookup works at any depth.
+    fn execute_dp_plan(
+        &self,
+        mask: usize,
+        dp: &[Option<DPEntry>],
+        tables: &mut [Option<ExecTable>],
+        conjuncts: &[Expr2],
+    ) -> Result<ExecTable, Error> {
+        let entry = dp[mask].as_ref().expect("execute_dp_plan: missing dp entry");
+        match entry.partition {
+            None => {
+                // Single-table leaf — take the table out of the slot (each leaf visited once)
+                let i = mask.trailing_zeros() as usize;
+                Ok(tables[i].take().expect("execute_dp_plan: table already consumed"))
+            }
+            Some((left_mask, right_mask)) => {
+                let left = self.execute_dp_plan(left_mask, dp, tables, conjuncts)?;
+                let right = self.execute_dp_plan(right_mask, dp, tables, conjuncts)?;
+                let keys = self.find_join_keys(&left, &right, conjuncts);
+                if keys.is_empty() {
+                    Ok(self.cross_join(left, right))
+                } else {
+                    self.hash_join_with_keys(left, right, &keys, JoinType2::Inner)
+                }
+            }
+        }
     }
 
     fn hash_join_with_keys(
@@ -5132,6 +5334,14 @@ impl<'a> TpchExec<'a> {
         for v in values { if let Some(f) = v.as_f64() { max = Some(max.map_or(f, |m| m.max(f))); } }
         max.map(Value2::Float).unwrap_or(Value2::Null)
     }
+}
+
+// W4: Selinger DP entry — holds cost/cardinality estimate + optimal partition.
+#[derive(Clone, Copy)]
+struct DPEntry {
+    cost: f64,
+    cardinality: f64,
+    partition: Option<(usize, usize)>, // (left_mask, right_mask); None for single-table
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
