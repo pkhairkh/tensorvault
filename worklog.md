@@ -973,5 +973,5 @@ Stage Summary:
 - Bench (best-of-4 per-query, ms): Q19=4.7, total≈9166
 - Bench (best single run, ms): total=9228.75
 - Delta vs Wave 4 baseline (9391.0ms best-of-5): -233ms (-2.5%) best run; Q19 -329.7ms (-98.6%)
-- Commit hash: 9a469b1 (local only, NOT pushed — wave gate will push)
+- Commit hash: f08e5f7 (local only, NOT pushed — wave gate will push)
 - Push: deferred to wave gate
