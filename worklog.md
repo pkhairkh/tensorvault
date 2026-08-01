@@ -2119,6 +2119,6 @@ Stage Summary:
   * Q20: 363.7ms → 16.6ms = -347.1ms (-95.4%, 21.9x speedup)
   * Total: 923.96ms → 579.76ms = -344.2ms (-37.2%)
   * LTO drift on untouched code paths: Q15 +2.8ms (+5.4%), Q18 +2.4ms (+11.9%), Q11 +0.6ms (+5.6%), Q2 +0.2ms (+6.3%); partially offset by Q3 -1.6ms (-7.9%), Q17 -0.4ms (-9.3%). Q20 win dwarfs all drift.
-- Commit hash: (local only, NOT pushed — orchestrator pushes final)
+- Commit hash: cd3c524 (local only, NOT pushed — orchestrator pushes final)
 - Push: deferred to wave gate
 ---
