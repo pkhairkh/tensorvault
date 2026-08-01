@@ -607,5 +607,5 @@ Stage Summary:
 - Cargo.toml additions: fxhash = "0.2.1" (task said "2.1" — corrected to real latest), wide = "0.7" (→0.7.33).
 - Baseline (best-of-1 = run 1 of 3, ms): Q1=26.73, Q3=474.69, Q4=425.21, Q5=260.69, Q7=1117.79, Q9=527.79, Q12=509.59, Q14=400.77, Q18=1204.85, Q19=991.09, Q20=440.36, Q21=3102.36, total(all 22, run1)=11891.52
 - Baseline (best-of-3 min, ms — harness headline, for cross-wave comparison): Q1=26.73, Q3=424.74, Q4=400.94, Q5=198.95, Q7=1100.72, Q9=527.79, Q12=436.86, Q14=345.43, Q18=1158.23, Q19=952.57, Q20=412.11, Q21=3095.69, total(all 22, best)=11469.55
-- Commit hash: <TBD>
-- Push status: <TBD>
+- Commit hash: e37bc86
+- Push status: success (2403ba1..e37bc86 -> origin/main)
