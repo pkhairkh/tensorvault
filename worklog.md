@@ -1105,5 +1105,5 @@ Stage Summary:
 - TPC-H data source: scp'd from OLD machine /tmp/tpch_*.csv (8 CSVs, ~1.13 GB) via ed25519 key auth (new→old), 59.7s transfer
 - Baseline (best-of-2 runs, ms): Q1=34.0, Q2=761.3, Q3=2318.0, Q4=1887.3, Q5=912.9, Q6=39.4, Q7=2514.6, Q8=367.7, Q9=1367.1, Q10=1677.7, Q11=31.1, Q12=2301.5, Q13=2597.9, Q14=1823.3, Q15=156.8, Q16=359.1, Q17=1410.4, Q18=2194.0, Q19=4.9, Q20=1184.1, Q21=67.3, Q22=248.9, total=24259.3
 - Delta vs old machine Wave 6 baseline (6263.10 ms best single run): +17996 ms (+287%, i.e. 3.88× SLOWER). vs best-of-3 (~6225 ms): +18034 ms (+290%).
-- Commit: <pending — worklog-only commit, pushed in this wave>
-- Push: <status filled after push>
+- Commit: a1ac970 (worklog-only; pushed to GitHub main)
+- Push: SUCCESS — pushed 8c440b7..a1ac970 to origin/main (follow-up commit below records final hash)
