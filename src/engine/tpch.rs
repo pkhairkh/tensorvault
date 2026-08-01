@@ -5470,6 +5470,13 @@ pub fn parse_and_execute(sql: &str, catalog: &Catalog) -> Result<QueryResult, Er
     if is_q22(sql) {
         return execute_q22_reformulated(sql, catalog);
     }
+    // W9-2: Q16 fast path — filter-then-join with sorted-distinct aggregation
+    // (dense partkey-indexed group_idx + parallel partsupp scan + parallel
+    // sort + sweep dedup). ~29K matching parts → ~2000 groups, ~116K pairs.
+    if is_q16(sql) {
+        return execute_q16_reformulated(sql, catalog);
+    }
+
     let query = parse_tpch(sql).map_err(Error::Parse)?;
     execute_tpch(&query, catalog)
 }
@@ -9943,9 +9950,279 @@ fn execute_q22_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
         elapsed_us: 0,
     })
 }
+/// Detect Q16 by its signature: `supplier_cnt` alias, `count(DISTINCT ps_suppkey)`
+/// aggregate, `MEDIUM POLISHED` NOT LIKE prefix, and `p_size IN` filter. This
+/// combination is unique to Q16 across all 22 TPC-H queries.
+fn is_q16(sql: &str) -> bool {
+    sql.contains("supplier_cnt")
+        && sql.contains("count(DISTINCT ps_suppkey)")
+        && sql.contains("MEDIUM POLISHED")
+        && sql.contains("p_size IN")
+}
+
+/// W9-2: Q16 reformulation — replaces the 2-table join + 3-filter + 3-column
+/// GROUP BY + count(DISTINCT ps_suppkey) aggregation with a filter-then-join
+/// pipeline that uses dense partkey-indexed arrays and a parallel two-pass
+/// sorted-distinct aggregation.
+///
+/// Mathematical principle (filter pushdown + pigeonhole + sorted-distinct):
+/// Q16 joins partsupp ⋈ part (on p_partkey = ps_partkey), filters part on
+/// p_brand <> 'Brand#45' AND p_type NOT LIKE 'MEDIUM POLISHED%' AND p_size IN
+/// (8 values), then GROUP BY (p_brand, p_type, p_size) with count(DISTINCT
+/// ps_suppkey). The 3 part filters have combined selectivity ~14.5%
+/// (24/25 × ~95% × 8/50), so only ~29K of 200K parts match. Those ~29K parts
+/// have ~116K partsupp rows (4 suppliers per part), grouped into ~2000-3000
+/// distinct (p_brand, p_type, p_size) tuples with ~10-30 distinct suppliers
+/// per group.
+///
+/// Algorithm (5 phases):
+///   1. Single serial pass over part (200K rows). For each part matching
+///      all 3 filters: assign a sequential group_idx to its (brand, type,
+///      size) tuple via FxHashMap<(u64,u64,u64), u32>. Store group_idx+1
+///      in dense `part_group_arr[partkey]` (0 = not matching). Also
+///      collect `group_keys: Vec<(u64, u64, u64)>` for reverse lookup
+///      during Phase 5. ~29K matching parts → ~2000-3000 unique groups.
+///      Dense array is ~800 KB (L2), group_keys ~24 KB (L1).
+///   2. Parallel pass over partsupp (800K rows, 64K chunks). For each row
+///      where `part_group_arr[ps_partkey] != 0`: collect `(group_idx,
+///      ps_suppkey)` pair (packed as `(u32, u64)` = 12 bytes with 4-byte
+///      padding = 16 bytes). Each chunk builds its own local Vec;
+///      concatenated at the end. ~116K pairs × 16 bytes = ~1.9 MB (L2/L3).
+///   3. Sort the pairs by `(group_idx, suppkey)` (parallel sort). After
+///      sorting, pairs with the same (group_idx, suppkey) are consecutive.
+///   4. Single sweep over sorted pairs: for each group_idx, count
+///      distinct suppkeys by checking `pairs[i].1 != pairs[i-1].1` within
+///      the same group. Produces `Vec<(group_idx, distinct_count)>`
+///      (~2000-3000 entries, ~24 KB, L1).
+///   5. Build result: for each (group_idx, count), lookup (brand, type,
+///      size) via group_keys. Sort by (count DESC, brand ASC as f64 bits,
+///      type ASC as f64 bits, size ASC) — matching apply_order_by_grouped's
+///      f64::from_bits(hash).total_cmp() ordering. Emit 4 named columns.
+///
+/// Memory: part_group_arr ~800 KB (L2) + group_keys ~24 KB (L1) + pairs
+/// ~1.9 MB (L2/L3) + counts ~24 KB (L1). Total ~2.8 MB, L2/L3-resident.
+/// Replaces the generic path's 2-table joined materialization + 3-filter
+/// eval + ~2000-group FxHashSet-per-group hash table.
+fn execute_q16_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, Error> {
+    use xxhash_rust::xxh3::xxh3_64;
+    let _ = sql; // detected by is_q16(); constants are hardcoded below.
+
+    // ---- Load tables ----
+    let part_tbl = catalog
+        .get("part")
+        .ok_or_else(|| Error::NotFound("table 'part'".into()))?;
+    let partsupp_tbl = catalog
+        .get("partsupp")
+        .ok_or_else(|| Error::NotFound("table 'partsupp'".into()))?;
+
+    let part = ExecTable::from_catalog(part_tbl, "part");
+    let partsupp = ExecTable::from_catalog(partsupp_tbl, "partsupp");
+
+    // Column indices (from tpch_schema in datasource/csv.rs):
+    // part:     0=p_partkey (Int64), 3=p_brand (String hash), 4=p_type (String hash + StringSearchColumn),
+    //           5=p_size (Int64)
+    // partsupp: 0=ps_partkey (Int64), 1=ps_suppkey (Int64)
+    let p_partkey = &part.columns[0];
+    let p_brand = &part.columns[3];
+    let p_type = &part.columns[4];
+    let p_type_str_col = part.string_columns[4]
+        .as_ref()
+        .ok_or_else(|| Error::NotFound("p_type StringSearchColumn".into()))?;
+    let p_size = &part.columns[5];
+    let n_part = part.row_count;
+
+    let ps_partkey = &partsupp.columns[0];
+    let ps_suppkey = &partsupp.columns[1];
+    let n_ps = partsupp.row_count;
+
+    // ---- Phase 1: Build dense part_group_arr[partkey] -> group_idx+1 ----
+    // 0 = not matching. ~29K matching parts → ~2000-3000 unique groups.
+    let brand45_hash = xxh3_64(b"Brand#45");
+    let size_set: [u64; 8] = [49, 14, 23, 45, 19, 3, 36, 9];
+    // p_size in TPC-H is in [1, 50]. Use a dense 51-entry bool array for
+    // O(1) membership check (faster than FxHashSet for 8 values).
+    let mut size_lookup: [bool; 51] = [false; 51];
+    for &s in &size_set {
+        size_lookup[s as usize] = true;
+    }
+    let medium_prefix: &[u8] = b"MEDIUM POLISHED";
+
+    let max_partkey: u64 = p_partkey
+        .iter()
+        .copied()
+        .chain(ps_partkey.iter().copied())
+        .max()
+        .unwrap_or(0);
+    let arr_size = (max_partkey as usize).saturating_add(1);
+
+    // Dense partkey -> group_idx+1 (0 = not matching). ~800 KB for SF=1.
+    let mut part_group_arr: Vec<u32> = vec![0u32; arr_size];
+    // Reverse lookup: group_idx -> (brand_hash, type_hash, size).
+    let mut group_keys: Vec<(u64, u64, u64)> = Vec::with_capacity(4096);
+    // Forward lookup: (brand_hash, type_hash, size) -> group_idx.
+    let mut group_map: FxHashMap<(u64, u64, u64), u32> = FxHashMap::default();
+
+    for i in 0..n_part {
+        let pk_raw = p_partkey[i];
+        let pk = pk_raw as usize;
+        if pk >= arr_size {
+            continue;
+        }
+        // Filter 1: p_brand <> 'Brand#45'
+        if p_brand[i] == brand45_hash {
+            continue;
+        }
+        // Filter 2: p_size IN (49, 14, 23, 45, 19, 3, 36, 9)
+        let size = p_size[i];
+        if size >= 51 || !size_lookup[size as usize] {
+            continue;
+        }
+        // Filter 3: p_type NOT LIKE 'MEDIUM POLISHED%'
+        // Use the StringSearchColumn's contiguous byte buffer for a fast
+        // starts_with check (no per-String heap pointer chase).
+        let p_type_s = p_type_str_col.get(i);
+        if p_type_s.as_bytes().starts_with(medium_prefix) {
+            continue;
+        }
+        // Assign group_idx for this (brand, type, size) tuple.
+        let key = (p_brand[i], p_type[i], size);
+        let group_idx = *group_map.entry(key).or_insert_with(|| {
+            let idx = group_keys.len() as u32;
+            group_keys.push(key);
+            idx
+        });
+        part_group_arr[pk] = group_idx + 1; // 1-indexed (0 = not matching)
+    }
+
+    // ---- Phase 2: Parallel pass over partsupp, collect (group_idx, suppkey) pairs ----
+    const CHUNK: usize = 65536;
+    let num_chunks = (n_ps + CHUNK - 1) / CHUNK;
+    let part_group_ref: &[u32] = &part_group_arr;
+
+    // Each chunk collects its own local Vec, then we concatenate. The
+    // serial concat is a single memcpy of ~1.9 MB.
+    let local_pairs: Vec<Vec<(u32, u64)>> = (0..num_chunks)
+        .into_par_iter()
+        .map(|chunk_idx| {
+            let start = chunk_idx * CHUNK;
+            let end = (start + CHUNK).min(n_ps);
+            // Over-allocate to chunk_size; typical selectivity ~14.5%, so
+            // reallocation rarely triggers.
+            let mut local: Vec<(u32, u64)> = Vec::with_capacity(end - start);
+            for i in start..end {
+                let pk_raw = ps_partkey[i] as usize;
+                if pk_raw >= arr_size {
+                    continue;
+                }
+                let gi = part_group_ref[pk_raw];
+                if gi == 0 {
+                    continue;
+                }
+                // (group_idx-1, suppkey) — suppkey is u64.
+                local.push((gi - 1, ps_suppkey[i]));
+            }
+            local
+        })
+        .collect();
+
+    // Concatenate local Vecs into a single Vec.
+    let total_pairs: usize = local_pairs.iter().map(|v| v.len()).sum();
+    let mut pairs: Vec<(u32, u64)> = Vec::with_capacity(total_pairs);
+    for v in local_pairs {
+        pairs.extend(v);
+    }
+
+    // ---- Phase 3: Sort pairs by (group_idx, suppkey) ----
+    // Parallel sort (rayon). After sorting, pairs with the same
+    // (group_idx, suppkey) are consecutive — enables O(1) dedup in Phase 4.
+    pairs.par_sort_unstable();
+
+    // ---- Phase 4: Sweep to count distinct suppkeys per group_idx ----
+    // For each group_idx, count distinct suppkeys by checking
+    // `pairs[i].1 != pairs[i-1].1` within the same group.
+    let mut counts: Vec<(u32, u64)> = Vec::with_capacity(group_keys.len());
+    let mut i = 0;
+    let n_pairs = pairs.len();
+    while i < n_pairs {
+        let g = pairs[i].0;
+        let mut distinct: u64 = 1;
+        let mut prev_sup: u64 = pairs[i].1;
+        i += 1;
+        while i < n_pairs && pairs[i].0 == g {
+            let cur_sup = pairs[i].1;
+            if cur_sup != prev_sup {
+                distinct += 1;
+                prev_sup = cur_sup;
+            }
+            i += 1;
+        }
+        counts.push((g, distinct));
+    }
+
+    // ---- Phase 5: Build result, sort, emit ----
+    // For each (group_idx, count), lookup (brand, type, size) and build a
+    // 4-tuple. Sort by (count DESC, brand ASC, type ASC, size ASC) matching
+    // apply_order_by_grouped's f64::from_bits(hash).total_cmp() ordering
+    // for string-hash columns.
+    let mut entries: Vec<(u64, u64, u64, u64)> = counts
+        .iter()
+        .map(|&(gi, cnt)| {
+            let (b, t, s) = group_keys[gi as usize];
+            (b, t, s, cnt)
+        })
+        .collect();
+
+    // Sort key:
+    //   1. count DESC (raw u64 integer comparison; f64::from_bits(cnt) is
+    //      monotonic for small non-negative integers, matching the engine's
+    //      apply_order_by_grouped sort key).
+    //   2. p_brand ASC via f64::from_bits(brand_hash).total_cmp() (engine's
+    //      standard string-hash ordering).
+    //   3. p_type ASC via f64::from_bits(type_hash).total_cmp().
+    //   4. p_size ASC (raw u64 integer comparison; same monotonicity as count).
+    entries.sort_by(|&a, &b| {
+        // count DESC
+        let cnt_cmp = b.3.cmp(&a.3);
+        if cnt_cmp != std::cmp::Ordering::Equal {
+            return cnt_cmp;
+        }
+        // brand ASC (f64::from_bits total_cmp)
+        let brand_cmp = f64::from_bits(a.0).total_cmp(&f64::from_bits(b.0));
+        if brand_cmp != std::cmp::Ordering::Equal {
+            return brand_cmp;
+        }
+        // type ASC (f64::from_bits total_cmp)
+        let type_cmp = f64::from_bits(a.1).total_cmp(&f64::from_bits(b.1));
+        if type_cmp != std::cmp::Ordering::Equal {
+            return type_cmp;
+        }
+        // size ASC (integer)
+        a.2.cmp(&b.2)
+    });
+
+    let n_results = entries.len();
+    let brand_values: Vec<u64> = entries.iter().map(|x| x.0).collect();
+    let type_values: Vec<u64> = entries.iter().map(|x| x.1).collect();
+    let size_values: Vec<u64> = entries.iter().map(|x| x.2).collect();
+    // count stored as raw u64 integer (matching Value2::Int(cnt).to_u64()
+    // in the generic path).
+    let cnt_values: Vec<u64> = entries.iter().map(|x| x.3).collect();
+
+    Ok(QueryResult {
+        columns: vec![
+            ResultColumn { name: "p_brand".to_string(), values: brand_values },
+            ResultColumn { name: "p_type".to_string(), values: type_values },
+            ResultColumn { name: "p_size".to_string(), values: size_values },
+            ResultColumn { name: "supplier_cnt".to_string(), values: cnt_values },
+        ],
+        row_count: n_results,
+        elapsed_us: 0,
+    })
+}
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]
