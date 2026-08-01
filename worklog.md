@@ -2471,7 +2471,7 @@ Stage Summary:
 - Cumulative delta vs Wave 0 baseline (11470ms): 11470 - 313.84 = 11156.16ms (-97.3%)
 - Cumulative delta vs DuckDB (442ms): 442 - 313.84 = 128.16ms (turboGP 1.41x faster than DuckDB overall; was 1.36x at W9-3, was 25.9x slower at Wave 0)
 - Queries now beating DuckDB: 18 of 22 (Q11 newly added; Q11 turboGP 2.0ms vs DuckDB 5.6ms = 2.8x faster). Remaining slower: Q3 (18.7 vs 13), Q5 (19.3 vs 12), Q7 (21.7 vs 14), Q13 (28.2 vs 12).
-- Commit hash: 60511c6
+- Commit hash: 8110bdb
 - Push: deferred to wave gate
 
 ---
@@ -2524,5 +2524,5 @@ Stage Summary:
 - Cumulative delta vs Wave 0 baseline (11470ms): 11470 - 291.25 = 11178.75ms (-97.5%)
 - Cumulative delta vs DuckDB (442ms): 442 - 291.25 = 150.75ms (turboGP 1.52× faster than DuckDB overall; was 1.42× at W9-5, was 25.9× slower at Wave 0)
 - Queries now beating DuckDB: 17 of 22 (Q13 newly added; Q13 turboGP 8.05ms vs DuckDB 12ms = 1.49× faster). Remaining slower: Q3 (18.8 vs 13), Q5 (17.0 vs 12), Q7 (18.1 vs 14), Q12 (17.4 vs 16), Q20 (16.7 vs 11).
-- Commit hash: 60511c6
+- Commit hash: 8110bdb
 - Push: deferred to wave gate
