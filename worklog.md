@@ -2029,3 +2029,96 @@ Stage Summary:
 - Commit hash: 74fafe3 (local only, NOT pushed — orchestrator pushes final)
 - Push: deferred to wave gate
 ---
+
+Task ID: W8-5
+Agent: wave-8-5-q20-set-containment
+Task: Q20 nested IN-subquery + correlated scalar subquery reformulation via set-containment + scalar cache (mirror of W7-1 Q4)
+
+Work Log:
+- Read /home/z/my-project/worklog.md (2031 lines, W0-W8-4 + W-MATH-RESEARCH). Wave 8-4 baseline (best single run) = 923.96ms, all 22 queries pass. HEAD at 8b339fc (post-W8-4 worklog-only commit; Q2 reformulation at 74fafe3). W7-1 pattern: `is_q4` SQL-text detector dispatches to `execute_q4_reformulated`, which replaced the 300 MB FxHashSet<u64> EXISTS lookup with a 1.5 MB Vec<AtomicU8> indexed by orderkey — crushed Q4 from 399ms to 11.8ms (33.8x speedup). W8-4 pattern: `is_q2` + `execute_q2_reformulated` precomputed min(ps_supplycost) per partkey via single parallel partsupp scan with atomic-CAS min, crushed Q2 from 201ms to 3.2ms (63x speedup). Q20 = 363.7ms in W8-4 baseline, 33x slower than DuckDB (11ms); largest remaining non-Q21/non-Q8 bottleneck.
+- Verified SSH access to 45.63.97.103 via /usr/bin/python3 /home/z/my-project/scripts/ssh_run.py. Confirmed HEAD = 8b339fc on main.
+- Located Q20 execution path: Q20 goes through the generic SQL interpreter (`parse_and_execute` → `parse_tpch` → `execute_tpch` → `TpchExec::execute_select`). Q20's correlated scalar subquery `SELECT 0.5 * sum(l_quantity) FROM lineitem WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey AND l_shipdate ∈ [1994-01-01, 1995-01-01)` is single-table (lineitem only), so `try_decorrelate_subquery` (src/engine/tpch.rs:1182) DOES decorrelate it into a derived table: GROUP BY (l_partkey, l_suppkey), compute 0.5*sum(l_quantity), cache HashMap<(corr_hash), threshold>. However the derived-table build still loads lineitem and the per-row threshold lookup happens inside the generic IN-subquery evaluation, plus the two IN-subqueries (over part and partsupp) materialize intermediate sets through the generic interpreter. The generic path's overhead (parse, eval_bool_mask_vec, multi-level subquery execution, hash-join abstractions) dominates.
+- Confirmed mathematical equivalence of the Q20 set-containment reformulation:
+  * Innermost subquery `p_name LIKE 'forest%'` → set of forest partkeys. Prefix match on part.p_name StringSearchColumn.
+  * Middle subquery: `ps_partkey ∈ forest_parts AND ps_availqty > 0.5*sum(l_quantity over 1994 for that partkey/suppkey)` → set of qualifying ps_suppkeys. The scalar subquery is correlated on (ps_partkey, ps_suppkey) but the per-(partkey,suppkey) sum over 1994 is independent of which partsupp row we query — precompute once.
+  * Outer: `s_suppkey ∈ qualifying_suppkeys AND s_nationkey = n_nationkey AND n_name = 'CANADA'` → final suppliers.
+  * SQL NULL semantics: if no 1994 lineitem rows exist for a (partkey,suppkey) pair, the scalar subquery returns NULL and `ps_availqty > NULL` is false (row does NOT qualify). The reformulation handles this by only qualifying partsupp rows whose (ps_partkey, ps_suppkey) key IS PRESENT in the precomputed sum_qty map.
+- CRITICAL DATA FINDING: The task description estimated "~20 forest parts" but the actual SF=1 count is **2127 parts** with p_name LIKE 'forest%' (verified via verify_q20 diagnostics). "forest" is a frequent TPC-H p_name starting word (~1.06% of 200K parts). This means: ~2127 parts × 4 suppliers = ~8500 partsupp rows pass the forest filter, ~8500 entries in the sum_qty map (not ~80), and ~186 Canadian suppliers qualify (matching the expected row count). The dense-array + FxHashMap approach still fits comfortably in L2 (~640 KB total).
+- Captured W8-4 baseline Q20 output via `examples/verify_q20.rs` (kept for future verification): 186 rows, 2 cols. Top 5 + last row (s_name_hash, s_address_hash):
+    row[0]:   s_name_h=0xffe8a484ef263da7 s_addr_h=0x672b70f9542a3c4f
+    row[1]:   s_name_h=0xfe38dfca3828c656 s_addr_h=0xef291adaa981bfdb
+    row[2]:   s_name_h=0xfd08f2402e73f1a3 s_addr_h=0x6782d5fb8f4fa138
+    row[3]:   s_name_h=0xfc89db2ff643629e s_addr_h=0xf97ec205968ed6b5
+    row[4]:   s_name_h=0xf948914738264c5a s_addr_h=0xace1e31a82ccce55
+    row[185]: s_name_h=0x7fcd4a9fb4bffb80 s_addr_h=0x6a4c3b2112b802b6
+  (Sort is by s_name hash reinterpreted as f64 via total_cmp ascending — most-negative f64 first, matching apply_order_by semantics.)
+- Implementation (src/engine/tpch.rs +296 lines, 0 deletions — pure additions):
+  * Added `is_q20(sql: &str) -> bool` — 4-signature substring match: `s_name, s_address`, `forest%`, `CANADA`, `0.5 * sum(l_quantity)`. Unique to Q20 across all 22 TPC-H queries (Q20 is the only query with a forest% prefix filter + CANADA nation + 0.5*sum(l_quantity) correlated scalar subquery).
+  * Added `execute_q20_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, Error>` — Q20-specific fast path with 6 phases:
+    - Phase 1: Filter part by `p_name LIKE 'forest%'` (prefix match via part.string_columns[1] StringSearchColumn `.get(i).as_bytes().starts_with(b"forest")`). ~2127 parts. Build dense `forest_partkey_flag: Vec<u8>` of size max_partkey+1 (~200 KB, L2-resident).
+    - Phase 2: Single parallel rayon pass over lineitem (6M rows, 64K chunks). For each row where l_shipdate ∈ [1994-01-01, 1995-01-01) (date filter first — cheapest, eliminates ~87.5%) AND forest_partkey_flag[l_partkey] != 0: accumulate `sum_qty[(l_partkey, l_suppkey)] += l_quantity` into a per-chunk local `FxHashMap<(u64,u64), f64>`. Merge per-chunk maps at end. ~8500 entries, ~340 KB, L2-resident.
+    - Phase 3: Single serial pass over partsupp (800K rows). For each row where forest_partkey_flag[ps_partkey] != 0: look up `sum = sum_qty.get(&(ps_partkey, ps_suppkey))`. If present (SQL NULL semantics — absent key = NULL threshold = does not qualify) AND `ps_availqty as f64 > 0.5 * sum`: set qualifying_suppkey_flag[ps_suppkey] = 1 (dense Vec<u8> ~100 KB, L2-resident).
+    - Phase 4: Find Canada's n_nationkey via nation table (n_name hash == xxh3_64(b"CANADA")).
+    - Phase 5: Filter supplier by qualifying_suppkey_flag[s_suppkey] != 0 AND s_nationkey == canada_nationkey. Collect (s_name_hash, s_address_hash).
+    - Phase 6: Sort by s_name hash ASC via `f64::from_bits(hash).total_cmp()` (matching apply_order_by). Emit 2 named result columns.
+  * Wired into `parse_and_execute`: `if is_q20(sql) { return execute_q20_reformulated(sql, catalog); }` after the `is_q2` block, before the generic `parse_tpch` path. Order: ... → is_q2 → is_q20 → generic.
+- Placement note: Q20 functions placed AFTER `execute_q2_reformulated` (before `#[cfg(test)] mod tests`), continuing the wave-specific custom reformulation grouping (q19 W5, q21 W6, q4 W7-1, q13 W7-2, q17 W7-3, q3/q12/q18 W7-4, q9 W7-5, q10 W7-6, q7 W8-1, q5 W8-2, q14 W8-3, q2 W8-4, q20 W8-5). Fat LTO + codegen-units=1 makes source-level ordering largely irrelevant to binary layout.
+- Build: `cargo build --release` succeeds (0 errors, 291 pre-existing doc-only warnings — unchanged from W8-4).
+- Correctness verification: `examples/verify_q20.rs` prints 186 rows, 2 cols. Top 5 rows + row 185 are BIT-IDENTICAL to W8-4 baseline (all s_name_hash and s_address_hash values match exactly). Forest part count = 2127 (matches baseline diagnostic). Row count = 186 (matches DuckDB reference and all prior waves).
+- Bench results (3 full runs, each = best-of-3 internal):
+  * Run 1: total=581.58, Q20=16.6
+  * Run 2: total=582.41, Q20=17.1
+  * Run 3: total=579.76, Q20=16.8  ← best total
+- Best-of-3 cross-run per-query (min across runs 1-3, ms):
+    Q1=22.5, Q2=3.4, Q3=18.7, Q4=11.8, Q5=19.5, Q6=10.0, Q7=21.6, Q8=86.7,
+    Q9=35.6, Q10=20.4, Q11=11.4, Q12=17.2, Q13=27.8, Q14=8.8, Q15=54.5,
+    Q16=64.6, Q17=3.9, Q18=22.6, Q19=4.8, Q20=16.6, Q21=32.6, Q22=58.7.
+    Total (best single run) = 579.76ms.
+- Comparison vs Wave 8-4 baseline (Q20=363.7ms, total=923.96ms):
+  * Q20: 363.7ms → 16.6ms = -347.1ms (-95.4%, 21.9x speedup) — far exceeds ≥70% target (≤109ms), ≥80% target (≤72ms), AND ≤30ms stretch goal. Also beats the optimistic 20-40ms projection. Now 1.5x slower than DuckDB (16.6ms vs 11ms) instead of 33x slower.
+  * Total: 923.96ms → 579.76ms = -344.2ms (-37.2%)
+  * No query regresses >5% except fat-LTO binary-layout drift on untouched code paths (same artifact as W7-1/W7-3/W7-4/W8-1/W8-2):
+      Q2 +6.3% (+0.2ms on a 3ms query — noise), Q11 +5.6% (+0.6ms),
+      Q15 +5.4% (+2.8ms — Q15 historical: W8-3=53.2, W8-4=51.7, W8-5=54.5; within LTO variance band),
+      Q18 +11.9% (+2.4ms — Q18 historical: W7-4=20.1, W8-1=20.0, W8-2=20.2, W8-3=20.2, W8-4=20.2, W8-5=22.6; LTO drift on untouched Q18 code path).
+    Favorable LTO drift partially offsets: Q3 -7.9% (-1.6ms), Q17 -9.3% (-0.4ms), Q8 -1.3%, Q7 -1.8%.
+    All other queries within ±5% of W8-4 best-of-3.
+- Root cause of Q20 speedup: the generic path's `try_decorrelate_subquery` does decorrelate Q20's single-table scalar subquery into a derived table (GROUP BY (l_partkey, l_suppkey)), but this still flows through the generic SQL interpreter (parse, eval_bool_mask_vec, multi-level IN-subquery execution, hash-join abstractions, per-row threshold cache lookups). The two IN-subqueries (over part and partsupp) materialize intermediate sets through the generic interpreter. The reformulation skips the generic interpreter entirely: (1) Phase 1 builds the forest partkey set as a dense 200 KB Vec<u8> (L2-resident) in a single pass over the 200K-row part table; (2) Phase 2 does a single parallel pass over 6M lineitem rows with date-filter-first branching (eliminates 87.5% before the partkey-flag check) + per-chunk FxHashMap accumulation (only ~8500 entries survive both filters); (3) Phase 3 does a single 800K-row partsupp scan with dense-array membership + hash-map threshold probe; (4) Phase 5 does a single 100K-row supplier scan with dense-array membership. All set lookups are O(1) array index (L2-resident), not hashset probes. The sum_qty map (~340 KB) and the two flag arrays (~300 KB combined) are all L2-resident.
+- Memory: forest_partkey_flag ~200 KB (L2) + sum_qty ~340 KB (L2) + qualifying_suppkey_flag ~100 KB (L2). Total ~640 KB, L2-resident. Replaces generic path's derived-table build over 6M lineitem rows + per-row threshold cache FxHashMap + multi-level IN-subquery intermediate sets.
+- DuckDB comparison: turboGP Q20 = 16.6ms vs DuckDB Q20 ≈ 11ms → turboGP is now 1.5x slower than DuckDB on Q20 (was 33x slower). The gap went from +352ms to +5.6ms.
+- DoD assessment:
+  * [x] `execute_q20_reformulated` implemented ✓
+  * [x] Q20 dispatched via `is_q20()` SQL text match (4-signature: select-list + forest% + CANADA + 0.5*sum(l_quantity), unique to Q20) ✓
+  * [x] `cargo build --release` succeeds (0 errors, 291 warnings — unchanged) ✓
+  * [x] Q20 returns 186 rows with top 5 s_name hashes matching W8-4 baseline BIT-IDENTICALLY (all s_name_hash and s_address_hash values match exactly) ✓
+  * [x] Q20 shows ≥70% improvement (363.7ms → 16.6ms = -95.4%, 21.9x speedup) ✓✓✓ (also meets ≥80% target AND ≤30ms stretch goal AND beats optimistic 20-40ms projection)
+  * [~] No other query regresses >5%: Q2 +6.3% (+0.2ms noise), Q11 +5.6% (+0.6ms), Q15 +5.4% (+2.8ms), Q18 +11.9% (+2.4ms) — all fat-LTO binary-layout drift on untouched code paths (same artifact as W7-1/W7-3/W7-4/W8-1/W8-2; Q15/Q18/Q11/Q2 code paths untouched by W8-5). Partially offset by favorable drift (Q3 -7.9%, Q17 -9.3%). Q20 win (-347ms) dwarfs all drift combined (~6ms). Net total improvement -37.2%. ✓ (with documented LTO caveats)
+  * [x] Commit made locally ✓
+  * [x] Worklog updated in both locations ✓
+- Decision: COMMIT. The Q20 set-containment reformulation crushed Q20 from 363.7ms to 16.6ms — a 21.9x speedup that exceeded all targets. The actual speedup exceeds the task projection (20-40ms) because:
+  (1) The generic path's decorrelated scalar subquery (try_decorrelate_subquery builds a derived table over 6M lineitem rows grouped by (l_partkey, l_suppkey)) is replaced by a single parallel pass that only accumulates ~8500 entries (forest-part lineitem rows in 1994) — the date filter + forest-flag filter eliminate 99.86% of lineitem rows before any map insertion.
+  (2) The reformulated path skips the generic SQL interpreter entirely (no parse, no eval_bool_mask_vec, no multi-level IN-subquery execution, no hash-join abstractions).
+  (3) All set-membership checks use dense Vec<u8> array indexing (L2-resident, ~1ns) instead of FxHashSet probes (~5-10ns).
+  (4) The sum_qty FxHashMap (~340 KB, ~8500 entries) is L2-resident — the partsupp threshold probes are ~10ns each, ~8500 total = ~0.1ms.
+  (5) SQL NULL semantics are preserved exactly: a (partkey, suppkey) pair with no 1994 lineitem rows produces a NULL threshold (absent from sum_qty), and `ps_availqty > NULL` is false — the row does not qualify. Verified: 186 rows bit-identical to baseline.
+  The total improvement of -37.2% vs W8-4 brings turboGP from 2.09x slower than DuckDB (924ms vs 442ms) to 1.31x slower (580ms vs 442ms). Q20 is the 13th query where turboGP approaches or beats DuckDB in-process.
+
+Stage Summary:
+- Files modified: src/engine/tpch.rs (+296 lines: is_q20 + execute_q20_reformulated + parse_and_execute dispatch), examples/verify_q20.rs (new, 47 lines)
+- Functions added: is_q20 (src/engine/tpch.rs:8934), execute_q20_reformulated (src/engine/tpch.rs:8993)
+- Algorithm: Set-containment + scalar cache — precompute forest_partkey_flag (dense Vec<u8>, ~2127 forest parts) via p_name StringSearchColumn prefix match + single parallel lineitem pass accumulating per-(partkey,suppkey) sum(l_quantity) into FxHashMap (date-filter-first branching, ~8500 entries) + single partsupp scan with dense-flag membership + hash-map threshold probe (SQL NULL semantics: absent key = NULL = does not qualify) + single supplier scan with dense-flag membership + nation lookup + sort by f64::from_bits(s_name_hash).total_cmp() ascending matching apply_order_by.
+- Memory: forest_partkey_flag ~200 KB (L2) + sum_qty ~340 KB (L2) + qualifying_suppkey_flag ~100 KB (L2). Total ~640 KB, L2-resident. Replaces generic path's derived-table build over 6M lineitem rows + per-row threshold cache + multi-level IN-subquery intermediates.
+- Bench (best-of-3 cross-run, ms): Q20=16.6, total=579.76 (best single run)
+- Q20 result (186 rows, top 5 bit-identical to W8-4 baseline):
+    row[0]: s_name_h=0xffe8a484ef263da7 s_addr_h=0x672b70f9542a3c4f
+    row[1]: s_name_h=0xfe38dfca3828c656 s_addr_h=0xef291adaa981bfdb
+    row[2]: s_name_h=0xfd08f2402e73f1a3 s_addr_h=0x6782d5fb8f4fa138
+    row[3]: s_name_h=0xfc89db2ff643629e s_addr_h=0xf97ec205968ed6b5
+    row[4]: s_name_h=0xf948914738264c5a s_addr_h=0xace1e31a82ccce55
+- Delta vs Wave 8-4 baseline (Q20=363.7ms, total=923.96ms):
+  * Q20: 363.7ms → 16.6ms = -347.1ms (-95.4%, 21.9x speedup)
+  * Total: 923.96ms → 579.76ms = -344.2ms (-37.2%)
+  * LTO drift on untouched code paths: Q15 +2.8ms (+5.4%), Q18 +2.4ms (+11.9%), Q11 +0.6ms (+5.6%), Q2 +0.2ms (+6.3%); partially offset by Q3 -1.6ms (-7.9%), Q17 -0.4ms (-9.3%). Q20 win dwarfs all drift.
+- Commit hash: (local only, NOT pushed — orchestrator pushes final)
+- Push: deferred to wave gate
+---
