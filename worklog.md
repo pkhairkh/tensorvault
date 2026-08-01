@@ -609,3 +609,41 @@ Stage Summary:
 - Baseline (best-of-3 min, ms — harness headline, for cross-wave comparison): Q1=26.73, Q3=424.74, Q4=400.94, Q5=198.95, Q7=1100.72, Q9=527.79, Q12=436.86, Q14=345.43, Q18=1158.23, Q19=952.57, Q20=412.11, Q21=3095.69, total(all 22, best)=11469.55
 - Commit hash: e37bc86
 - Push status: success (2403ba1..e37bc86 -> origin/main)
+
+---
+Task ID: W1-A
+Agent: wave-1a-fxhash
+Task: Replace hashbrown::HashMap with FxHashMap in hot u64-keyed paths (high-card GROUP BY, EXISTS, semi-join)
+
+Work Log:
+- Read /home/z/my-project/worklog.md (612 lines, W0–W4 + W-MATH-RESEARCH + W0-ENV): baseline at commit e37bc86, best-of-3 total 11469.55ms. W-MATH-RESEARCH trick 10 (FxHashMap) projected ~2× faster than ahash for trusted u64 keys because FxHash skips AES-NI finalizer (already saturated on Q21).
+- Surveyed remote repo for u64-keyed HashMap sites: 3 files with hot-path u64 maps identified (src/engine/tpch.rs, src/engine/dispatch.rs, src/kernel/hash.rs). Explicitly SKIPPED per task constraints: col_map (HashMap<String, usize> plan-time), JoinHashTable (CedarDB bloom-tagged custom layout — Wave 2/4), BloomFilter (custom AVX-512), executor.rs HashMap<Vec<u64>, _> (variable-length key — FxHashMap suboptimal), index/lsh.rs (not TPC-H hot path), flat_hash_table.rs (CountDistinct fallback / test code), kernel/mod.rs (HashMap<(Operator, CpuTarget, MemoryTier), _> tuple key).
+- Wrote /home/z/my-project/scripts/w1a/edit_w1a.py — surgical string-replace script with assertions (must_replace asserts each pattern matches exactly once). Uploaded to /tmp/edit_w1a.py on remote.
+- Backed up originals to /tmp/{tpch,dispatch,hash}.rs.bak, then ran script. All 22 substitutions succeeded (26 FxHashMap/FxHashSet occurrences in tpch.rs, 4 in dispatch.rs, 3 in kernel/hash.rs).
+- tpch.rs changes: added `use fxhash::{FxHashMap, FxHashSet};` import + `new_fxhashmap()`/`new_fxhashset()` helpers (FxHash uses fixed seed 0, no OS entropy); replaced 4 cache struct field types (exists_cache, exists_multi_cache, in_subquery_cache, decorrelated_cache) — outer `HashMap<usize, _>` kept as ahash (cache lookup is not hot), inner u64-keyed maps swapped to FxHashMap/FxHashSet; replaced try_decorrelate_subquery return type (HashMap<u64, Value2> → FxHashMap<u64, Value2>); build_exists_hashset signature + body (HashSet<u64> → FxHashSet<u64>, new_hashset() → new_fxhashset()); build_exists_multi_map signature + body (HashMap<u64, HashSet<u64>> → FxHashMap<u64, FxHashSet<u64>>); in_subquery_cache 2 insert sites; fused GROUP BY local_slot + key_to_slot; parallel GROUP BY local_maps + local + group_map.
+- dispatch.rs changes: execute_group_by local `use std::collections::HashMap;` → `use fxhash::FxHashMap;` + `HashMap<u64, Vec<usize>> = HashMap::new()` → `FxHashMap<u64, Vec<usize>> = FxHashMap::default()`; execute_string_group_by local import + `HashMap<u64, u64> = HashMap::with_capacity(n)` → `FxHashMap::default(); counts.reserve(n);` (FxHashMap is `HashMap<K, V, BuildHasherDefault<FxHasher>>` — `with_capacity` is only defined for `HashMap<K, V, RandomState>`, so use default+reserve).
+- kernel/hash.rs changes: `use std::collections::HashMap;` → `use fxhash::FxHashMap;`; `HashTable.map: HashMap<u64, Vec<usize>>` → `FxHashMap<u64, Vec<usize>>` (public field — only consumed by benches/examples, no TPC-H impact); `build()` local var same swap, with default+reserve for capacity hint.
+- First `cargo build --release` failed: 2 errors — `FxHashMap::with_capacity(n)` not found (FxHashMap = HashMap<_, _, BuildHasherDefault<FxHasher>>; std's `with_capacity` is only defined on HashMap<K, V, RandomState>). Fixed by replacing both call sites with `FxHashMap::default()` + `.reserve(n)` (preserves capacity hint without rehash-on-grow). Rebuild succeeded.
+- `cargo build --release` final: 0 errors, 289 pre-existing doc-only warnings (unchanged from Wave 0 baseline).
+- Built bench harness `cargo build --release --example bench_tpch_turbogp` (0 errors) and ran `./target/release/examples/bench_tpch_turbogp`. All 22 queries OK, 0 failures, 0 timeouts. CSV load 3196.8ms (excluded from totals).
+- Inspected /root/results/turbogp_tpch.json for per-run timings; recorded run-1 (best-of-1) and best-of-3 min for tracked queries.
+- Comparison vs Wave 0 baseline (no rollback needed — every tracked query improved or stayed flat within noise):
+  * Q1:  26.73 → 22.96 best (-14.1%)  / 26.73 → 26.25 run1 (-1.8%)
+  * Q3:  424.74 → 394.33 best (-7.2%) / 474.69 → 475.23 run1 (+0.1%, flat — best-of-3 reveals true improvement)
+  * Q4:  400.94 → 404.28 best (+0.8%, flat within noise) / 425.21 → 425.42 run1 (+0.05%)
+  * Q18: 1158.23 → 1141.10 best (-1.5%) / 1204.85 → 1199.18 run1 (-0.5%)
+  * Q21: 3095.69 → 2920.36 best (-5.7%) / 3102.36 → 2940.12 run1 (-5.2%)
+  * total(all 22, best): 11469.55 → 11122.22 = -347.33ms (-3.0%)
+- DoD: ≥3 files modified (3 ✓: tpch.rs, dispatch.rs, kernel/hash.rs); cargo build --release succeeds (✓); no tracked query regressed >5% (✓); Q3 improved -7.2% best-of-3 (✓) AND Q18 improved -1.5% best-of-3 (✓) — both high-card GROUP BY paths hit the target; commit made locally (✓, hash bf47974).
+- Committed locally with descriptive message (no push — orchestrator pushes per wave). Backup files in /tmp on remote are NOT cleaned (kept for forensics if a later wave needs to bisect).
+
+Stage Summary:
+- Files modified: src/engine/tpch.rs, src/engine/dispatch.rs, src/kernel/hash.rs
+- HashMap → FxHashMap replacements: 22 substitutions across the 3 files (26+4+3 = 33 FxHashMap/FxHashSet occurrences total, counting both newly-added helper functions and import lines)
+- Build: success (cargo build --release, 0 errors, 289 pre-existing doc-only warnings)
+- Bench (best-of-3 min, ms): Q1=22.96, Q3=394.33, Q4=404.28, Q18=1141.10, Q21=2920.36, total(all 22)=11122.22
+- Bench (run-1 of 3, ms): Q1=26.25, Q3=475.23, Q4=425.42, Q18=1199.18, Q21=2940.12, total(all 22)=11667.54
+- Delta vs Wave 0 baseline (best-of-3, 11469.55ms): -347.33ms (-3.0%)
+- Per-tracked-query delta (best-of-3): Q1 -14.1%, Q3 -7.2%, Q4 +0.8% (flat), Q18 -1.5%, Q21 -5.7%
+- Commit hash: bf47974 (local only, NOT pushed — wave gate will push)
+- Push: deferred to wave gate
