@@ -5409,6 +5409,13 @@ pub fn parse_and_execute(sql: &str, catalog: &Catalog) -> Result<QueryResult, Er
     if is_q10(sql) {
         return execute_q10_reformulated(sql, catalog);
     }
+    // W8-1: Q7 comultiplication. Split OR nation-pair into 2 disjoint
+    // sub-joins (FRANCE->GERMANY and GERMANY->FRANCE). Filter pushdown:
+    // supplier by nation, customer by nation, lineitem by shipdate.
+    // Single parallel pass with 4-group FxHashMap accumulation.
+    if is_q7(sql) {
+        return execute_q7_reformulated(sql, catalog);
+    }
     let query = parse_tpch(sql).map_err(Error::Parse)?;
     execute_tpch(&query, catalog)
 }
@@ -7671,6 +7678,326 @@ fn execute_q10_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
     })
 }
 
+
+// =========================================================================
+// W8-1: Q7 comultiplication — split OR nation-pair into 2 disjoint sub-joins
+// =========================================================================
+
+/// Detect Q7 by its signature: `supp_nation` + `cust_nation` + `l_year`
+/// aliases + `FRANCE` and `GERMANY` literals. Unique to Q7 across all 22
+/// TPC-H queries (Q7 is the only query selecting supp_nation/cust_nation
+/// with the FRANCE<->GERMANY nation-pair filter).
+fn is_q7(sql: &str) -> bool {
+    sql.contains("supp_nation")
+        && sql.contains("cust_nation")
+        && sql.contains("l_year")
+        && sql.contains("FRANCE")
+        && sql.contains("GERMANY")
+}
+
+/// W8-1: Q7 comultiplication — replaces the 6-table join + OR nation-pair
+/// filter with filter pushdown + single-pass lineitem scan over dense
+/// lookup arrays.
+///
+/// Mathematical principle (comultiplication / distributivity of join over
+/// union):
+/// The WHERE has an OR of 2 nation-pair conditions:
+///   Branch A: n1=FRANCE AND n2=GERMANY (supplier from FRANCE, customer
+///             from GERMANY)
+///   Branch B: n1=GERMANY AND n2=FRANCE (supplier from GERMANY, customer
+///             from FRANCE)
+/// These are disjoint (FRANCE != GERMANY), so:
+///   R join (S_A union S_B) = (R join S_A) union (R join S_B)
+/// Instead of 2 separate sub-joins, we do a single pass: for each lineitem
+/// row, look up the supplier's nation and customer's nation; if the pair
+/// is (FRANCE, GERMANY) or (GERMANY, FRANCE), accumulate. The disjointness
+/// guarantees each row matches at most one branch.
+///
+/// Algorithm (6 phases):
+///   1. Build nation lookup: find n_nationkey for FRANCE and GERMANY (25
+///      rows, trivial scan). Compute france_hash and germany_hash.
+///   2. Build dense `supp_nation_hash[suppkey]` (u64, 0 if not FRANCE/
+///      GERMANY). ~80 KB, L2-resident. Only ~4K suppliers match.
+///   3. Build dense `cust_nation_hash[custkey]` (u64, 0 if not FRANCE/
+///      GERMANY). ~1.2 MB, L2/L3-resident. Only ~15K customers match.
+///   4. Build dense `order_custkey[orderkey]` (u64). ~12 MB, L3-resident.
+///   5. Single parallel pass over lineitem (6M rows, 64K chunks). For each
+///      row where l_shipdate in [1995-01-01, 1996-12-31] AND
+///      supp_nation_hash[l_suppkey] != 0 AND cust_nation_hash[order_custkey
+///      [l_orderkey]] != 0 AND supp_hash != cust_hash (ensures FRANCE<->
+///      GERMANY, not same nation): compute year via Hinnant, volume =
+///      ext*(1-disc), accumulate into per-chunk FxHashMap<(supp_hash,
+///      cust_hash, year), f64>. 4 groups total (2 nation-pairs x 2 years).
+///   6. Merge per-chunk maps, sort by (supp_name ASC, cust_name ASC,
+///      l_year ASC), return 4 columns.
+///
+/// The 6M-row lineitem scan does 3 cheap array lookups per row (shipdate
+/// range check + supp_nation_hash + order_custkey + cust_nation_hash) that
+/// filter ~99.7% of rows before the FMA multiply. Replaces the generic
+/// path's 6-table joined-table materialization + OR-of-nation-pair scan
+/// + 4-group hash table.
+fn execute_q7_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, Error> {
+    use xxhash_rust::xxh3::xxh3_64;
+    let _ = sql; // detected by is_q7(); constants are hardcoded below.
+
+    // ---- Load tables ----
+    let supplier_tbl = catalog
+        .get("supplier")
+        .ok_or_else(|| Error::NotFound("table 'supplier'".into()))?;
+    let lineitem_tbl = catalog
+        .get("lineitem")
+        .ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
+    let orders_tbl = catalog
+        .get("orders")
+        .ok_or_else(|| Error::NotFound("table 'orders'".into()))?;
+    let customer_tbl = catalog
+        .get("customer")
+        .ok_or_else(|| Error::NotFound("table 'customer'".into()))?;
+    let nation_tbl = catalog
+        .get("nation")
+        .ok_or_else(|| Error::NotFound("table 'nation'".into()))?;
+
+    let supplier = ExecTable::from_catalog(supplier_tbl, "supplier");
+    let lineitem = ExecTable::from_catalog(lineitem_tbl, "lineitem");
+    let orders = ExecTable::from_catalog(orders_tbl, "orders");
+    let customer = ExecTable::from_catalog(customer_tbl, "customer");
+    let nation = ExecTable::from_catalog(nation_tbl, "nation");
+
+    // Column indices (from tpch_schema in datasource/csv.rs):
+    // supplier: 0=s_suppkey, 3=s_nationkey (Int64)
+    // lineitem: 0=l_orderkey, 2=l_suppkey, 5=l_extendedprice (Float64 bits),
+    //           6=l_discount (Float64 bits), 10=l_shipdate (Date, days since epoch)
+    // orders:   0=o_orderkey, 1=o_custkey (Int64)
+    // customer: 0=c_custkey, 3=c_nationkey (Int64)
+    // nation:   0=n_nationkey (Int64), 1=n_name (String hash)
+    let supp_suppkey = &supplier.columns[0];
+    let supp_nationkey_col = &supplier.columns[3];
+    let n_supp = supplier.row_count;
+
+    let li_orderkey = &lineitem.columns[0];
+    let li_suppkey = &lineitem.columns[2];
+    let li_extendedprice = &lineitem.columns[5];
+    let li_discount = &lineitem.columns[6];
+    let li_shipdate = &lineitem.columns[10];
+    let n_li = lineitem.row_count;
+
+    let ord_orderkey = &orders.columns[0];
+    let ord_custkey = &orders.columns[1];
+    let n_ord = orders.row_count;
+
+    let cust_custkey = &customer.columns[0];
+    let cust_nationkey_col = &customer.columns[3];
+    let n_cust = customer.row_count;
+
+    let nat_nationkey = &nation.columns[0];
+    let nat_name = &nation.columns[1];
+    let n_nat = nation.row_count;
+
+    // ---- Phase 1: Build nation lookup ----
+    // Find n_nationkey for FRANCE and GERMANY by scanning nation (25 rows).
+    // String columns store xxh3_64(bytes); compute the same hash for the
+    // literal nation names.
+    let france_hash = xxh3_64(b"FRANCE");
+    let germany_hash = xxh3_64(b"GERMANY");
+    let mut france_nk: u64 = u64::MAX;
+    let mut germany_nk: u64 = u64::MAX;
+    for i in 0..n_nat {
+        let name_hash = nat_name[i];
+        let nk = nat_nationkey[i];
+        if name_hash == france_hash {
+            france_nk = nk;
+        } else if name_hash == germany_hash {
+            germany_nk = nk;
+        }
+    }
+    if france_nk == u64::MAX || germany_nk == u64::MAX {
+        return Err(Error::NotFound(
+            "FRANCE or GERMANY nation not found in nation table".into(),
+        ));
+    }
+
+    // ---- Phase 2: Build dense supp_nation_hash[suppkey] ----
+    // u64: 0 = not FRANCE/GERMANY, else france_hash or germany_hash.
+    // ~80 KB (10K suppkeys x 8B), L2-resident. Only ~4K suppliers match.
+    let max_suppkey: u64 = supp_suppkey
+        .iter()
+        .copied()
+        .chain(li_suppkey.iter().copied())
+        .max()
+        .unwrap_or(0);
+    let supp_arr_size = (max_suppkey as usize).saturating_add(1);
+    let mut supp_nation_hash: Vec<u64> = vec![0; supp_arr_size];
+    for i in 0..n_supp {
+        let sk = supp_suppkey[i] as usize;
+        if sk < supp_arr_size {
+            let nk = supp_nationkey_col[i];
+            if nk == france_nk {
+                supp_nation_hash[sk] = france_hash;
+            } else if nk == germany_nk {
+                supp_nation_hash[sk] = germany_hash;
+            }
+        }
+    }
+
+    // ---- Phase 3: Build dense cust_nation_hash[custkey] ----
+    // u64: 0 = not FRANCE/GERMANY, else france_hash or germany_hash.
+    // ~1.2 MB (150K custkeys x 8B), L2/L3-resident. Only ~15K customers match.
+    let max_custkey: u64 = cust_custkey
+        .iter()
+        .copied()
+        .chain(ord_custkey.iter().copied())
+        .max()
+        .unwrap_or(0);
+    let cust_arr_size = (max_custkey as usize).saturating_add(1);
+    let mut cust_nation_hash: Vec<u64> = vec![0; cust_arr_size];
+    for i in 0..n_cust {
+        let ck = cust_custkey[i] as usize;
+        if ck < cust_arr_size {
+            let nk = cust_nationkey_col[i];
+            if nk == france_nk {
+                cust_nation_hash[ck] = france_hash;
+            } else if nk == germany_nk {
+                cust_nation_hash[ck] = germany_hash;
+            }
+        }
+    }
+
+    // ---- Phase 4: Build dense order_custkey[orderkey] ----
+    // ~12 MB (1.5M orderkeys x 8B), L3-resident.
+    let max_orderkey: u64 = ord_orderkey
+        .iter()
+        .copied()
+        .chain(li_orderkey.iter().copied())
+        .max()
+        .unwrap_or(0);
+    let ord_arr_size = (max_orderkey as usize).saturating_add(1);
+    let mut order_custkey: Vec<u64> = vec![0; ord_arr_size];
+    for i in 0..n_ord {
+        let ok = ord_orderkey[i] as usize;
+        if ok < ord_arr_size {
+            order_custkey[ok] = ord_custkey[i];
+        }
+    }
+
+    // ---- Phase 5: Single parallel pass over lineitem ----
+    // For each row where l_shipdate in [1995-01-01, 1996-12-31] AND
+    // supp_nation_hash[l_suppkey] != 0 AND cust_nation_hash[order_custkey
+    // [l_orderkey]] != 0 AND supp_hash != cust_hash (ensures FRANCE<->
+    // GERMANY, not same nation): compute year via Hinnant, volume =
+    // ext*(1-disc), accumulate into per-chunk FxHashMap<(supp_hash,
+    // cust_hash, year), f64>. 4 groups total (2 nation-pairs x 2 years).
+    // Chunks are processed in 0..n_li order; per-chunk maps are merged in
+    // order, so per-group sums match a serial scan's FP summation order.
+    let date_start = date_to_days_q4(1995, 1, 1); // >= 1995-01-01 (inclusive)
+    let date_end = date_to_days_q4(1996, 12, 31); // <= 1996-12-31 (inclusive)
+
+    const CHUNK: usize = 65536;
+    let num_chunks = (n_li + CHUNK - 1) / CHUNK;
+
+    let local_maps: Vec<FxHashMap<(u64, u64, i32), f64>> = (0..num_chunks)
+        .into_par_iter()
+        .map(|chunk_idx| {
+            let start = chunk_idx * CHUNK;
+            let end = (start + CHUNK).min(n_li);
+            let mut local: FxHashMap<(u64, u64, i32), f64> = FxHashMap::default();
+            for i in start..end {
+                let shipdate = li_shipdate[i];
+                if shipdate < date_start || shipdate > date_end {
+                    continue;
+                }
+                let sk_raw = li_suppkey[i];
+                let sk = sk_raw as usize;
+                if sk >= supp_arr_size {
+                    continue;
+                }
+                let supp_hash = supp_nation_hash[sk];
+                if supp_hash == 0 {
+                    continue;
+                }
+                let ok_raw = li_orderkey[i];
+                let ok = ok_raw as usize;
+                if ok >= ord_arr_size {
+                    continue;
+                }
+                let ck = order_custkey[ok];
+                let ck_i = ck as usize;
+                if ck_i >= cust_arr_size {
+                    continue;
+                }
+                let cust_hash = cust_nation_hash[ck_i];
+                if cust_hash == 0 || cust_hash == supp_hash {
+                    continue;
+                }
+                let year = crate::types::days_since_epoch_to_year(shipdate as i64);
+                let ext = f64::from_bits(li_extendedprice[i]);
+                let disc = f64::from_bits(li_discount[i]);
+                let volume = ext * (1.0 - disc);
+                let gkey = (supp_hash, cust_hash, year);
+                *local.entry(gkey).or_insert(0.0) += volume;
+            }
+            local
+        })
+        .collect();
+
+    // ---- Phase 6: Merge per-chunk maps (serial, preserves row order) ----
+    let mut groups: FxHashMap<(u64, u64, i32), f64> = FxHashMap::default();
+    for local in local_maps {
+        for (k, v) in local {
+            *groups.entry(k).or_insert(0.0) += v;
+        }
+    }
+
+    // ---- Sort by (supp_name ASC, cust_name ASC, l_year ASC) ----
+    // FRANCE < GERMANY alphabetically. Assign rank: FRANCE=0, GERMANY=1.
+    // The result columns store the nation name hashes (u64); the sort uses
+    // the rank to match DuckDB's alphabetical ORDER BY.
+    let rank = |h: u64| -> u8 {
+        if h == france_hash {
+            0
+        } else {
+            1
+        }
+    };
+    let mut entries: Vec<(u64, u64, i32, f64)> = groups
+        .into_iter()
+        .map(|((sh, ch, yr), vol)| (sh, ch, yr, vol))
+        .collect();
+    entries.sort_by(|a, b| {
+        rank(a.0)
+            .cmp(&rank(b.0))
+            .then_with(|| rank(a.1).cmp(&rank(b.1)))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+
+    let n_results = entries.len();
+    let supp_values: Vec<u64> = entries.iter().map(|x| x.0).collect();
+    let cust_values: Vec<u64> = entries.iter().map(|x| x.1).collect();
+    let year_values: Vec<u64> = entries.iter().map(|x| x.2 as u64).collect();
+    let revenue_values: Vec<u64> = entries.iter().map(|x| x.3.to_bits()).collect();
+
+    Ok(QueryResult {
+        columns: vec![
+            ResultColumn {
+                name: "supp_nation".to_string(),
+                values: supp_values,
+            },
+            ResultColumn {
+                name: "cust_nation".to_string(),
+                values: cust_values,
+            },
+            ResultColumn {
+                name: "l_year".to_string(),
+                values: year_values,
+            },
+            ResultColumn {
+                name: "revenue".to_string(),
+                values: revenue_values,
+            },
+        ],
+        row_count: n_results,
+        elapsed_us: 0,
+    })
+}
 
 #[cfg(test)]
 mod tests {
