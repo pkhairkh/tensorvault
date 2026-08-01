@@ -13,6 +13,7 @@ use crate::exec::fm_index::StringSearchColumn;
 use crate::sql::lexer::{tokenize, Token};
 use crate::Error;
 use rayon::prelude::*;
+use fxhash::{FxHashMap, FxHashSet};
 
 // Use ahash (hardware AES) instead of std SipHash for all HashMap/HashSet.
 // Perf showed 28% of Q21 time was in SipHash + hashbrown operations.
@@ -31,6 +32,18 @@ fn new_hashmap<K, V>() -> HashMap<K, V> {
 /// Create a HashSet without calling OS entropy.
 fn new_hashset<T>() -> HashSet<T> {
     HashSet::with_hasher(ahash::RandomState::with_seed(0x517cc1b727220a95))
+}
+
+/// Create an FxHashMap (trusted u64 keys - no AES, 1 multiply hash) for hot
+/// GROUP BY / EXISTS paths. FxHash is ~2x faster than ahash for u64 keys
+/// because it skips the AES-NI finalizer (already saturated on this workload).
+fn new_fxhashmap<K, V>() -> FxHashMap<K, V> {
+    FxHashMap::default()
+}
+
+/// Create an FxHashSet (trusted u64 keys) for hot EXISTS semi-join sets.
+fn new_fxhashset<T>() -> FxHashSet<T> {
+    FxHashSet::default()
 }
 
 // =========================================================================
@@ -745,17 +758,17 @@ struct TpchExec<'a> {
     /// column values (l_orderkey where l_commitdate < l_receiptdate) ONCE,
     /// then check membership per outer row. This decorrelates the EXISTS,
     /// reducing ~25k subquery executions to 1 hash-set build + 25k lookups.
-    exists_cache: std::cell::RefCell<HashMap<usize, HashSet<u64>>>,
+    exists_cache: std::cell::RefCell<HashMap<usize, FxHashSet<u64>>>,
     /// Cache for multi-column EXISTS: HashMap<equi_key, HashSet<ineq_col>>.
     /// For Q21's `exists (SELECT * FROM lineitem l2 WHERE l2.l_orderkey = l1.l_orderkey
     /// AND l2.l_suppkey <> l1.l_suppkey)`, we build a HashMap<l_orderkey, HashSet<l_suppkey>>
     /// once, then for each outer row, check if any suppkey in the set != l1.l_suppkey.
-    exists_multi_cache: std::cell::RefCell<HashMap<usize, HashMap<u64, HashSet<u64>>>>,
+    exists_multi_cache: std::cell::RefCell<HashMap<usize, FxHashMap<u64, FxHashSet<u64>>>>,
     /// Cache for uncorrelated IN-subquery result sets: keyed by AST pointer.
     /// When an IN-subquery is uncorrelated (e.g. Q20's `s_suppkey IN (SELECT
     /// ps_suppkey FROM partsupp WHERE ...)`), we execute it ONCE and cache
     /// the set of values. Then per-row eval just checks membership.
-    in_subquery_cache: std::cell::RefCell<HashMap<usize, HashSet<u64>>>,
+    in_subquery_cache: std::cell::RefCell<HashMap<usize, FxHashSet<u64>>>,
     /// Cache for decorrelated correlated scalar subqueries.
     /// When a correlated scalar subquery has an aggregate (sum/avg/min/max)
     /// and multiple correlation columns, we proactively build a derived table:
@@ -766,7 +779,7 @@ struct TpchExec<'a> {
     /// key (ps_partkey, ps_suppkey) has 800k distinct values, each requiring
     /// a 6M-row lineitem scan — the derived table scans lineitem ONCE.
     /// Value: (HashMap<corr_hash, agg_value>, Vec<usize> corr_col_indices_in_outer).
-    decorrelated_cache: std::cell::RefCell<HashMap<usize, (HashMap<u64, Value2>, Vec<usize>)>>,
+    decorrelated_cache: std::cell::RefCell<HashMap<usize, (FxHashMap<u64, Value2>, Vec<usize>)>>,
 }
 
 impl<'a> TpchExec<'a> {
@@ -1107,7 +1120,7 @@ impl<'a> TpchExec<'a> {
     ///   0.5 * sum(l_quantity), caches HashMap<(l_partkey,l_suppkey)_hash, threshold>.
     fn try_decorrelate_subquery(
         &self, subquery: &SelectQuery2, outer_t: &ExecTable,
-    ) -> Result<Option<(HashMap<u64, Value2>, Vec<usize>)>, Error> {
+    ) -> Result<Option<(FxHashMap<u64, Value2>, Vec<usize>)>, Error> {
         // Only decorrelate if the subquery has exactly 1 SELECT item that is
         // an aggregate (or a scalar function of an aggregate, like 0.2 * avg(x)).
         if subquery.select.len() != 1 { return Ok(None); }
@@ -1238,7 +1251,7 @@ impl<'a> TpchExec<'a> {
         let agg_expr = &subquery.select[0].expr;
         let inner_corr_indices: Vec<usize> = corr_to_inner.iter().map(|(_, ii, _, _)| *ii).collect();
         // Group rows by composite hash of inner corr cols.
-        let mut groups: HashMap<u64, Vec<usize>> = new_hashmap();
+        let mut groups: FxHashMap<u64, Vec<usize>> = new_fxhashmap();
         for i in 0..base.row_count {
             if !mask[i] { continue; }
             let mut h: u64 = 0;
@@ -1250,7 +1263,7 @@ impl<'a> TpchExec<'a> {
         }
 
         // For each group, compute the aggregate value.
-        let mut result_map: HashMap<u64, Value2> = new_hashmap();
+        let mut result_map: FxHashMap<u64, Value2> = new_fxhashmap();
         result_map.reserve(groups.len());
         for (hash, indices) in &groups {
             let v = self.eval_agg_expr(agg_expr, &base, indices)?;
@@ -1472,7 +1485,7 @@ impl<'a> TpchExec<'a> {
     /// uncorrelated conjuncts are applied).
     ///
     /// For Q4: `SELECT DISTINCT l_orderkey FROM lineitem WHERE l_commitdate < l_receiptdate`
-    fn build_exists_hashset(&self, subquery: &SelectQuery2, inner_col_idx: usize) -> Result<HashSet<u64>, Error> {
+    fn build_exists_hashset(&self, subquery: &SelectQuery2, inner_col_idx: usize) -> Result<FxHashSet<u64>, Error> {
         // Load the subquery's FROM table(s) and join them (no correlation).
         let mut tables: Vec<ExecTable> = Vec::new();
         for item in &subquery.from {
@@ -1505,10 +1518,10 @@ impl<'a> TpchExec<'a> {
         const CHUNK_SIZE: usize = 65536;
         let n = base.row_count;
         let num_chunks = (n + CHUNK_SIZE - 1) / CHUNK_SIZE;
-        let local_sets: Vec<HashSet<u64>> = (0..num_chunks).into_par_iter().map(|chunk_idx| {
+        let local_sets: Vec<FxHashSet<u64>> = (0..num_chunks).into_par_iter().map(|chunk_idx| {
             let start = chunk_idx * CHUNK_SIZE;
             let end = std::cmp::min(start + CHUNK_SIZE, n);
-            let mut local = new_hashset();
+            let mut local = new_fxhashset();
             for i in start..end {
                 if mask[i] {
                     local.insert(col[i]);
@@ -1517,7 +1530,7 @@ impl<'a> TpchExec<'a> {
             local
         }).collect();
         // Merge local sets into final set
-        let mut set = new_hashset();
+        let mut set = new_fxhashset();
         for local in local_sets {
             set.extend(local);
         }
@@ -1682,7 +1695,7 @@ impl<'a> TpchExec<'a> {
 
     /// Build HashMap<equi_key, HashSet<ineq_col>> from the subquery's inner
     /// table, applying only uncorrelated conjuncts.
-    fn build_exists_multi_map(&self, subquery: &SelectQuery2, inner_eq_idx: usize, inner_neq_idx: usize) -> Result<HashMap<u64, HashSet<u64>>, Error> {
+    fn build_exists_multi_map(&self, subquery: &SelectQuery2, inner_eq_idx: usize, inner_neq_idx: usize) -> Result<FxHashMap<u64, FxHashSet<u64>>, Error> {
         let mut tables: Vec<ExecTable> = Vec::new();
         for item in &subquery.from {
             tables.push(self.resolve_from_item(item)?);
@@ -1710,10 +1723,10 @@ impl<'a> TpchExec<'a> {
         const CHUNK_SIZE: usize = 65536;
         let n = base.row_count;
         let num_chunks = (n + CHUNK_SIZE - 1) / CHUNK_SIZE;
-        let local_maps: Vec<HashMap<u64, HashSet<u64>>> = (0..num_chunks).into_par_iter().map(|chunk_idx| {
+        let local_maps: Vec<FxHashMap<u64, FxHashSet<u64>>> = (0..num_chunks).into_par_iter().map(|chunk_idx| {
             let start = chunk_idx * CHUNK_SIZE;
             let end = std::cmp::min(start + CHUNK_SIZE, n);
-            let mut local: HashMap<u64, HashSet<u64>> = new_hashmap();
+            let mut local: FxHashMap<u64, FxHashSet<u64>> = new_fxhashmap();
             for i in start..end {
                 if mask[i] {
                     local.entry(eq_col[i]).or_default().insert(neq_col[i]);
@@ -1722,7 +1735,7 @@ impl<'a> TpchExec<'a> {
             local
         }).collect();
         // Merge local maps into final map
-        let mut map: HashMap<u64, HashSet<u64>> = new_hashmap();
+        let mut map: FxHashMap<u64, FxHashSet<u64>> = new_fxhashmap();
         for local in local_maps {
             for (k, v) in local {
                 map.entry(k).or_default().extend(v);
@@ -3291,14 +3304,14 @@ impl<'a> TpchExec<'a> {
                     match r {
                         Ok(r) => {
                             if let Some(col) = r.columns.first() {
-                                let set: HashSet<u64> = col.values.iter().copied().collect();
+                                let set: FxHashSet<u64> = col.values.iter().copied().collect();
                                 self.in_subquery_cache.borrow_mut().insert(ast_key, set);
                             }
                         }
                         Err(_) => {
                             // Correlated — mark as empty set so we don't retry.
                             // Per-row eval with outer context will handle it.
-                            self.in_subquery_cache.borrow_mut().insert(ast_key, new_hashset());
+                            self.in_subquery_cache.borrow_mut().insert(ast_key, new_fxhashset());
                         }
                     }
                 }
@@ -3597,7 +3610,7 @@ impl<'a> TpchExec<'a> {
             let end = std::cmp::min(start + CHUNK_SIZE, n);
 
             let mut local_keys: Vec<u64> = Vec::with_capacity(16);
-            let mut local_slot: HashMap<u64, usize> = new_hashmap();
+            let mut local_slot: FxHashMap<u64, usize> = new_fxhashmap();
 
             let mut local_sums: Vec<f64> = Vec::new();
             let mut local_counts: Vec<u64> = Vec::new();
@@ -3659,7 +3672,7 @@ impl<'a> TpchExec<'a> {
         let partials: Vec<(Vec<u64>, Vec<f64>, Vec<u64>)> = partials.into_iter().map(|p| p.unwrap()).collect();
 
         // Merge: build global group->slot map from all chunk-local keys
-        let mut key_to_slot: HashMap<u64, usize> = new_hashmap();
+        let mut key_to_slot: FxHashMap<u64, usize> = new_fxhashmap();
 
         let mut group_keys_discovered: Vec<u64> = Vec::new();
         for (keys, _, _) in &partials {
@@ -3810,10 +3823,10 @@ impl<'a> TpchExec<'a> {
         let n_indices = indices.len();
         let num_chunks = (n_indices + GROUP_CHUNK_SIZE - 1) / GROUP_CHUNK_SIZE;
 
-        let local_maps: Vec<HashMap<u64, Vec<usize>>> = (0..num_chunks).into_par_iter().map(|chunk_idx| {
+        let local_maps: Vec<FxHashMap<u64, Vec<usize>>> = (0..num_chunks).into_par_iter().map(|chunk_idx| {
             let start = chunk_idx * GROUP_CHUNK_SIZE;
             let end = std::cmp::min(start + GROUP_CHUNK_SIZE, n_indices);
-            let mut local: HashMap<u64, Vec<usize>> = new_hashmap();
+            let mut local: FxHashMap<u64, Vec<usize>> = new_fxhashmap();
 
             for i in start..end {
                 let idx = indices[i];
@@ -3833,7 +3846,7 @@ impl<'a> TpchExec<'a> {
         }).collect();
 
         // Merge local maps into global group_indices
-        let mut group_map: HashMap<u64, usize> = new_hashmap();
+        let mut group_map: FxHashMap<u64, usize> = new_fxhashmap();
 
         let mut group_indices: Vec<Vec<usize>> = Vec::with_capacity(1024);
         for local in local_maps {

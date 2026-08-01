@@ -17,7 +17,7 @@
 use crate::kernel::cpu::CpuTarget;
 use crate::kernel::{Kernel, KernelParams, KernelResult, Operator};
 use crate::memory::tier::MemoryTier;
-use std::collections::HashMap;
+use fxhash::FxHashMap;
 
 /// A cache-line-aligned hash-table slot (ADR-005).
 ///
@@ -83,7 +83,7 @@ impl AlignedSlot {
 /// `VPCMPEQB` probing. For the prototype we use `std::HashMap`.
 pub struct HashTable {
     /// Maps key → list of build-side row indices.
-    pub map: HashMap<u64, Vec<usize>>,
+    pub map: FxHashMap<u64, Vec<usize>>,
     /// Number of slots (for diagnostics).
     pub slots: usize,
 }
@@ -91,7 +91,8 @@ pub struct HashTable {
 impl HashTable {
     /// Build a hash table from a slice of u64 keys.
     pub fn build(keys: &[u64]) -> Self {
-        let mut map: HashMap<u64, Vec<usize>> = HashMap::with_capacity(keys.len());
+        let mut map: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
+        map.reserve(keys.len());
         for (i, &k) in keys.iter().enumerate() {
             map.entry(k).or_default().push(i);
         }

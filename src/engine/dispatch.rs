@@ -398,7 +398,7 @@ fn single_value(name: &str, value: u64) -> QueryResult {
 
 fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
     use crate::exec::flat_hash_table::{hash_group_by_flat, AggFunc};
-    use std::collections::HashMap;
+    use fxhash::FxHashMap;
 
     // Filter rows
     let mask = build_filter_mask(query, table)?;
@@ -522,7 +522,7 @@ fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
     }
 
     // Multi-key GROUP BY: fall back to HashMap
-    let mut groups: HashMap<u64, Vec<usize>> = HashMap::new();
+    let mut groups: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
     for &idx in &indices {
         let mut h = 0u64;
         for &col in &group_cols {
@@ -642,13 +642,14 @@ fn execute_string_group_by(
     indices: &[usize],
     group_col: usize,
 ) -> Result<QueryResult> {
-    use std::collections::HashMap;
+    use fxhash::FxHashMap;
     use xxhash_rust::xxh3::xxh3_64;
 
     let string_col = table.string_columns[group_col].as_ref().expect("string column");
 
     // Hash each actual string and count occurrences.
-    let mut counts: HashMap<u64, u64> = HashMap::with_capacity(indices.len());
+    let mut counts: FxHashMap<u64, u64> = FxHashMap::default();
+    counts.reserve(indices.len());
     for &i in indices {
         let s = string_col.get(i);
         let h = xxh3_64(s.as_bytes());
