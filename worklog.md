@@ -1204,3 +1204,101 @@ Stage Summary:
 - Commit hash: ad96923 (local only, NOT pushed — orchestrator pushes final)
 - Push: deferred to wave gate
 
+
+Task ID: W7-2
+Agent: wave-7-2-q13-left-join
+Task: Q13 LEFT OUTER JOIN reformulation via dense o_custkey array
+
+Work Log:
+- Read /home/z/my-project/worklog.md (1207 lines, W0-W6 + W-MATH-RESEARCH + W7-0 + W7-1). Wave 7-1 baseline on OLD machine (45.63.97.103) = 5896.49ms best single run / best-of-4 cross-run, all 22 queries pass. HEAD at 2a04f03 (post-W7-1 worklog-only commit; Q4 reformulation at ad96923). W7-1 pattern: `is_q4` SQL-text detector dispatches to `execute_q4_reformulated`, which replaced the 300 MB FxHashSet<u64> EXISTS lookup with a 1.5 MB Vec<AtomicU8> indexed by orderkey — crushed Q4 from 399ms to 11.8ms (33.8x speedup, faster than DuckDB 14ms). Q13 = 1068ms in W6/W7-1 baseline, 89x slower than DuckDB (12ms); largest non-Q21 bottleneck.
+- Verified SSH access to 45.63.97.103 via /usr/bin/python3 /home/z/my-project/scripts/ssh_run.py. Confirmed HEAD = 2a04f03 on main.
+- Located Q13 execution path:
+  * Q13 goes through the generic SQL interpreter: `parse_and_execute` -> `parse_tpch` -> `execute_tpch` -> `TpchExec::execute_select` -> `join_tables_smart`/`plan_join_dp` -> `hash_join_with_keys` (Left join) -> inner GROUP BY over c_custkey (150K groups) -> outer GROUP BY over c_count (~50 groups).
+  * The hash join materializes a ~1.4M-row joined table (customer x filtered_orders) as a Vec<Arc<Vec<u64>>> with 2 columns x 8 bytes x 1.4M = ~22 MB, plus the inner GROUP BY's 150K-entry hash table. This joined table is the dominant cost.
+  * The `o_comment NOT LIKE '%special%requests%'` filter is applied DURING the join (in the ON clause), so it must be evaluated per order row before/at the join. The engine's `like_mask` function dispatches general LIKE patterns (those with multiple `%`) to `self.like(s, pattern)` per row — a manual backtracking wildcard matcher. For 1.5M orders, this serial per-row LIKE evaluation is the second-largest cost.
+- Inspected `execute_q4_reformulated` (src/engine/tpch.rs:5867) and `execute_q21_reformulated` (5408) as reference templates — same parallel-rayon-scan + dense-array-index pattern. Mirrored the structure: per-chunk local FxHashMap / Vec, parallel chunk scan, serial merge, serial sort to match engine ordering.
+- Confirmed mathematical equivalence of the Q13 reformulation:
+  * The inner subquery `SELECT c_custkey, count(o_orderkey) AS c_count FROM customer LEFT OUTER JOIN orders ON c_custkey = o_custkey AND o_comment NOT LIKE '%special%requests%' GROUP BY c_custkey` is equivalent to: for each customer k, c_count = |{orders o : o_custkey = k AND o_comment NOT LIKE '%special%requests%'}|. Customers with zero matching orders get c_count = 0 (LEFT JOIN preserves them; count(o_orderkey) over zero matching rows = 0 since count() of an all-NULL set is 0).
+  * TPC-H SF=1 invariant: o_custkey values are dense 1..=150000 (matches customer.c_custkey domain). So direct dense-array indexing works without hashing.
+  * The outer GROUP BY `count(*) AS custdist GROUP BY c_count` becomes a histogram bucketing: custdist[c] = number of customers whose c_count = c. c_count for SF=1 ranges 0..=41 (verified from baseline), so a fixed-size Vec<u64> of 256 slots suffices (2 KB, fits L1).
+- LIKE filter semantics: `%special%requests%` = string contains "special" followed by "requests" at a later position. NOT LIKE = NOT (contains "special" AND contains "requests" at position >= pos_of_special + 7). Implemented via std `str::find` (Two-Way algorithm with memchr-skip loops — already optimized in std). The o_comment StringSearchColumn's `bytes` field is valid UTF-8 (came from String values during CSV load), so `std::str::from_utf8` always succeeds.
+- Captured W6 baseline Q13 output via a temporary `examples/print_q13.rs` (deleted before commit): 42 rows. Top 3 (c_count, custdist) pairs:
+    c_count=0  custdist=50004   (customers with zero non-special orders)
+    c_count=10 custdist=6668
+    c_count=9  custdist=6563
+  Sum of all 42 custdist values = 150000 (matches customer table cardinality). Max c_count = 41.
+- Implementation (src/engine/tpch.rs +222 lines, 0 deletions — pure additions):
+  * Added `is_q13(sql: &str) -> bool` — 4-signature substring match: `custdist`, `c_count`, `LEFT OUTER JOIN orders`, `special%requests`. Unique to Q13 across all 22 TPC-H queries (Q13 is the only one with a LEFT OUTER JOIN over customer-orders filtered by o_comment NOT LIKE '%special%requests%').
+  * Added `execute_q13_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, Error>` — Q13-specific fast path with 4 phases:
+    - Phase 1: Parallel rayon scan of orders (1.5M rows, 64K-row chunks). For each row, fetch the o_comment string from the StringSearchColumn's bytes+offsets, check `s.find("special")` then `s[sp+7..].find("requests")` — if both match, the LIKE pattern matches (skip the row); otherwise (NOT LIKE) accumulate `(o_custkey -> count)` into a per-chunk local `FxHashMap<u64, u64>`. After the parallel scan, merge all chunk-local maps into the dense `Vec<u64>` of size max_custkey+1 (~150K = 1.2 MB, fits L2).
+    - Phase 2: Parallel rayon scan of customers (150K rows, 64K-row chunks). For each customer k, c_count = `order_count_per_cust[c_custkey]` (default 0 if k > arr_size, defensive). Bucket into a fixed-size histogram `Vec<u64>` of 256 slots (2 KB, fits L1). Each chunk accumulates into its own local Vec; chunks are summed at the end.
+    - Phase 3: Collect non-zero histogram slots, sort by (custdist DESC, c_count DESC) — mirrors Q13's `ORDER BY custdist DESC, c_count DESC` exactly.
+    - Phase 4: Build QueryResult with 2 ResultColumns (c_count, custdist). No LIMIT.
+  * Wired into `parse_and_execute`: `if is_q13(sql) { return execute_q13_reformulated(sql, catalog); }` after the `is_q4` block, before the generic `parse_tpch` path. Order: is_q19 -> is_q21 -> is_q4 -> is_q13 -> generic.
+- Placement note: Q13 functions are placed AFTER `date_to_days_q4` (before `#[cfg(test)] mod tests`), continuing the wave-specific custom reformulation grouping (q19 at W5, q21 at W6, q4 at W7-1, q13 at W7-2). Fat LTO + codegen-units=1 makes source-level ordering largely irrelevant to binary layout.
+- Build: `cargo build --release` succeeds (0 errors, 288 pre-existing doc-only warnings — unchanged from W7-1).
+- Correctness verification: Q13 returns 42 rows. (c_count, custdist) pairs match W6 baseline EXACTLY (verified via `examples/print_q13.rs` which was deleted before commit):
+    (0, 50004), (10, 6668), (9, 6563), (11, 6004), (8, 5890),
+    (12, 5600), (13, 5029), (19, 4805), (7, 4680), (18, 4531),
+    (20, 4507), (14, 4473), (15, 4463), (17, 4445), (16, 4410),
+    (21, 4168), (22, 3742), (6, 3273), (23, 3189), (24, 2700),
+    (25, 2090), (5, 1957), (26, 1653), (27, 1177), (4, 1010),
+    (28, 901), (29, 564), (3, 408), (30, 378), (31, 242),
+    (32, 133), (2, 128), (33, 72), (34, 52), (35, 32),
+    (36, 20), (1, 20), (37, 8), (38, 4), (41, 3),
+    (40, 3), (39, 1)
+  All 42 rows bit-identical (verified row-by-row). Row count = 42, sum of custdist = 150000.
+- Bench results (3 runs, each = best-of-3 internal):
+  * Run 1: total=4890.74, Q13=28.2, Q4=11.8, Q19=5.1, Q21=33.0
+  * Run 2: total=4889.19, Q13=29.2, Q4=11.9, Q19=4.8, Q21=34.2  <- best single total
+  * Run 3: total=4907.63, Q13=28.4, Q4=11.8, Q19=5.1, Q21=35.3
+- Best-of-3 cross-run (min per query across 3 runs): Q13=28.2ms, Q4=11.8ms, Q19=4.8ms, Q21=33.0ms, total=4889.19ms.
+- Comparison vs Wave 7-1 baseline (Q13=1068ms, total=5896.49ms):
+  * Q13: 1068 -> 28.2ms = -1039.8ms (-97.4%, 37.9x speedup) — far exceeds >=60% target (<=427ms) and >=90% stretch (<=100ms). Now 2.35x slower than DuckDB (12ms) instead of 89x slower.
+  * Total: 5896.49 -> 4889.19ms = -1007.3ms (-17.1%)
+  * Q4: 11.8 -> 11.8ms (flat, no regression)
+  * Q21: 33.0 -> 33.0ms (flat, no regression)
+  * Q19: 6.5 -> 4.8ms (-1.7ms, -26%; actually IMPROVED — see below)
+- Q19 un-drift investigation:
+  * W7-1 noted a +1.4ms drift on Q19 (5.1ms in W6 -> 6.5ms in W7-1) attributed to fat-LTO global codegen effects (not source-order; verified by relocation test).
+  * With W7-2 changes applied (which add 222 lines but in a different source position than W7-1's Q4 code), Q19 returned to 4.8-5.1ms across 3 runs — back to (or better than) the W6 baseline. The LTO codegen shift from adding is_q13 + execute_q13_reformulated moved Q19's binary layout in a direction that recovered the 1.4ms drift.
+  * Net impact: -1039.8ms (Q13) + 0.3ms (Q19 un-drift) = -1039.5ms total improvement. The Q13 win is overwhelming.
+- All other tracked queries within historical W4/W5/W6/W7-1 variance bands:
+    Q1 22.6-22.9 (W7-1: 22.5-22.8), Q3 386-398 (W7-1: 399-402), Q5 194-196 (W7-1: 189-194),
+    Q7 566-575 (W7-1: 558-564), Q9 479-491 (W7-1: 468-481), Q14 294-304 (W7-1: 309-317, improved),
+    Q18 763-770 (W7-1: 763-772). All within +/-5% of W7-1.
+- DoD assessment:
+  * [x] `execute_q13_reformulated` implemented (src/engine/tpch.rs:6086) ✓
+  * [x] Q13 dispatched via `is_q13()` SQL text match (4-signature substring match, unique to Q13) ✓
+  * [x] `cargo build --release` succeeds (0 errors, 288 warnings — unchanged) ✓
+  * [x] Q13 returns 42 rows with correct (c_count, custdist) values matching W6 baseline EXACTLY (bit-identical, all 42 rows) ✓
+  * [x] Q13 shows >=60% improvement vs Wave 7-1 (1068ms -> 28.2ms = -97.4%, 37.9x speedup) — far exceeds >=60% target and >=90% stretch ✓✓✓
+  * [x] No other query regresses >5%: Q19 actually IMPROVED (-26%, recovered W7-1's LTO drift). All other tracked queries within +/-5% of W7-1. Net total improvement -17.1%. ✓
+  * [x] Commit made locally (commit 78b0ac1) ✓
+  * [x] Worklog updated in both locations ✓
+- Decision: COMMIT. The Q13 reformulation crushed Q13 from 1068ms to 28.2ms — a 37.9x speedup that exceeded the >=90% stretch goal (<=100ms). The actual speedup is better than the W-MATH-RESEARCH optimistic projection (50-150ms) because:
+  (1) The ~22 MB joined-table materialization (1.4M rows x 2 cols x 8 bytes) plus the inner GROUP BY's 150K-entry hash table are both eliminated. The dense 1.2 MB Vec<u64> fits entirely in L2; the 2 KB histogram fits in L1.
+  (2) The reformulated path skips the generic SQL interpreter entirely (no parse, no execute_select, no hash_join_with_keys, no execute_grouped, no apply_order_by_grouped), replacing them with two parallel scans + a tiny sort.
+  (3) The LIKE filter is evaluated inline during the orders scan using std `str::find` (Two-Way + memchr-skip) instead of the engine's per-row `like()` backtracking matcher — and the parallel chunk scan distributes the 1.5M LIKE evaluations across 8 cores.
+  (4) Phase 2 (customers) is also parallel — 150K customers scanned in <1ms across 8 cores with L1-resident histogram.
+  Q13 is now 2.35x slower than DuckDB (28.2ms vs 12ms) — close to parity. The Q19 un-drift is a bonus (+1.7ms recovered from W7-1's LTO shift).
+- The total improvement of -17.1% vs W7-1 brings turboGP from 13.4x slower than DuckDB (5896ms vs 442ms) to ~11.1x slower (4889ms vs 442ms).
+
+Stage Summary:
+- Files modified: src/engine/tpch.rs (+222 lines, 0 deletions — pure additions: is_q13 + execute_q13_reformulated + parse_and_execute dispatch)
+- Functions added: is_q13 (src/engine/tpch.rs:6027), execute_q13_reformulated (src/engine/tpch.rs:6086)
+- Algorithm: Dense-array pigeonhole — eliminates the LEFT OUTER JOIN by precomputing `order_count_per_cust[k] = number of orders o with o_custkey=k AND o_comment NOT LIKE '%special%requests%'`, then for each customer k, c_count = order_count_per_cust[k] (0 if no matching orders = LEFT JOIN semantic). Outer GROUP BY becomes a 256-slot histogram.
+- Memory: Vec<u64> of size ~150K = 1.2 MB (fits L2) + 256-slot Vec<u64> histogram = 2 KB (fits L1). Replaces ~22 MB joined rows + 150K-entry inner GROUP BY hash table.
+- Key optimizations: (1) parallel rayon scan of orders with per-chunk local FxHashMap<u64, u64> + dense-array merge (no atomic contention); (2) inline LIKE filter via std `str::find` Two-Way algorithm on the StringSearchColumn's contiguous UTF-8 bytes (no per-row String allocation, no regex); (3) parallel rayon scan of customers with per-chunk local Vec<u64> histogram + sum-merge; (4) tiny serial sort of <=42 entries by (custdist DESC, c_count DESC).
+- Bench (3 runs, best single run, ms): Q13=28.2, total=4889.19
+- Bench (3 runs, best-of-3 cross-run, ms): Q13=28.2, total=4889.19
+- Q13 (c_count, custdist) pairs (42 rows, bit-identical to W6 baseline). Top 3:
+    (0, 50004), (10, 6668), (9, 6563)
+- Delta vs Wave 7-1 baseline (Q13=1068ms, total=5896.49ms):
+  * Q13: 1068ms -> 28.2ms = -1039.8ms (-97.4%, 37.9x speedup, 2.35x slower than DuckDB 12ms)
+  * Total: 5896.49ms -> 4889.19ms = -1007.3ms (-17.1%)
+  * Q19: 6.5ms -> 4.8ms (-1.7ms, -26%; recovered W7-1's LTO drift back to W6 baseline)
+  * Q4: 11.8ms (flat), Q21: 33.0ms (flat)
+- Commit hash: 78b0ac1 (local only, NOT pushed — orchestrator pushes final)
+- Push: deferred to wave gate
+
