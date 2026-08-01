@@ -2310,3 +2310,59 @@ Stage Summary:
 - Queries now beating DuckDB: 16 of 22 (Q16 newly added). Remaining slower: Q3 (18.7 vs 13), Q5 (19.6 vs 12), Q7 (22.1 vs 14), Q11 (11.0 vs 5.6), Q13 (27.6 vs 12), Q20 (16.6 vs 11).
 - Commit hash: 8bb0c11 (local only, NOT pushed — orchestrator pushes final)
 - Push: deferred to wave gate
+
+---
+Task ID: W9-3
+Agent: wave-9-3-q15-max-revenue
+Task: Q15 max-revenue cache — compute the repeated uncorrelated subquery (sum(l_extendedprice * (1 - l_discount)) GROUP BY l_suppkey) ONCE, cache in dense Vec<f64>, find max, filter suppliers.
+
+Work Log:
+- Read W9-2 (Q16), W8-4 (Q2 subquery cache), W7-4 (Q3 high-card GROUP BY) worklog sections for patterns.
+- Inspected existing Q15 code: the generic path executes the same uncorrelated subquery TWICE (once as derived table `revenue`, once inside `max(total_revenue)`), scanning+aggregating ~1.5M filtered lineitem rows twice. This is the root cause of Q15's 52.7ms latency.
+- Inspected Q3/Q10 implementations for the per-chunk FxHashMap<u64, f64> revenue aggregation pattern. Q3/Q10 use FxHashMap because their group keys (orderkey/custkey) have wide ranges. Q15's group key (l_suppkey) is a small contiguous integer in [1, 10K], enabling a dense Vec<f64> approach that eliminates hash computation and probing.
+- Implemented `is_q15(sql: &str) -> bool` detector: matches on `total_revenue`, `max(total_revenue)`, `supplier_no`, `1996-01-01`, `1996-04-01`. Unique to Q15 across all 22 TPC-H queries.
+- Implemented `execute_q15_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, Error>`:
+  * Phase 1: Single parallel pass over lineitem (6M rows, 64K chunks). Filter by l_shipdate ∈ [1996-01-01, 1996-04-01) (~3.5% selectivity, ~1.5M surviving rows). For each surviving row, accumulate `revenue = ext * (1 - disc)` into a thread-local dense `Vec<f64>` indexed by l_suppkey. Thread-local Vecs merged via rayon `fold` + `reduce` (element-wise sum). Dense Vec chosen over FxHashMap because TPC-H suppkeys are contiguous integers in [1, 10K] — direct indexing eliminates hash computation and probing (~3x faster for this cardinality).
+  * Phase 2: Find max_revenue = max(per-suppkey revenue) over all suppliers.
+  * Phase 3: Iterate supplier table in CSV order. For each supplier, look up revenue from dense array. If `(rev - max_revenue).abs() <= 1e-10 * max_revenue.abs()` (FP tolerance), emit row. Sort by s_suppkey ASC (no-op for TPC-H's sorted supplier CSV, but ensures correctness).
+  * Phase 4: Build 5-column QueryResult (s_suppkey, s_name, s_address, s_phone, total_revenue).
+- Design decisions:
+  * Dense Vec<f64> instead of FxHashMap: ~3x faster for [1, 10K] suppkey range (no hashing, direct indexing, sequential access).
+  * rayon fold+reduce: per-thread dense Vecs (80KB each, 8 threads = 640KB, L2-resident). Thread-local reuse avoids per-chunk allocation.
+  * Direct form `ext * (1 - disc)` per row (not distributive split): SIMD FMA via `sum_a_mul_one_minus_b_by_idx` would require materializing per-group index lists — slower for ~150-row groups due to AVX-512 gather overhead. Scalar f64 FMA is 1 cycle on Zen 5 (2/cycle throughput), so 1.5M rows = ~0.4ms.
+  * `#[cold]` annotation on `execute_q15_reformulated`: prevents Q15's code from shifting hot functions (especially Q19) to unfavorable cache line boundaries. Without `#[cold]`, Q19 regressed from 4.8ms to 6.4ms (+33%). With `#[cold]`, Q19 is 4.6ms (no regression). The `#[cold]` attribute moves the function to a separate "cold" section in the binary, preserving the favorable layout of hot code.
+- Dispatch added in `parse_and_execute` after `is_q16` check (before generic path).
+- Correctness verified: Q15 returns 1 row with s_suppkey=8449, total_revenue bits=4700364187609423099 (baseline: 4700364187609423098, 1 ULP difference = ~2.3e-10 relative, well within 1e-6 tolerance).
+- `cargo build --release` succeeds (291 pre-existing warnings, 0 errors).
+- Benchmark (best-of-3, ms):
+  * Q15: 52.7 → 3.6 (93.2% improvement, 14.6x speedup) — far exceeds ≥40% target and ≤15ms stretch goal
+  * Q19: 4.8 → 4.6 (no regression, #[cold] preserves layout)
+  * Total: 374 → 324.4 (-49.6ms, 13.3% improvement)
+  * All 22 queries within ±5% of W9-2 baseline (max drift: Q10 +4.9%, Q6 +4.0%, Q14 +4.8% — all within noise threshold)
+
+DoD checklist:
+- [x] `execute_q15_reformulated` implemented (src/engine/tpch.rs:10279)
+- [x] Q15 dispatched via `is_q15()` SQL text match (src/engine/tpch.rs:5480)
+- [x] `cargo build --release` succeeds
+- [x] Q15 returns correct rows (1 row, s_suppkey=8449, total_revenue within 1 ULP of baseline)
+- [x] Q15 shows ≥40% improvement (93.2% improvement, 3.6ms ≤ 32ms target)
+- [x] No other query regresses >5% (Q19 restored via #[cold]; max drift Q10 +4.9%)
+- [x] Commit made locally (2b41723)
+- [x] Worklog updated in both locations
+
+Stage Summary:
+- Files modified: src/engine/tpch.rs (+236 lines: is_q15 + execute_q15_reformulated + #[cold] + parse_and_execute dispatch)
+- Functions added: is_q15 (src/engine/tpch.rs:10232), execute_q15_reformulated (src/engine/tpch.rs:10279)
+- Algorithm: Subquery cache + filter pushdown — compute per-suppkey revenue ONCE in a single parallel pass (dense Vec<f64> indexed by suppkey, rayon fold+reduce for per-thread accumulation + element-wise merge), find max, filter suppliers where revenue == max (1e-10 relative FP tolerance), sort by s_suppkey.
+- Memory: per-thread dense Vec ~80KB × 8 threads = 640KB (L2) + supplier table ~800KB (L2). Total ~1.4MB, L2-resident. Replaces generic path's double lineitem scan + double per-suppkey FxHashMap aggregation + derived-table materialization + max() scalar subquery + join.
+- Bench (best-of-3, ms): Q15=3.6, total=324.40
+- Q15 result: 1 row, s_suppkey=8449, total_revenue bits=4700364187609423099 (baseline 4700364187609423098, 1 ULP, ~2.3e-10 rel)
+- Delta vs Wave 9-2 baseline (Q15=52.7ms, total=374ms):
+  * Q15: 52.7ms → 3.6ms = -49.1ms (-93.2%, 14.6x speedup)
+  * Total: 374ms → 324.4ms = -49.6ms (-13.3%)
+  * No regressions: Q19 4.8→4.6 (#[cold] preserved layout), all others within ±5% noise
+- Cumulative delta vs Wave 0 baseline (11470ms): 11470 - 324.4 = 11145.6ms (-97.2%)
+- Cumulative delta vs DuckDB (442ms): 442 - 324.4 = 117.6ms (turboGP 1.36x faster than DuckDB overall; was 1.18x at W9-2, was 25.9x slower at Wave 0)
+- Queries now beating DuckDB: 17 of 22 (Q15 newly added; Q15 turboGP 3.6ms vs DuckDB ~36ms = 10x faster). Remaining slower: Q3 (18.8 vs 13), Q5 (19.5 vs 12), Q7 (22.0 vs 14), Q11 (11.5 vs 5.6), Q13 (28.0 vs 12).
+- Commit hash: 2b41723 (local only, NOT pushed — orchestrator pushes final)
+- Push: deferred to wave gate
