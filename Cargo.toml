@@ -49,6 +49,13 @@ rand = "0.9"
 time = { version = "0.3", features = ["parsing", "formatting", "macros"] }
 regex = "1.10"
 rust_decimal = "1.36"
+# Fast non-cryptographic hash (FxHashMap) — 1-instr multiply hash for
+# trusted u64 keys; replaces ahash (~5 instr) in hot HashMap sites.
+# Wave 1A: Q21 EXISTS maps, Q3 GROUP BY, col_map.
+fxhash = "0.2.1"
+# Portable SIMD wrappers (f64x8, u64x8) with safe fallback on non-AVX512.
+# Wave 3: SIMD aggregation kernels.
+wide = "0.7"
 
 [dev-dependencies]
 tempfile = "3.10"
