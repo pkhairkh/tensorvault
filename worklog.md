@@ -779,3 +779,26 @@ Stage Summary:
 - Per-tracked-query delta (best-of-4 vs W1-B best-of-1): Q7 -0.5%, Q9 -4.9%, Q3 -2.7%, Q5 -2.2%, Q18 +0.2%, Q19 -0.9%, Q21 +0.2%
 - Commit hash: 39a4c27 (local only, NOT pushed — wave gate will push)
 - Push: deferred to wave gate
+
+---
+Task ID: W1-D
+Agent: wave-1d-q7-lut (recovered by orchestrator after sub-agent timeout)
+Task: Replace Q7's per-row OR of nation-name equality with 25x25 nation-pair LUT (generalized to bitmap-composed OR-of-string-equalities)
+
+Work Log:
+- Initial sub-agent timed out at context deadline; orchestrator inspected working tree and found complete implementation in src/engine/tpch.rs (uncommitted)
+- Implementation: try_nation_pair_or_lut() called from eval_bool_mask_vec OR arm
+- Algorithm: flatten OR tree into disjuncts; each disjunct must be AND of Col==Str on same 2 string columns; compose bitmaps via filter_eq_u64 + Bitmap.and/or
+- Handles npairs<=8 via bitmap composition (AVX-512); npairs>8 via FxHashSet fallback
+- Cleaned up backup file tpch.rs.bak_w1d; compiled cleanly (0 errors, 289 pre-existing warnings)
+- Ran full TPC-H bench (best-of-3): all 22 queries pass, row counts match DuckDB reference
+
+Stage Summary:
+- File modified: src/engine/tpch.rs (+259 lines), examples/verify_q7.rs (new)
+- Function added: try_nation_pair_or_lut (src/engine/tpch.rs:2716)
+- Pattern recognized: OR of (Col==Str AND Col==Str) on same 2 string columns
+- Bench (best-of-3, ms): Q7=773.6, Q9=454.6, Q14=334.1, Q18=775.6, Q19=372.2, Q21=2950.4, total=9868.82
+- Delta vs W1-C baseline (11113ms best-of-3): -1244ms (-11.2%)
+- Cumulative Wave 1 delta vs Wave 0 baseline (11470ms best-of-3): -1601ms (-13.9%)
+- Commit hash: 4845bc5
+- Push: deferred to wave gate
