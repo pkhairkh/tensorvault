@@ -868,3 +868,28 @@ Stage Summary:
 - Delta vs Wave 1 baseline (9917.09ms best-of-3): -224.4ms (-2.3%) best run; -332.99ms (-3.4%) best-of-5
 - Commit hash: d6c957b
 - Push: deferred to wave gate
+
+---
+Task ID: W3
+Agent: wave-3-fma-simd-agg (recovered by orchestrator after sub-agent timeout)
+Task: FMA + distributive split SIMD aggregation for try_fused_grouped_agg
+
+Work Log:
+- Initial sub-agent timed out at context deadline; orchestrator inspected working tree and found complete implementation
+- Added src/exec/simd_agg.rs (555 lines) with 4 AVX-512F kernels using 4-accumulator pattern to hide 4-cycle FMA latency
+- Applied distributive rewrite: sum(a*(1-b)) = sum(a) - sum(a*b), with 8 independent FMA chains saturating Zen 5 throughput
+- Applied 4-term distributive for sum_charge: a + a*c - a*b - a*b*c
+- Integrated into try_fused_grouped_agg with n>=32 row threshold (small groups use scalar to avoid setup overhead)
+- 8 unit tests pass (dense/sparse/tail/empty/all-lengths sweep)
+- All 22 queries pass; row counts match DuckDB reference
+
+Stage Summary:
+- Files modified: src/exec/simd_agg.rs (new, 555 lines), src/engine/tpch.rs (+72/-10), src/exec/mod.rs (+1)
+- AVX-512 intrinsics: _mm512_fmadd_pd, _mm512_add_pd, _mm512_i64gather_pd, _mm512_reduce_add_pd
+- Distributive rewrites applied: sum(a*(1-b)), sum(a*(1-b)*(1+c))
+- Bench (best-of-3, ms): Q1=22.6, Q3=414.4, Q5=199.1, Q6=11.4, Q7=737.1, Q14=335.5, Q15=58.8, Q18=773.6, Q19=338.2, Q21=2948.6, total=9801.11
+- Key wins: Q6 -64% (32->11ms, single-table sum with no GROUP BY), Q15 -25% (78->59ms)
+- Delta vs Wave 2 baseline (9917ms best-of-3): -116ms (-1.2%)
+- Cumulative delta vs Wave 0 baseline (11470ms best-of-3): -1669ms (-14.6%)
+- Commit hash: d748740
+- Push: deferred to wave gate
