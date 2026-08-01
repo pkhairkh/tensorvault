@@ -1970,7 +1970,41 @@ impl<'a> TpchExec<'a> {
             let mut local_out: Vec<Vec<u64>> = (0..ncol).map(|_| Vec::with_capacity(CHUNK_SIZE * 2)).collect();
             let mut matched_rows: Vec<u32> = Vec::with_capacity(16);
 
+            // W1-B: Software prefetch distance (rows ahead). Literature default
+            // for hash-join probes is 8-32; tuned to K=8 on TPC-H (best total
+            // of 3 distances tested: K=8 total=11093, K=16 total=11224, K=32 total=11174).
+            const PREFETCH_DIST: usize = 8;
             for p in start..end {
+                // W1-B: Prefetch the hash-table directory slot AND bloom
+                // filter bits for the probe key PREFETCH_DIST rows ahead.
+                // This hides the ~100-cycle L3 miss on the next random
+                // directory access (Q21's #1 hot spot at 23.68% of runtime).
+                //
+                // The probe-side column load for next_key is sequential
+                // (hardware-prefetched), so the only added cost is the
+                // prefetch instruction itself (~1 cycle each).
+                #[cfg(target_arch = "x86_64")]
+                if p + PREFETCH_DIST < end {
+                    let next_p = p + PREFETCH_DIST;
+                    let next_key = if keys.len() == 1 {
+                        probe_side.columns[pk_cols[0]][next_p]
+                    } else {
+                        let mut nbuf = [0u8; 64];
+                        let mut noff = 0;
+                        for &kc in &pk_cols {
+                            let nv = probe_side.columns[kc][next_p];
+                            let nbytes = nv.to_le_bytes();
+                            if noff + 8 <= 64 {
+                                nbuf[noff..noff + 8].copy_from_slice(&nbytes);
+                                noff += 8;
+                            }
+                        }
+                        xxh3_64(&nbuf[..noff])
+                    };
+                    build_hash.prefetch_directory(next_key);
+                    bloom.prefetch(next_key);
+                }
+
                 let probe_key = if keys.len() == 1 {
                     probe_side.columns[pk_cols[0]][p]
                 } else {

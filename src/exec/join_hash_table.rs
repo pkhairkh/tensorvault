@@ -201,6 +201,39 @@ impl JoinHashTable {
         }
     }
 
+    /// Prefetch the directory slot for a given key into all cache levels
+    /// (L1/L2/L3). Call this K rows ahead of the actual `probe`/`probe_all`
+    /// call to hide the ~100-cycle L3 miss on the random directory access.
+    ///
+    /// This is the #1 hot spot in Q21 (23.68% of runtime per W-MATH-RESEARCH
+    /// perf profile) — the directory is a Vec<AtomicU64> sized at
+    /// 2x build_side rows, so for a 6M-row build side it is ~96MB and
+    /// entirely L3-resident. Each probe's `directory[slot]` load is a
+    /// random access that stalls the pipeline for ~100 cycles.
+    ///
+    /// Issuing `_mm_prefetch(addr, _MM_HINT_T0)` ~16 rows ahead gives the
+    /// memory subsystem time to pull the cache line into L1 before the
+    /// actual load executes.
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    pub fn prefetch_directory(&self, key: u64) {
+        use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        let hash = Self::hash(key);
+        let slot = (hash >> self.shift) as usize;
+        // SAFETY: slot is derived from hash >> shift, where shift = 64 - log2(dir_size).
+        // So slot < dir_size = directory.len(). The pointer add is in-bounds.
+        // _mm_prefetch is a hint instruction — it never faults on invalid addresses,
+        // but we keep the address valid for cleanliness.
+        unsafe {
+            _mm_prefetch(self.directory.as_ptr().add(slot) as *const i8, _MM_HINT_T0);
+        }
+    }
+
+    /// No-op prefetch fallback for non-x86_64 targets.
+    #[cfg(not(target_arch = "x86_64"))]
+    #[inline]
+    pub fn prefetch_directory(&self, _key: u64) {}
+
     /// Number of entries in the table.
     pub fn len(&self) -> usize {
         self.len - 1 // subtract sentinel

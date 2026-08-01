@@ -276,6 +276,32 @@ impl BloomFilter {
         true
     }
 
+    /// Prefetch the bloom filter bits for a given key into all cache levels.
+    /// Call this K rows ahead of the actual `might_contain` call to hide
+    /// the random access latency for large bloom filters (>L2 size).
+    ///
+    /// For a 6M-item build side, the bloom filter is ~7.5MB — too large
+    /// for L1 (32KB) or L2 (1MB), so each `might_contain` check incurs
+    /// 3 random L3 accesses. Prefetching the first hash position's word
+    /// (the first of 3) hides most of the latency.
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    pub fn prefetch(&self, key: u64) {
+        use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        let (h1, _h2) = Self::hash_pair(key);
+        let word_idx = ((h1 as usize) >> 6) & self.word_mask;
+        // SAFETY: word_idx = (h1 >> 6) & word_mask, where word_mask = bits.len()-1.
+        // So word_idx < bits.len(). Pointer add is in-bounds.
+        unsafe {
+            _mm_prefetch(self.bits.as_ptr().add(word_idx) as *const i8, _MM_HINT_T0);
+        }
+    }
+
+    /// No-op prefetch fallback for non-x86_64 targets.
+    #[cfg(not(target_arch = "x86_64"))]
+    #[inline]
+    pub fn prefetch(&self, _key: u64) {}
+
     /// Batch check 8 keys at once using AVX-512. Returns a `u8` mask
     /// where bit `i` = 1 if `keys[i]` might be present (caller must
     /// probe the hash table to confirm), and bit `i` = 0 if `keys[i]`
