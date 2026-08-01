@@ -2526,3 +2526,80 @@ Stage Summary:
 - Queries now beating DuckDB: 17 of 22 (Q13 newly added; Q13 turboGP 8.05ms vs DuckDB 12ms = 1.49× faster). Remaining slower: Q3 (18.8 vs 13), Q5 (17.0 vs 12), Q7 (18.1 vs 14), Q12 (17.4 vs 16), Q20 (16.7 vs 11).
 - Commit hash: 8110bdb
 - Push: deferred to wave gate
+
+---
+Task ID: W10-2
+Agent: wave-10-2-q20-deep-rewrite
+Task: Q20 deep rewrite — eliminate FxHashMap accumulation in lineitem hot loop via pre-built (partkey,suppkey)→idx map from partsupp + flat Vec<f64> + fold/reduce
+
+Work Log:
+- Read /home/z/my-project/worklog.md (W0-W10-1). W10-1 baseline (best-of-3) = 291.25 ms (verified 291.92 ms on re-measurement), all 22 queries pass. HEAD at 84b5535 (post-W10-1 worklog-only commit). Q20 = 16.5 ms, 1.50× slower than DuckDB (11 ms), 2.1× faster than ClickHouse (35 ms). Q20 was the last query slower than DuckDB among the remaining 5 (Q3, Q5, Q7, Q12, Q20).
+- Bottleneck analysis (from task brief, confirmed by code inspection of execute_q20_reformulated at src/engine/tpch.rs:9166):
+  * Phase 2 (lineitem scan, 6M rows): per-chunk FxHashMap<(u64,u64), f64> with entry().or_insert() in the hot loop. ~92 chunks, each creating a fresh FxHashMap that grows to ~100 entries. The hashmap insert (hash + probe + possible resize) + per-chunk map merge was the dominant non-scan overhead (~2-3 ms).
+  * Phase 3 (partsupp scan, 800K rows): serial scan with forest_flag check + FxHashMap lookup for threshold. ~4 ms single-threaded.
+  * The lineitem scan itself (reading l_shipdate for 6M rows = 48 MB DRAM) is bandwidth-bound at ~2-4 ms.
+- Located execute_q20_reformulated at src/engine/tpch.rs:9166. Read the full function (~220 lines). Also read the W8-5 doc comment (lines 9111-9165) describing the 6-phase algorithm.
+- Verified W10-1 Q20 output via examples/verify_q20.rs: 186 rows, 2 cols. Top 5 + last row (s_name_hash, s_address_hash) bit-identical to W8-5 baseline:
+    row[0]:   s_name_h=0xffe8a484ef263da7 s_addr_h=0x672b70f9542a3c4f
+    row[1]:   s_name_h=0xfe38dfca3828c656 s_addr_h=0xef291adaa981bfdb
+    row[2]:   s_name_h=0xfd08f2402e73f1a3 s_addr_h=0x6782d5fb8f4fa138
+    row[3]:   s_name_h=0xfc89db2ff643629e s_addr_h=0xf97ec205968ed6b5
+    row[4]:   s_name_h=0xf948914738264c5a s_addr_h=0xace1e31a82ccce55
+    row[185]: s_name_h=0x7fcd4a9fb4bffb80 s_addr_h=0x6a4c3b2112b802b6
+- Implemented W10-2 deep optimization (3 structural changes to execute_q20_reformulated):
+  1. **Pre-build (partkey,suppkey)→idx map from partsupp (Phase 2 NEW)**: Replaced the W8-5 approach of building sum_qty from lineitem rows (which required FxHashMap insert in the hot loop). Instead, scan partsupp (800K rows) in parallel first, collecting the ~8500 forest (partkey, suppkey, availqty) triples. Build a packed-key FxHashMap<u64, u32> mapping (partkey<<32 | suppkey) → flat-array index. This pre-populates the index so the lineitem hot loop only does read-only map.get() (no insert). The partsupp scan is also parallelized (W8-5 was serial, ~4 ms → ~0.5 ms).
+  2. **Flat Vec<f64> + Vec<u8> with fold+reduce (Phase 3 NEW)**: Replaced per-chunk FxHashMap<(u64,u64), f64> with per-thread (Vec<f64>, Vec<u8>) accumulators of size num_pairs (~8500). The lineitem hot loop does: date filter → forest flag → map.get() (read-only) → unsafe get_unchecked_mut flat array add + set has_rows=1. No hashmap mutation in the hot loop. The fold+reduce pattern (same as W10-1 Q13) creates ~8 accumulators (one per thread), not ~92 (one per chunk). Reduce: element-wise sum + OR. The Vec<u8> has_rows tracks SQL NULL semantics (no 1994 lineitem rows → NULL threshold → does not qualify), replacing W8-5's "absent from map = NULL" approach.
+  3. **Direct threshold check on partsupp_pairs (Phase 4 NEW)**: Replaced the W8-5 Phase 3 (800K-row partsupp rescan with FxHashMap lookup) with a direct iteration over the ~8500 collected partsupp_pairs. No 800K-row rescan needed. Also optimized max_suppkey computation to use supp_suppkey + ps_suppkey only (not li_suppkey, saving ~2.4 ms of DRAM reads over 6M rows).
+  - Added #[cold] annotation (consistent with Q13/Q3/Q7/Q11/Q15 reformulated functions; was missing in W8-5).
+  - Updated doc comment to describe the 7-phase algorithm and W10-2 optimizations.
+- Compiled cleanly (0 errors, 291 pre-existing warnings — unchanged from W10-1).
+- Verified correctness: Q20 returns 186 rows, 2 cols. Top 5 rows + row 185 are BIT-IDENTICAL to W8-5/W10-1 baseline (all s_name_hash and s_address_hash values match exactly). Forest part count = 2127 (matches baseline). Verified via examples/verify_q20.rs after rebuild.
+- Bench results (3 full runs, each = best-of-3 internal):
+  * Run 1: total=286.43, Q20=10.7
+  * Run 2: total=285.80, Q20=10.7  ← best total
+  * Run 3: total=286.07, Q20=10.6  ← best Q20
+- Best-of-3 cross-run per-query (min across runs 1-3, ms):
+    Q1=22.3, Q2=3.2, Q3=18.7, Q4=11.8, Q5=16.9, Q6=9.8, Q7=18.2, Q8=6.3,
+    Q9=35.4, Q10=23.8, Q11=2.0, Q12=17.6, Q13=8.2, Q14=8.4, Q15=3.4,
+    Q16=5.6, Q17=4.1, Q18=20.2, Q19=5.0, Q20=10.6, Q21=31.7, Q22=0.4.
+    Total (best single run) = 285.80ms.
+- W10-1 baseline re-measurement (checked out 8110bdb, built, ran benchmark):
+  * Q10=23.9ms, Q20=16.5ms, total=291.92ms
+  * This confirmed Q10 was ALREADY at ~24ms in W10-1 (not 20ms from W8-5) — the W9-5 #[cold] additions and W10-1 Q13 optimization caused LTO drift on Q10. W10-2 does NOT regress Q10 (23.8ms vs 23.9ms = -0.4%, flat).
+- Comparison vs Wave 10-1 baseline (Q20=16.5ms, total=291.92ms):
+  * Q20: 16.5ms → 10.6ms = -5.9ms (-35.8%, 1.56× speedup) — meets ≥35% target (≤10.7ms) and ≥25% target (≤12.4ms). Q20 is now FASTER than DuckDB (10.6 vs 11ms = 1.04× faster); was 1.50× slower.
+  * Total: 291.92ms → 285.80ms = -6.12ms (-2.1%)
+  * No query regresses >5%: Q10 flat at 23.8ms (same as W10-1's 23.9ms — confirmed by re-measuring W10-1 baseline). All other queries within noise range of W10-1. Net improvement from Q20 (-5.9ms) exceeds all drift combined.
+  * Q20 win (-5.9ms) accounts for 96% of the total improvement (-6.12ms).
+- Root cause of Q20 speedup: the W8-5 per-chunk FxHashMap<(u64,u64), f64> with entry().or_insert() required a hash computation + table probe + possible resize for every matching lineitem row (~42K rows), plus per-chunk map creation (92 FxHashMaps) and merge (iterate all 92 maps). The W10-2 approach pre-builds the index map from partsupp (800K rows, parallel, ~0.5ms), so the lineitem hot loop does only read-only map.get() + unchecked flat array add (~1ns per matching row vs ~20ns for hashmap insert). The fold+reduce pattern reduces accumulator count from 92 to 8, and the flat Vec<f64> (68 KB per thread) is L2-resident with sequential access pattern (vs FxHashMap's random access). The partsupp threshold check also benefits: 8500 direct array accesses instead of 800K-row rescan.
+- Memory: forest_partkey_flag ~200 KB (L2) + pk_sk_to_idx ~170 KB (L2) + per-thread (Vec<f64> + Vec<u8>) ~76 KB × 8 = ~608 KB (L2) + qualifying_suppkey_flag ~100 KB (L2). Total ~1.1 MB, L2/L3-resident. Slightly larger than W8-5's ~640 KB due to per-thread Vec allocation, but all L2/L3-resident.
+- DuckDB comparison: turboGP Q20 = 10.6ms vs DuckDB Q20 ≈ 11ms → turboGP is now 1.04× FASTER than DuckDB on Q20 (was 1.50× slower). The gap went from +5.5ms to -0.4ms.
+- DoD assessment:
+  * [x] execute_q20_reformulated optimized ✓
+  * [x] cargo build --release succeeds (0 errors, 291 warnings — unchanged) ✓
+  * [x] Q20 returns 186 rows with first 5 s_name hashes matching baseline BIT-IDENTICALLY ✓
+  * [x] Q20 shows ≥25% improvement (16.5ms → 10.6ms = -35.8%, meets ≥35% target ≤10.7ms) ✓
+  * [x] No other query regresses >5%: Q10 flat at 23.8ms (confirmed W10-1 baseline = 23.9ms via re-measurement). All other queries within noise range. ✓
+  * [x] Commit made locally ✓
+  * [x] Worklog updated in both locations ✓
+- Decision: COMMIT. The Q20 deep rewrite achieved -35.8% improvement (16.5ms → 10.6ms), meeting the ≥35% target. Q20 is now FASTER than DuckDB (10.6 vs 11ms). The optimization eliminates the W8-5 FxHashMap insert bottleneck by pre-building a (partkey,suppkey)→idx map from partsupp and using flat Vec<f64> with fold+reduce in the lineitem hot loop. No query regresses >5% (Q10 confirmed flat via W10-1 re-measurement).
+
+Stage Summary:
+- Files modified: src/engine/tpch.rs (+140/-100 lines in execute_q20_reformulated: new Phase 2-4 + #[cold] + doc comment update)
+- Optimization approach: Pre-build packed-key FxHashMap<u64,u32>→idx from parallel partsupp scan + flat Vec<f64>/Vec<u8> with fold+reduce in lineitem hot loop (read-only map.get() + unchecked array add, no hashmap insert) + direct threshold check on ~8500 partsupp_pairs (no 800K-row rescan) + #[cold] annotation
+- Bench (best-of-3, ms): Q20=10.6, total=285.80 (best single run)
+- Q20 result (186 rows, top 5 bit-identical to W8-5/W10-1 baseline):
+    row[0]: s_name_h=0xffe8a484ef263da7 s_addr_h=0x672b70f9542a3c4f
+    row[1]: s_name_h=0xfe38dfca3828c656 s_addr_h=0xef291adaa981bfdb
+    row[2]: s_name_h=0xfd08f2402e73f1a3 s_addr_h=0x6782d5fb8f4fa138
+    row[3]: s_name_h=0xfc89db2ff643629e s_addr_h=0xf97ec205968ed6b5
+    row[4]: s_name_h=0xf948914738264c5a s_addr_h=0xace1e31a82ccce55
+- Delta vs Wave 10-1 baseline (Q20=16.5ms, total=291.92ms):
+  * Q20: 16.5ms → 10.6ms = -5.9ms (-35.8%, 1.56× speedup)
+  * Total: 291.92ms → 285.80ms = -6.12ms (-2.1%)
+  * Q20 now FASTER than DuckDB (10.6 vs 11ms = 1.04× faster); was 1.50× slower
+  * No query regresses >5% (Q10 confirmed flat at 23.8ms vs W10-1's 23.9ms)
+- Queries now beating DuckDB: 18 of 22 (Q20 newly added; Q20 turboGP 10.6ms vs DuckDB 11ms = 1.04× faster). Remaining slower: Q3 (18.7 vs 13), Q5 (16.9 vs 12), Q7 (18.2 vs 14), Q12 (17.6 vs 16).
+- Cumulative delta vs DuckDB (442ms): 442 - 285.80 = 156.20ms (turboGP 1.55× faster than DuckDB overall; was 1.52× at W10-1, was 25.9× slower at Wave 0)
+- Commit hash: ec33ab0
+- Push: deferred to wave gate
