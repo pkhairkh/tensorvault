@@ -7712,19 +7712,20 @@ fn execute_q9_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
     }
     nation_name_by_key = nation_name_str;
 
-    // order_date[orderkey] -> o_orderdate days (dense, ~12 MB, L3-resident).
+    // W11-6: Pre-compute order_year[orderkey] = year (i32) to avoid
+    // per-row days_since_epoch_to_year call in the hot loop.
     let max_orderkey: u64 = ord_orderkey
         .iter()
         .copied()
-        .chain(li_orderkey.iter().copied())
         .max()
         .unwrap_or(0);
     let ord_arr_size = (max_orderkey as usize).saturating_add(1);
-    let mut order_date: Vec<u64> = vec![0; ord_arr_size];
+    let mut order_year: Vec<i32> = vec![0; ord_arr_size];
     for i in 0..n_ord {
         let ok = ord_orderkey[i] as usize;
         if ok < ord_arr_size {
-            order_date[ok] = ord_orderdate[i];
+            let days = ord_orderdate[i] as i64;
+            order_year[ok] = crate::types::days_since_epoch_to_year(days);
         }
     }
 
@@ -7772,15 +7773,7 @@ fn execute_q9_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
                 if ok >= ord_arr_size {
                     continue;
                 }
-                let days = unsafe { *order_date.get_unchecked(ok) } as i64;
-                let year = if days >= 24855 { 1998 }
-                    else if days >= 24490 { 1997 }
-                    else if days >= 24125 { 1996 }
-                    else if days >= 23760 { 1995 }
-                    else if days >= 23395 { 1994 }
-                    else if days >= 23030 { 1993 }
-                    else if days >= 22665 { 1992 }
-                    else { crate::types::days_since_epoch_to_year(days) };
+                let year = unsafe { *order_year.get_unchecked(ok) };
                 let year_idx = (year - YEAR_BASE) as usize;
                 if year_idx >= N_YEARS {
                     continue;
