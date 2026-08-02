@@ -5628,6 +5628,26 @@ fn execute_q21_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
     // W11-4: Replace Vec<AtomicU32> (12 MB) with Vec<AtomicU8> (3 MB).
     // Also: collect (ok, suppkey) candidates for late rows to eliminate
     // the Phase 2 re-scan.
+    // ---- Build orders_f flag array (dense, indexed by orderkey) ----
+    // Replaces FxHashMap<u64, ()> with Vec<u8> for O(1) lookup.
+    // Build: parallel filter+collect F-orderkeys, then sequential scatter.
+    let f_hash = xxh3_64(b"F");
+    let max_ord_ok: u64 = ord_orderkey.iter().copied().max().unwrap_or(0);
+    let ord_arr_size = (max_ord_ok as usize).saturating_add(1);
+    let mut orders_f_flag: Vec<u8> = vec![0u8; ord_arr_size];
+    let f_orderkeys: Vec<u64> = (0..n_ord)
+        .into_par_iter()
+        .filter(|&r| ord_orderstatus[r] == f_hash)
+        .map(|r| ord_orderkey[r])
+        .collect();
+    for &ok in &f_orderkeys {
+        let ok_idx = ok as usize;
+        if ok_idx < ord_arr_size {
+            orders_f_flag[ok_idx] = 1;
+        }
+    }
+
+
     let max_ok: u64 = li_orderkey.iter().copied().max().unwrap_or(0);
     let arr_size = (max_ok as usize).saturating_add(1);
 
@@ -5653,9 +5673,8 @@ fn execute_q21_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
             for i in start..end {
                 let ok = li_orderkey[i];
                 let ok_idx = ok as usize;
-                if ok_idx < arr_size {
-                    // Relaxed is safe: no cross-thread read until after
-                    // the par_iter completes (rayon scope joins all workers).
+                // W11-6: skip non-F-order rows (saves ~67% atomic updates)
+                if ok_idx < arr_size && ok_idx < ord_arr_size && orders_f_flag[ok_idx] != 0 {
                     cnt_atomic[ok_idx].fetch_add(1, Ordering::Relaxed);
                     if li_receiptdate[i] > li_commitdate[i] {
                         late_atomic[ok_idx].fetch_add(1, Ordering::Relaxed);
@@ -5673,25 +5692,6 @@ fn execute_q21_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
         cnt_atomic.into_iter().map(|a| a.into_inner()).collect();
     let late_cnt: Vec<u8> =
         late_atomic.into_iter().map(|a| a.into_inner()).collect();
-
-    // ---- Build orders_f flag array (dense, indexed by orderkey) ----
-    // Replaces FxHashMap<u64, ()> with Vec<u8> for O(1) lookup.
-    // Build: parallel filter+collect F-orderkeys, then sequential scatter.
-    let f_hash = xxh3_64(b"F");
-    let max_ord_ok: u64 = ord_orderkey.iter().copied().max().unwrap_or(0);
-    let ord_arr_size = (max_ord_ok as usize).saturating_add(1).max(arr_size);
-    let mut orders_f_flag: Vec<u8> = vec![0u8; ord_arr_size];
-    let f_orderkeys: Vec<u64> = (0..n_ord)
-        .into_par_iter()
-        .filter(|&r| ord_orderstatus[r] == f_hash)
-        .map(|r| ord_orderkey[r])
-        .collect();
-    for &ok in &f_orderkeys {
-        let ok_idx = ok as usize;
-        if ok_idx < ord_arr_size {
-            orders_f_flag[ok_idx] = 1;
-        }
-    }
 
     // ---- Build supplier_name array (dense, indexed by suppkey) ----
     // Replaces FxHashMap<u64, u64> with Vec<u64> for O(1) lookup.
