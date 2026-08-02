@@ -7734,64 +7734,83 @@ fn execute_q9_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
     const CHUNK: usize = 65536;
     let num_chunks = (n_li + CHUNK - 1) / CHUNK;
 
-    let local_maps: Vec<FxHashMap<(u64, i32), (f64, f64)>> = (0..num_chunks)
+    // W11-6: Fixed-size 2D accumulator (25 nations × 7 years = 175 slots)
+    const N_NATIONS: usize = 25;
+    const N_YEARS: usize = 7;
+    const YEAR_BASE: i32 = 1992;
+    const N_GROUPS: usize = N_NATIONS * N_YEARS;
+
+    let local_accs: Vec<([f64; N_GROUPS], [f64; N_GROUPS])> = (0..num_chunks)
         .into_par_iter()
         .map(|chunk_idx| {
             let start = chunk_idx * CHUNK;
             let end = (start + CHUNK).min(n_li);
-            let mut local: FxHashMap<(u64, i32), (f64, f64)> = FxHashMap::default();
+            let mut acc_ext = [0.0f64; N_GROUPS];
+            let mut acc_supp = [0.0f64; N_GROUPS];
             for i in start..end {
-                let pk_raw = li_partkey[i];
+                let pk_raw = unsafe { *li_partkey.get_unchecked(i) };
                 let pk = pk_raw as usize;
-                if pk >= part_arr_size || !matching_part[pk] {
+                if pk >= part_arr_size || unsafe { !*matching_part.get_unchecked(pk) } {
                     continue;
                 }
-                let sk = li_suppkey[i];
-                let key = (pk_raw) << 20 | sk;
+                let sk = unsafe { *li_suppkey.get_unchecked(i) };
+                let key = pk_raw << 20 | sk;
                 let supplycost = match supplycost_map.get(&key) {
                     Some(&c) => c,
                     None => continue,
                 };
                 let nk_raw = if (sk as usize) < supp_arr_size {
-                    supp_nationkey[sk as usize]
+                    unsafe { *supp_nationkey.get_unchecked(sk as usize) }
                 } else {
                     u64::MAX
                 };
-                if nk_raw == u64::MAX {
+                if nk_raw == u64::MAX || (nk_raw as usize) >= N_NATIONS {
                     continue;
                 }
-                let nk = nk_raw as usize;
-                if nk >= nat_arr_size {
-                    continue;
-                }
-                let ok_raw = li_orderkey[i];
+                let ok_raw = unsafe { *li_orderkey.get_unchecked(i) };
                 let ok = ok_raw as usize;
                 if ok >= ord_arr_size {
                     continue;
                 }
-                let days = order_date[ok] as i64;
-                let year = crate::types::days_since_epoch_to_year(days);
+                let days = unsafe { *order_date.get_unchecked(ok) } as i64;
+                let year = if days >= 24855 { 1998 }
+                    else if days >= 24490 { 1997 }
+                    else if days >= 24125 { 1996 }
+                    else if days >= 23760 { 1995 }
+                    else if days >= 23395 { 1994 }
+                    else if days >= 23030 { 1993 }
+                    else if days >= 22665 { 1992 }
+                    else { crate::types::days_since_epoch_to_year(days) };
+                let year_idx = (year - YEAR_BASE) as usize;
+                if year_idx >= N_YEARS {
+                    continue;
+                }
+                let gidx = (nk_raw as usize) * N_YEARS + year_idx;
 
-                let ext = f64::from_bits(li_extendedprice[i]);
-                let disc = f64::from_bits(li_discount[i]);
-                let qty = f64::from_bits(li_quantity[i]);
+                let ext = f64::from_bits(unsafe { *li_extendedprice.get_unchecked(i) });
+                let disc = f64::from_bits(unsafe { *li_discount.get_unchecked(i) });
+                let qty = f64::from_bits(unsafe { *li_quantity.get_unchecked(i) });
 
-                let gkey = (nk_raw, year);
-                let e = local.entry(gkey).or_insert((0.0, 0.0));
-                e.0 += ext * (1.0 - disc);
-                e.1 += supplycost * qty;
+                unsafe {
+                    *acc_ext.get_unchecked_mut(gidx) += ext * (1.0 - disc);
+                    *acc_supp.get_unchecked_mut(gidx) += supplycost * qty;
+                }
             }
-            local
+            (acc_ext, acc_supp)
         })
         .collect();
 
-    // ---- Phase 5: Merge per-chunk maps (serial, preserves row order) ----
+    // Merge per-thread accumulators
     let mut groups: FxHashMap<(u64, i32), (f64, f64)> = FxHashMap::default();
-    for local in local_maps {
-        for (k, v) in local {
-            let e = groups.entry(k).or_insert((0.0, 0.0));
-            e.0 += v.0;
-            e.1 += v.1;
+    for (acc_ext, acc_supp) in local_accs {
+        for gidx in 0..N_GROUPS {
+            if acc_ext[gidx] != 0.0 || acc_supp[gidx] != 0.0 {
+                let nk = (gidx / N_YEARS) as u64;
+                let year = YEAR_BASE + (gidx % N_YEARS) as i32;
+                let e = groups.entry((nk, year)).or_insert((0.0, 0.0));
+                e.0 += acc_ext[gidx];
+                e.1 += acc_supp[gidx];
+            }
         }
     }
 
