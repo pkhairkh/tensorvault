@@ -269,14 +269,50 @@ fn execute_shape(shape: QueryShape, query: &SelectQuery, table: &Table) -> Resul
         }
         QueryShape::SelectMulti => {
             let mask = build_filter_mask(query, table)?;
-            let limit = query.limit.unwrap_or(mask.iter().filter(|&&b| b).count());
-            let indices: Vec<usize> = (0..table.row_count).filter(|&i| mask[i]).take(limit).collect();
+            // Wave 49 fix: previously this path computed `indices` and then
+            // immediately applied `take(limit)`, completely ignoring
+            // `query.order_by`. We now sort `indices` by the ORDER BY column
+            // (string-aware if the sidecar exists) BEFORE applying LIMIT, so
+            // `SELECT a, b FROM t ORDER BY a LIMIT 10` returns the 10 smallest
+            // `a` values rather than the first 10 rows in scan order.
+            let mut indices: Vec<usize> = (0..table.row_count).filter(|&i| mask[i]).collect();
+            if !query.order_by.is_empty() {
+                let (order_col, ascending) = &query.order_by[0];
+                let order_col_idx = resolve_col_name(order_col, table).unwrap_or(0);
+                let has_string_sidecar = order_col_idx < table.string_columns.len()
+                    && table.string_columns[order_col_idx].is_some();
+                if has_string_sidecar {
+                    let sc = table.string_columns[order_col_idx].as_ref().unwrap();
+                    indices.sort_by(|&a, &b| {
+                        let sa = sc.get(a);
+                        let sb = sc.get(b);
+                        if *ascending { sa.cmp(sb) } else { sb.cmp(sa) }
+                    });
+                } else {
+                    let col = &table.columns[order_col_idx];
+                    indices.sort_by(|&a, &b| {
+                        let va = col.get(a).copied().unwrap_or(0);
+                        let vb = col.get(b).copied().unwrap_or(0);
+                        if *ascending { va.cmp(&vb) } else { vb.cmp(&va) }
+                    });
+                }
+            }
+            let limit = query.limit.unwrap_or(indices.len());
+            let indices: Vec<usize> = indices.into_iter().take(limit).collect();
             let mut cols = Vec::new();
             for item in &query.select {
                 if let SelectItem::Column(name) = item {
                     let col_idx = resolve_col_name(name, table)?;
                     let values: Vec<u64> = indices.iter().map(|&i| table.columns[col_idx][i]).collect();
-                    cols.push(ResultColumn { name: name.clone(), values, string_values: None, type_oid: 0 });
+                    // Carry the string sidecar through when present so the
+                    // pgwire layer can return original strings to clients.
+                    let string_values = if col_idx < table.string_columns.len() {
+                        if let Some(ref sc) = table.string_columns[col_idx] {
+                            let strings: Vec<String> = indices.iter().map(|&i| sc.get(i).to_string()).collect();
+                            Some(strings)
+                        } else { None }
+                    } else { None };
+                    cols.push(ResultColumn { name: name.clone(), values, string_values, type_oid: 0 });
                 } else if let SelectItem::Star = item {
                     for (col_idx, name) in table.column_names.iter().enumerate() {
                         let values: Vec<u64> = indices.iter().map(|&row_idx| table.columns[col_idx][row_idx]).collect();
@@ -592,97 +628,197 @@ fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
     }
 
     // For single-key GROUP BY: use flat hash table (fast path)
+    //
+    // Wave 49 fix: the previous implementation called
+    // `hash_group_by_flat` inside a `for item in &query.select` loop and
+    // then `return Ok(result)` at the bottom of the loop body — so only
+    // the FIRST aggregate was emitted and subsequent aggregates were
+    // silently dropped. We now iterate the SELECT list once to find the
+    // first aggregate (used to drive `hash_group_by_flat` for the per-group
+    // key→value map), then walk the SELECT list again to emit one column
+    // per item (group-by column, literal, or aggregate) using that map.
     if group_cols.len() == 1 {
         let group_col = group_cols[0];
         let keys: Vec<u64> = indices.iter().map(|&i| table.columns[group_col][i]).collect();
 
-        // Determine aggregate function and value column
-        for item in &query.select {
-            if let SelectItem::Aggregate { func, arg, alias } = item {
-                let name = alias.as_deref().unwrap_or(func.as_str());
-                let func_upper = func.to_uppercase();
-                let (agg_func, values) = match func_upper.as_str() {
-                    "COUNT" => {
-                        if arg == "*" {
-                            (AggFunc::Count, None)
-                        } else {
-                            let col_idx = resolve_col_name(arg, table)?;
-                            let vals: Vec<u64> = indices.iter().map(|&i| table.columns[col_idx][i]).collect();
-                            (AggFunc::Count, Some(vals))
-                        }
-                    }
-                    "SUM" => {
-                        let col_idx = resolve_col_name(arg, table)?;
-                        let vals: Vec<u64> = indices.iter().map(|&i| table.columns[col_idx][i]).collect();
-                        (AggFunc::Sum, Some(vals))
-                    }
-                    "AVG" => {
-                        let col_idx = resolve_col_name(arg, table)?;
-                        let vals: Vec<u64> = indices.iter().map(|&i| table.columns[col_idx][i]).collect();
-                        (AggFunc::Avg, Some(vals))
-                    }
-                    "MIN" => {
-                        let col_idx = resolve_col_name(arg, table)?;
-                        let vals: Vec<u64> = indices.iter().map(|&i| table.columns[col_idx][i]).collect();
-                        (AggFunc::Min, Some(vals))
-                    }
-                    "MAX" => {
-                        let col_idx = resolve_col_name(arg, table)?;
-                        let vals: Vec<u64> = indices.iter().map(|&i| table.columns[col_idx][i]).collect();
-                        (AggFunc::Max, Some(vals))
-                    }
-                    "COUNT_DISTINCT" => {
-                        let col_idx = resolve_col_name(arg, table)?;
-                        let vals: Vec<u64> = indices.iter().map(|&i| table.columns[col_idx][i]).collect();
-                        (AggFunc::CountDistinct, Some(vals))
-                    }
-                    _ => return Err(Error::Other(format!("unsupported agg: {func}"))),
-                };
+        // Find the first aggregate in the SELECT list to drive the flat hash
+        // table. Other aggregates will be computed separately below using the
+        // same per-group row-index buckets.
+        let first_agg = query.select.iter().find_map(|s| match s {
+            SelectItem::Aggregate { func, arg, alias } => Some((func.clone(), arg.clone(), alias.clone())),
+            _ => None,
+        });
 
-                let results = hash_group_by_flat(&keys, values.as_deref(), agg_func);
-
-                // Build result columns
-                let mut result_cols: Vec<ResultColumn> = Vec::new();
-                // GROUP BY column
-                let gb_name = &query.group_by[0];
-                let gb_values: Vec<u64> = results.iter().map(|(k, _)| *k).collect();
-                result_cols.push(ResultColumn { name: gb_name.clone(), values: gb_values , string_values: None, type_oid: 0 });
-                // Aggregate column
-                let agg_values: Vec<u64> = results.iter().map(|(_, v)| *v).collect();
-                result_cols.push(ResultColumn { name: name.to_string(), values: agg_values , string_values: None, type_oid: 0 });
-
-                let row_count = results.len();
-                let mut result = QueryResult { columns: result_cols, row_count, elapsed_us: 0 };
-
-                // Apply ORDER BY
-                if !query.order_by.is_empty() {
-                    let (col_name, ascending) = &query.order_by[0];
-                    let col_idx = result.columns.iter().position(|c| c.name == *col_name)
-                        .ok_or_else(|| Error::NotFound(format!("ORDER BY column '{}'", col_name)))?;
-                    let mut idx: Vec<usize> = (0..result.row_count).collect();
-                    idx.sort_by(|&a, &b| {
-                        let va = result.columns[col_idx].values[a];
-                        let vb = result.columns[col_idx].values[b];
-                        if *ascending { va.cmp(&vb) } else { vb.cmp(&va) }
-                    });
-                    let new_cols: Vec<ResultColumn> = result.columns.iter().map(|c| {
-                        let values: Vec<u64> = idx.iter().map(|&i| c.values[i]).collect();
-                        ResultColumn { name: c.name.clone(), values, string_values: None, type_oid: 0 }
-                    }).collect();
-                    result = QueryResult { columns: new_cols, row_count: result.row_count, elapsed_us: result.elapsed_us };
-                }
-
-                // Apply LIMIT
-                if let Some(limit) = query.limit {
-                    if result.row_count > limit {
-                        for col in &mut result.columns { col.values.truncate(limit); }
-                        result.row_count = limit;
-                    }
-                }
-
-                return Ok(result);
+        // Build per-group row-index buckets once, so every aggregate can
+        // reuse them without re-scanning the input.
+        let mut group_buckets: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
+        for (k_idx, &key) in keys.iter().enumerate() {
+            let row_idx = indices[k_idx];
+            group_buckets.entry(key).or_default().push(row_idx);
+        }
+        // Stable ordering: preserve first-seen order of group keys.
+        let mut group_keys_in_order: Vec<u64> = Vec::with_capacity(group_buckets.len());
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for &k in &keys {
+            if seen.insert(k) {
+                group_keys_in_order.push(k);
             }
         }
+
+        // Build the result columns by walking the SELECT list in order.
+        let mut result_cols: Vec<ResultColumn> = Vec::with_capacity(query.select.len());
+        for item in &query.select {
+            match item {
+                SelectItem::Column(name) => {
+                    // The GROUP BY column — emit the per-group key.
+                    // (If a non-group-by column appears here, we still emit
+                    // the per-group key for the first row in each bucket,
+                    // which matches the existing dispatcher behaviour for
+                    // the multi-key path.)
+                    if query.group_by.iter().any(|g| g == name) {
+                        result_cols.push(ResultColumn {
+                            name: name.clone(),
+                            values: group_keys_in_order.clone(),
+                            string_values: None,
+                            type_oid: 0,
+                        });
+                    } else {
+                        // Non-grouped column: emit the value from the first
+                        // row in each bucket (best-effort, matches multi-key
+                        // path behaviour).
+                        let col_idx = resolve_col_name(name, table).unwrap_or(group_col);
+                        let values: Vec<u64> = group_keys_in_order.iter().map(|k| {
+                            group_buckets.get(k)
+                                .and_then(|idxs| idxs.first())
+                                .map(|&i| table.columns[col_idx][i])
+                                .unwrap_or(0)
+                        }).collect();
+                        result_cols.push(ResultColumn {
+                            name: name.clone(),
+                            values,
+                            string_values: None,
+                            type_oid: 0,
+                        });
+                    }
+                }
+                SelectItem::Literal(v) => {
+                    result_cols.push(ResultColumn {
+                        name: v.to_string(),
+                        values: vec![*v; group_keys_in_order.len()],
+                        string_values: None,
+                        type_oid: 0,
+                    });
+                }
+                SelectItem::Star => {
+                    // `SELECT *` with GROUP BY is not meaningful; skip.
+                }
+                SelectItem::Aggregate { func, arg, alias } => {
+                    let name = alias.as_deref().unwrap_or(func.as_str());
+                    let func_upper = func.to_uppercase();
+                    let values: Vec<u64> = group_keys_in_order.iter().map(|k| {
+                        let idxs: &Vec<usize> = match group_buckets.get(k) {
+                            Some(v) => v,
+                            None => return 0,
+                        };
+                        match func_upper.as_str() {
+                            "COUNT" => {
+                                if arg == "*" {
+                                    idxs.len() as u64
+                                } else {
+                                    let col_idx = resolve_col_name(arg, table).unwrap_or(0);
+                                    // COUNT(col) excludes NULLs (Wave 33).
+                                    if col_idx < table.null_bitmaps.len() {
+                                        if let Some(ref bm) = table.null_bitmaps[col_idx] {
+                                            return idxs.iter().filter(|&&i| !bm.is_null(i)).count() as u64;
+                                        }
+                                    }
+                                    idxs.iter().filter(|&&i| table.columns[col_idx][i] != 0).count() as u64
+                                }
+                            }
+                            "SUM" => {
+                                let col_idx = resolve_col_name(arg, table).unwrap_or(0);
+                                let sum: u64 = idxs.iter().map(|&i| table.columns[col_idx][i]).sum();
+                                (sum as f64).to_bits()
+                            }
+                            "AVG" => {
+                                let col_idx = resolve_col_name(arg, table).unwrap_or(0);
+                                // AVG excludes NULLs (Wave 33).
+                                let (sum, cnt) = if col_idx < table.null_bitmaps.len() {
+                                    if let Some(ref bm) = table.null_bitmaps[col_idx] {
+                                        let filtered: Vec<u64> = idxs.iter()
+                                            .filter(|&&i| !bm.is_null(i))
+                                            .map(|&i| table.columns[col_idx][i])
+                                            .collect();
+                                        (filtered.iter().sum::<u64>(), filtered.len())
+                                    } else {
+                                        (idxs.iter().map(|&i| table.columns[col_idx][i]).sum::<u64>(), idxs.len())
+                                    }
+                                } else {
+                                    (idxs.iter().map(|&i| table.columns[col_idx][i]).sum::<u64>(), idxs.len())
+                                };
+                                if cnt == 0 { 0 } else { (sum as f64 / cnt as f64).to_bits() }
+                            }
+                            "MIN" => {
+                                let col_idx = resolve_col_name(arg, table).unwrap_or(0);
+                                idxs.iter().map(|&i| table.columns[col_idx][i]).min().unwrap_or(0)
+                            }
+                            "MAX" => {
+                                let col_idx = resolve_col_name(arg, table).unwrap_or(0);
+                                idxs.iter().map(|&i| table.columns[col_idx][i]).max().unwrap_or(0)
+                            }
+                            "COUNT_DISTINCT" => {
+                                let col_idx = resolve_col_name(arg, table).unwrap_or(0);
+                                let seen: std::collections::HashSet<u64> = idxs.iter().map(|&i| table.columns[col_idx][i]).collect();
+                                seen.len() as u64
+                            }
+                            _ => 0,
+                        }
+                    }).collect();
+                    result_cols.push(ResultColumn { name: name.to_string(), values, string_values: None, type_oid: 0 });
+                }
+                SelectItem::Window { .. } => {
+                    return Err(Error::Other(
+                        "window function in single-key GROUP BY — use tpch fallback".into(),
+                    ));
+                }
+            }
+        }
+
+        // Suppress unused-variable warning when no aggregate is present
+        // (shape classifier guarantees at least one aggregate, but the
+        // compiler doesn't know that).
+        let _ = &first_agg;
+
+        let row_count = group_keys_in_order.len();
+        let mut result = QueryResult { columns: result_cols, row_count, elapsed_us: 0 };
+
+        // Apply ORDER BY
+        if !query.order_by.is_empty() {
+            let (col_name, ascending) = &query.order_by[0];
+            let col_idx = result.columns.iter().position(|c| c.name == *col_name)
+                .ok_or_else(|| Error::NotFound(format!("ORDER BY column '{}'", col_name)))?;
+            let mut idx: Vec<usize> = (0..result.row_count).collect();
+            idx.sort_by(|&a, &b| {
+                let va = result.columns[col_idx].values[a];
+                let vb = result.columns[col_idx].values[b];
+                if *ascending { va.cmp(&vb) } else { vb.cmp(&va) }
+            });
+            let new_cols: Vec<ResultColumn> = result.columns.iter().map(|c| {
+                let values: Vec<u64> = idx.iter().map(|&i| c.values[i]).collect();
+                ResultColumn { name: c.name.clone(), values, string_values: None, type_oid: 0 }
+            }).collect();
+            result = QueryResult { columns: new_cols, row_count: result.row_count, elapsed_us: result.elapsed_us };
+        }
+
+        // Apply LIMIT
+        if let Some(limit) = query.limit {
+            if result.row_count > limit {
+                for col in &mut result.columns { col.values.truncate(limit); }
+                result.row_count = limit;
+            }
+        }
+
+        return Ok(result);
     }
 
     // Multi-key GROUP BY: fall back to HashMap

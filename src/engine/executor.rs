@@ -955,8 +955,27 @@ fn execute_with_join(
             .get(&join.table)
             .ok_or_else(|| Error::NotFound(format!("table '{}'", join.table)))?;
 
+        // Wave 49 fix: respect the parsed join type. Previously the executor
+        // always dispatched `JoinType::Inner`, silently turning every LEFT /
+        // RIGHT / FULL / CROSS join into an inner join.
+        let join_upper = join.join_type.to_uppercase();
+        if join_upper == "CROSS" {
+            // CROSS JOIN has no equi-key — materialise the cartesian product
+            // directly. The parser already synthesised a trivially-true ON
+            // predicate; we don't need (and cannot use) `extract_join_keys`
+            // here because that helper requires an `=` predicate.
+            cross_join_into(&mut running, right, &query.from, &join.table)?;
+            continue;
+        }
+
         let keys = extract_join_keys(&join.on, &running, right)?;
-        let result = hash_join(&running, right, &keys, JoinType::Inner)?;
+        let jt = match join_upper.as_str() {
+            "LEFT" => JoinType::Left,
+            "RIGHT" => JoinType::Right,
+            "FULL" => JoinType::Full,
+            _ => JoinType::Inner, // INNER, bare JOIN, or any unrecognised token
+        };
+        let result = hash_join(&running, right, &keys, jt)?;
         let mut new_table = result.into_table(&format!("__join_{}", join.table));
         // Rename columns from the right table to be qualified (table.col)
         // so they can be resolved by qualified names like l_orderkey
@@ -1014,4 +1033,76 @@ fn execute_with_join(
     } else {
         execute_select_multi(&modified.select, &filter, &running, &modified.order_by, modified.limit)
     }
+}
+
+/// Materialise a CROSS JOIN (cartesian product) into `running`.
+///
+/// Wave 49 fix: `CROSS JOIN` previously failed in `extract_join_keys` because
+/// there is no equi-join predicate. We materialise the full cartesian product
+/// directly. For large inputs this is O(N*M), which is the correct semantics
+/// of CROSS JOIN — callers should use it sparingly.
+///
+/// Column names from the right side are qualified as `right_table.col` to
+/// match the naming convention used by the regular join path.
+fn cross_join_into(
+    running: &mut Table,
+    right: &Table,
+    left_table_name: &str,
+    right_table_name: &str,
+) -> Result<()> {
+    let left_rows = running.row_count;
+    let right_rows = right.row_count;
+    let total_rows = left_rows.checked_mul(right_rows)
+        .ok_or_else(|| Error::Other("CROSS JOIN row count overflow".into()))?;
+
+    let left_col_count = running.columns.len();
+    let right_col_count = right.columns.len();
+    let total_cols = left_col_count + right_col_count;
+
+    // Build output columns by repeating each left row `right_rows` times and
+    // pairing it with every right row.
+    let mut out_cols: Vec<Vec<u64>> = Vec::with_capacity(total_cols);
+    for col in &running.columns {
+        let mut out = Vec::with_capacity(total_rows);
+        for l in 0..left_rows {
+            let v = col[l];
+            for _ in 0..right_rows {
+                out.push(v);
+            }
+        }
+        out_cols.push(out);
+    }
+    for col in &right.columns {
+        let mut out = Vec::with_capacity(total_rows);
+        for _ in 0..left_rows {
+            for r in 0..right_rows {
+                out.push(col[r]);
+            }
+        }
+        out_cols.push(out);
+    }
+
+    // Build qualified column names so downstream resolution can find them.
+    let mut names = Vec::with_capacity(total_cols);
+    for name in &running.column_names {
+        if name.contains('.') {
+            names.push(name.clone());
+        } else {
+            names.push(format!("{}.{}", left_table_name, name));
+        }
+    }
+    for name in &right.column_names {
+        names.push(format!("{}.{}", right_table_name, name));
+    }
+
+    *running = Table {
+        name: format!("__cross_{}", right_table_name),
+        columns: out_cols.into_iter().map(std::sync::Arc::new).collect(),
+        column_names: names,
+        row_count: total_rows,
+        string_columns: vec![],
+        null_bitmaps: vec![],
+        schema: None,
+    };
+    Ok(())
 }

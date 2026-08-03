@@ -51,6 +51,12 @@ pub struct JoinClause {
     pub table: String,
     /// The join condition (ON clause).
     pub on: Expr,
+    /// Join type keyword, uppercased: `INNER`, `LEFT`, `RIGHT`, `FULL`, `CROSS`.
+    /// Wave 49 fix: previously the parser recognised `LEFT JOIN` syntactically
+    /// but did not propagate the join type, so the executor always used
+    /// INNER. Carrying the type lets the executor dispatch the correct
+    /// `JoinType` to `hash_join`.
+    pub join_type: String,
 }
 
 /// One item in the SELECT list.
@@ -254,21 +260,55 @@ impl Parser {
     }
 
     /// Parse zero or more JOIN clauses.
+    ///
+    /// Wave 49 fix: every branch now records the join type (`INNER`, `LEFT`,
+    /// `RIGHT`, `FULL`, `CROSS`) on the `JoinClause`. Previously all joins
+    /// silently became INNER at execution time because the executor never
+    /// saw the original keyword.
     fn parse_joins(&mut self) -> Result<Vec<JoinClause>, String> {
         let mut joins = Vec::new();
         loop {
-            if self.match_keyword("JOIN") || (self.match_keyword("INNER") && self.expect_keyword("JOIN").is_ok()) {
+            // Bare `JOIN` is INNER.
+            if self.match_keyword("JOIN") {
                 let table = self.parse_table_name()?;
                 self.expect_keyword("ON")?;
                 let on = self.parse_expr()?;
-                joins.push(JoinClause { table, on });
+                joins.push(JoinClause { table, on, join_type: "INNER".to_string() });
+            } else if self.match_keyword("INNER") {
+                self.expect_keyword("JOIN")?;
+                let table = self.parse_table_name()?;
+                self.expect_keyword("ON")?;
+                let on = self.parse_expr()?;
+                joins.push(JoinClause { table, on, join_type: "INNER".to_string() });
             } else if self.match_keyword("LEFT") {
                 let _ = self.match_keyword("OUTER");
                 self.expect_keyword("JOIN")?;
                 let table = self.parse_table_name()?;
                 self.expect_keyword("ON")?;
                 let on = self.parse_expr()?;
-                joins.push(JoinClause { table, on });
+                joins.push(JoinClause { table, on, join_type: "LEFT".to_string() });
+            } else if self.match_keyword("RIGHT") {
+                let _ = self.match_keyword("OUTER");
+                self.expect_keyword("JOIN")?;
+                let table = self.parse_table_name()?;
+                self.expect_keyword("ON")?;
+                let on = self.parse_expr()?;
+                joins.push(JoinClause { table, on, join_type: "RIGHT".to_string() });
+            } else if self.match_keyword("FULL") {
+                let _ = self.match_keyword("OUTER");
+                self.expect_keyword("JOIN")?;
+                let table = self.parse_table_name()?;
+                self.expect_keyword("ON")?;
+                let on = self.parse_expr()?;
+                joins.push(JoinClause { table, on, join_type: "FULL".to_string() });
+            } else if self.match_keyword("CROSS") {
+                self.expect_keyword("JOIN")?;
+                let table = self.parse_table_name()?;
+                // CROSS JOIN has no ON clause — synthesize a trivially-true
+                // predicate (literal 1) so the downstream executor's
+                // `extract_join_keys` / `hash_join` path does not require one.
+                let on = crate::sql::parser::Expr::Literal(crate::sql::parser::Value::Int(1));
+                joins.push(JoinClause { table, on, join_type: "CROSS".to_string() });
             } else {
                 break;
             }
