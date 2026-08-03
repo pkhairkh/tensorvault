@@ -38,6 +38,9 @@ pub struct Table {
     /// column (all cells are non-NULL). `Some(bm)` tracks which cells are
     /// NULL (Wave 22).
     pub null_bitmaps: Vec<Option<crate::types::null_bitmap::NullBitmap>>,
+    /// Optional table schema preserving column types from DDL (Wave 36).
+    /// None for tables loaded from Parquet/CSV (no DDL).
+    pub schema: Option<crate::schema::table_schema::TableSchema>,
 }
 
 impl Table {
@@ -62,7 +65,7 @@ impl Table {
 
         let null_bitmaps = (0..columns.len()).map(|_| None).collect();
 
-        Table { name: loaded.name, columns, column_names, row_count, string_columns, null_bitmaps }
+        Table { name: loaded.name, columns, column_names, row_count, string_columns, null_bitmaps, schema: None }
     }
 
     /// Look up a column by name, returning a slice over its cells.

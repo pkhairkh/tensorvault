@@ -39,6 +39,7 @@ impl JoinResult {
             row_count: self.row_count,
             string_columns: vec![],
             null_bitmaps: vec![],
+            schema: None,
         }
     }
 }
@@ -241,6 +242,7 @@ mod tests {
             row_count,
             string_columns: vec![],
             null_bitmaps: vec![],
+            schema: None,
         }
     }
 

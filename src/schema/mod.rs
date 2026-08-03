@@ -8,5 +8,6 @@
 //! This module is a stub — a full SQL parser is out of scope for the prototype.
 
 pub mod mdl;
+pub mod table_schema;
 
 pub use mdl::{schema_select, schema_select_with_diagnostics, TypeInterpretation};

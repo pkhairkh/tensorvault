@@ -39,6 +39,7 @@ pub fn union_all(left: &Table, right: &Table) -> Result<Table, Error> {
         row_count: left.row_count + right.row_count,
         string_columns: vec![],
         null_bitmaps: vec![],
+            schema: None,
     })
 }
 
@@ -62,6 +63,7 @@ pub fn union_distinct(left: &Table, right: &Table) -> Result<Table, Error> {
         row_count: out_cols[0].len(),
         string_columns: vec![],
         null_bitmaps: vec![],
+            schema: None,
     })
 }
 
@@ -87,6 +89,7 @@ pub fn intersect(left: &Table, right: &Table) -> Result<Table, Error> {
         row_count: out_cols[0].len(),
         string_columns: vec![],
         null_bitmaps: vec![],
+            schema: None,
     })
 }
 
@@ -112,6 +115,7 @@ pub fn except(left: &Table, right: &Table) -> Result<Table, Error> {
         row_count: out_cols[0].len(),
         string_columns: vec![],
         null_bitmaps: vec![],
+            schema: None,
     })
 }
 
@@ -129,6 +133,7 @@ mod tests {
             row_count,
             string_columns: vec![],
             null_bitmaps: vec![],
+            schema: None,
         }
     }
 

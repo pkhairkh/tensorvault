@@ -110,6 +110,7 @@ impl QueryEngine {
             row_count: 1,
             string_columns: vec![None],
             null_bitmaps: vec![None],
+            schema: None,
         };
         catalog.register(dummy);
         Self {
@@ -434,7 +435,8 @@ impl QueryEngine {
                     column_names,
                     row_count: 0,
                     string_columns: vec![None; ct.columns.len()],
-            null_bitmaps: vec![None; ct.columns.len()],
+                    null_bitmaps: vec![None; ct.columns.len()],
+                    schema: Some(crate::schema::table_schema::TableSchema::from_ddl(&ct.columns)),
                 };
                 self.catalog.register(table);
                 Ok(QueryResult::empty())
@@ -679,6 +681,7 @@ impl QueryEngine {
                                 row_count: 0,
                                 string_columns: vec![],
             null_bitmaps: vec![],
+            schema: None,
                             }
                         }),
                         &rec_result,
@@ -898,6 +901,7 @@ fn result_to_table(name: &str, result: &QueryResult) -> Table {
         row_count: result.row_count,
         string_columns,
         null_bitmaps: vec![],
+            schema: None,
     }
 }
 
