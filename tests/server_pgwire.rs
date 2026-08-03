@@ -3,7 +3,7 @@
 //! and verifies the full protocol: startup, simple query, error handling,
 //! multi-statement batch.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use turbogp::engine::QueryEngine;
@@ -26,7 +26,7 @@ fn make_engine() -> QueryEngine {
 }
 
 async fn boot(e: QueryEngine) -> std::net::SocketAddr {
-    let e = Arc::new(Mutex::new(e));
+    let e = Arc::new(RwLock::new(e));
     let s = Server::bind(e, ServerConfig::default()).await.unwrap();
     let a = s.local_addr;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;

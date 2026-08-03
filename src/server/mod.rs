@@ -12,7 +12,7 @@ pub use session::Session;
 
 use crate::engine::QueryEngine;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
@@ -41,7 +41,7 @@ pub struct Server {
 impl Server {
     /// Bind and spawn the accept loop. Must be called inside a Tokio runtime.
     pub async fn bind(
-        engine: Arc<Mutex<QueryEngine>>,
+        engine: Arc<RwLock<QueryEngine>>,
         config: ServerConfig,
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(config.addr)
@@ -86,7 +86,7 @@ mod tests {
     }
     #[tokio::test]
     async fn bind_returns_local_addr() {
-        let engine = Arc::new(Mutex::new(QueryEngine::new()));
+        let engine = Arc::new(RwLock::new(QueryEngine::new()));
         let s = Server::bind(engine, ServerConfig::default()).await.unwrap();
         assert_ne!(s.local_addr.port(), 0);
     }

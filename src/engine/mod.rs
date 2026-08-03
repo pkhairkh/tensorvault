@@ -97,6 +97,54 @@ pub struct QueryEngine {
 }
 
 impl QueryEngine {
+    /// Try to execute a SELECT query without mutating the engine (Wave 41).
+    ///
+    /// This method takes `&self` (not `&mut self`), so it can be called
+    /// concurrently from multiple threads when the engine is wrapped in
+    /// `Arc<RwLock<QueryEngine>>`. SELECT queries take a read lock;
+    /// DML/DDL take a write lock.
+    ///
+    /// Returns `Ok(result)` if the query was a SELECT that succeeded.
+    /// Returns `Err(Error::Other("not a readonly query"))` if the query
+    /// is DDL/DML/transaction control (caller should use `execute()` with
+    /// a write lock).
+    pub fn try_readonly_select(&self, sql: &str) -> Result<QueryResult> {
+        let start = Instant::now();
+        let trimmed = sql.trim();
+        let lower = trimmed.to_lowercase();
+
+        // Only SELECT queries can be readonly.
+        if !lower.starts_with("select") && !lower.starts_with("with") {
+            return Err(Error::Other("not a readonly query".into()));
+        }
+
+        // Try CTE first.
+        if let Some(with_result) = crate::sql::parse_with(sql) {
+            // CTEs may execute DDL internally, so we can't guarantee readonly.
+            return Err(Error::Other("CTE requires write lock".into()));
+        }
+
+        // Try DDL/DML — these are NOT readonly.
+        if crate::sql::parse_ddl(sql).map_err(Error::Parse)?.is_some() {
+            return Err(Error::Other("DDL requires write lock".into()));
+        }
+        if crate::sql::parse_dml(sql).map_err(Error::Parse)?.is_some() {
+            return Err(Error::Other("DML requires write lock".into()));
+        }
+
+        // Parse as SELECT and execute against the current catalog.
+        let (query, extensions) = crate::sql::parse_with_extensions(sql).map_err(Error::Parse)?;
+        let mut result = execute_select(
+            &query,
+            &extensions,
+            &self.catalog,
+            &self.kernel_table,
+            &self.cost_model,
+        )?;
+        result.elapsed_us = start.elapsed().as_micros() as u64;
+        Ok(result)
+    }
+
     /// Construct an empty engine with the default kernel table and cost
     /// model. The catalog starts empty — register tables via
     /// [`QueryEngine::register_table`], [`QueryEngine::load_parquet`],

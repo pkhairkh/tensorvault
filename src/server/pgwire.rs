@@ -9,7 +9,7 @@ use crate::engine::{QueryEngine, QueryResult};
 use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
@@ -44,7 +44,7 @@ impl PgConn {
     pub async fn handle(
         stream: tokio::net::TcpStream,
         peer: std::net::SocketAddr,
-        engine: Arc<Mutex<QueryEngine>>,
+        engine: Arc<RwLock<QueryEngine>>,
         _server_name: String,
     ) -> io::Result<()> {
         let _ = peer;
@@ -64,7 +64,7 @@ impl PgConn {
         result
     }
 
-    async fn run_loop(&mut self, engine: &Arc<Mutex<QueryEngine>>) -> io::Result<()> {
+    async fn run_loop(&mut self, engine: &Arc<RwLock<QueryEngine>>) -> io::Result<()> {
         self.handle_startup().await?;
         loop {
             self.flush().await?;
@@ -192,7 +192,7 @@ impl PgConn {
 
     // --- Simple query ---
 
-    async fn handle_simple_query(&mut self, engine: &Arc<Mutex<QueryEngine>>, sql: &str) -> io::Result<()> {
+    async fn handle_simple_query(&mut self, engine: &Arc<RwLock<QueryEngine>>, sql: &str) -> io::Result<()> {
         let stmts = split_sql_batch(sql);
         let was_txn = self.session.txn != TxnStatus::Idle;
         for stmt in stmts {
@@ -215,8 +215,20 @@ impl PgConn {
                 continue;
             }
             let result = {
-                let mut guard = engine.lock().expect("engine mutex");
-                guard.execute(trimmed)
+                // MVCC (Wave 41): try readonly SELECT first with a read lock.
+                // If that fails (not a SELECT), take a write lock for DML/DDL.
+                let readonly_result = {
+                    let guard = engine.read().expect("engine read lock");
+                    guard.try_readonly_select(trimmed)
+                };
+                match readonly_result {
+                    Ok(r) => Ok(r),
+                    Err(_) => {
+                        // Not a readonly query — take write lock.
+                        let mut guard = engine.write().expect("engine write lock");
+                        guard.execute(trimmed)
+                    }
+                }
             };
             match result {
                 Ok(r) => {
@@ -303,7 +315,7 @@ impl PgConn {
         self.send_byte(b'2', &[]).await // BindComplete
     }
 
-    async fn handle_describe(&mut self, engine: &Arc<Mutex<QueryEngine>>, buf: &[u8]) -> io::Result<()> {
+    async fn handle_describe(&mut self, engine: &Arc<RwLock<QueryEngine>>, buf: &[u8]) -> io::Result<()> {
         if buf.is_empty() { return Err(io::Error::new(io::ErrorKind::InvalidData, "Describe empty")); }
         let kind = buf[0];
         let mut c = 1;
@@ -331,7 +343,17 @@ impl PgConn {
                     return Ok(());
                 }};
                 let sql = substitute_params(&stmt.sql, &portal.params);
-                let result = { let mut g = engine.lock().expect("engine"); g.execute(&sql) };
+                let result = {
+                    let readonly = engine.read().expect("engine");
+                    match readonly.try_readonly_select(&sql) {
+                        Ok(r) => Ok(r),
+                        Err(_) => {
+                            drop(readonly);
+                            let mut guard = engine.write().expect("engine");
+                            guard.execute(&sql)
+                        }
+                    }
+                };
                 match result {
                     Ok(r) => {
                         if r.columns.is_empty() { self.send_byte(b'n', &[]).await?; }
@@ -345,7 +367,7 @@ impl PgConn {
         Ok(())
     }
 
-    async fn handle_execute(&mut self, engine: &Arc<Mutex<QueryEngine>>, buf: &[u8]) -> io::Result<()> {
+    async fn handle_execute(&mut self, engine: &Arc<RwLock<QueryEngine>>, buf: &[u8]) -> io::Result<()> {
         let mut c = 0;
         let portal_name = read_cstring(buf, &mut c)?;
         if c + 4 > buf.len() { return Err(io::Error::new(io::ErrorKind::InvalidData, "Execute truncated")); }
@@ -359,7 +381,17 @@ impl PgConn {
             return Ok(());
         }};
         let sql = substitute_params(&stmt.sql, &portal.params);
-        let result = { let mut g = engine.lock().expect("engine"); g.execute(&sql) };
+        let result = {
+            let readonly = engine.read().expect("engine");
+            match readonly.try_readonly_select(&sql) {
+                Ok(r) => Ok(r),
+                Err(_) => {
+                    drop(readonly);
+                    let mut guard = engine.write().expect("engine");
+                    guard.execute(&sql)
+                }
+            }
+        };
         match result {
             Ok(r) => {
                 self.send_data_rows(&r).await?;
