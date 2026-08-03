@@ -1,3 +1,4 @@
+//! **WIRED INTO SQL EXECUTION (Wave 53)** — this module is reachable through QueryEngine::execute() via the dispatch path in engine/mod.rs.
 //! # Temporal tables (Wave 11).
 //!
 //! Implements system-versioned temporal tables: every UPDATE/DELETE on a

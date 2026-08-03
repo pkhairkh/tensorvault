@@ -22,9 +22,10 @@
 //! ## Type conversion table
 //!
 //! See the table in [`crate::datasource`] for the full mapping. Null
-//! values are encoded as the sentinel `0u64` — the engine does not
-//! yet track a null bitmap per column. This is acceptable for the
-//! ClickBench/TPC-H datasets, which are dense.
+//! values are tracked via the `null_bitmap` field on `LoadedColumn`
+//! (Wave 46) — the bitmap marks which cells are NULL, and the dispatch
+//! path consults it so `COUNT(col)` excludes NULLs and pgwire sends
+//! NULL as a `-1` length indicator (Wave 52).
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Float64Array, Int16Array, Int32Array, Int64Array,

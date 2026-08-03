@@ -1,3 +1,4 @@
+//! **WIRED INTO SQL EXECUTION (Wave 53)** — this module is reachable through QueryEngine::execute() via the dispatch path in engine/mod.rs.
 //! # Views (Wave 12).
 //!
 //! Implements CREATE VIEW, DROP VIEW, and view expansion (substituting

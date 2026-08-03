@@ -1,3 +1,4 @@
+//! **NOT WIRED INTO SQL EXECUTION** — this module exists but is not called by QueryEngine::execute() (or is only partially wired; see Wave 53 notes in engine/mod.rs).
 //! An eddy: adaptive per-morsel tuple routing (Avnur & Hellerstein, SIGMOD 2000).
 //!
 //! A [`Pipeline`](crate::executor::pipeline::Pipeline) runs its stages in a

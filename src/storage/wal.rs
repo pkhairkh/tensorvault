@@ -1,3 +1,4 @@
+//! **NOT WIRED INTO SQL EXECUTION** — this module exists but is not called by QueryEngine::execute() (or is only partially wired; see Wave 53 notes in engine/mod.rs).
 //! Write-ahead log (WAL) — ZNS-aware (ADR-011).
 //!
 //! The WAL is append-only and designed for Zoned Namespace SSDs. On a

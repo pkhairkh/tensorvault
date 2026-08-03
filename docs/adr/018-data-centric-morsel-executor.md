@@ -3,6 +3,14 @@
 ## Status
 Accepted
 
+> **⚠️ Implementation note (Wave 54):** The morsel-driven executor described
+> in this ADR is **NOT** used by the SQL executor. `src/executor/morsel.rs`
+> exists as a research prototype but is not wired to `QueryEngine::execute()`.
+> The actual execution path uses **dispatch-based** kernel selection
+> (`src/engine/dispatch.rs`) followed by vectorized kernels
+> (`src/exec/vectorized.rs`). See ARCHITECTURE.md "The executor" section for
+> the real execution flow.
+
 ## Confidence
 90%
 

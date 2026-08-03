@@ -1,3 +1,4 @@
+//! **NOT WIRED INTO SQL EXECUTION** — this module exists but is not called by QueryEngine::execute() (or is only partially wired; see Wave 53 notes in engine/mod.rs).
 //! A morsel: the unit of work for the morsel-driven executor (ADR-018).
 //!
 //! A morsel is a fixed-size batch of 1024 u64 cells (8 KB), chosen to fit in a

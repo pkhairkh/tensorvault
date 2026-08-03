@@ -52,30 +52,32 @@ Instruction Sets → Memory Hierarchy → Protocols → Storage Layout → Execu
 ## Repository layout
 
 ```
-tensorvault/
+turboGP/
 ├── README.md                         ← you are here
-├── ARCHITECTURE.md                   ← the instruction-first architecture (1-page summary)
+├── ARCHITECTURE.md                   ← the dispatch-based architecture (1-page summary)
 ├── Cargo.toml
 ├── src/                              ← Rust source code
-│   ├── kernel/                       ← THE KERNEL TABLE (the moat)
+│   ├── kernel/                       ← SIMD kernels (the moat)
 │   ├── memory/                       ← tier-aware memory manager
-│   ├── storage/                      ← instruction-shaped storage format
-│   ├── executor/                     ← scheduler of instruction streams
-│   ├── protocol/                     ← protocol boundary coordinator
-│   └── schema/                       ← the LAST layer (MDL schema selection)
+│   ├── storage/                      ← WAL + checkpoint (recovery.rs)
+│   ├── engine/                       ← QueryEngine + dispatch + tpch fallback
+│   │   ├── mod.rs                    ← QueryEngine::execute() entry point
+│   │   ├── dispatch.rs               ← kernel-direct query dispatch
+│   │   ├── executor.rs               ← basic executor (JOIN, GROUP BY, etc.)
+│   │   └── tpch.rs                   ← TPC-H interpreter (rich SQL fallback)
+│   ├── sql/                          ← lexer, parser, DDL, DML, CTE
+│   ├── exec/                         ← window, pivot, merge, json, temporal, etc.
+│   ├── datasource/                   ← CSV/Parquet loaders + Table struct
+│   ├── catalog/                      ← table + view registries
+│   ├── server/                       ← pgwire protocol server
+│   └── schema/                       ← column type schema (TableSchema)
 ├── examples/smoke.rs                 ← end-to-end demo
 ├── benches/                          ← criterion benchmarks
 └── docs/
     ├── README.md                     ← documentation index (start here)
-    ├── FINE_DRAFT.md                 ← THE master document: venture + catalog + solutions
-    ├── architecture/                 ← design docs + CPU energy knowledgebase
-    ├── research/                     ← math foundations + domain deep-dives + wave evaluations
-    │   ├── math-foundations.md
-    │   ├── math-enhancements.md
-    │   ├── domains/                  ← 5 mathematical pillars (info theory, spectral, prob, opt, category)
-    │   └── waves/                    ← per-problem solution evaluations (performance/time/energy)
-    ├── problems/                     ← problem catalog: 99 problems across 10 files
-    ├── benchmarks/                   ← TPC-C and TPC-H analysis
+    ├── adr/                          ← 25 ADRs + open questions
+    ├── research/                     ← math foundations + wave evaluations
+    └── problems/                     ← problem catalog
 ```
 
 ## The storage format: instruction-shaped, not schema-shaped
@@ -139,17 +141,56 @@ cargo bench               # AVX-512 throughput benchmarks
 
 | Phase | Status | Description |
 |-------|--------|-------------|
-| 1 | ✅ This repo | Kernel table + memory manager + storage format |
-| 2 | Pending | Full executor with cross-tier joins |
-| 3 | Pending | CXL-aware buffer pool + migration policy |
-| 4 | Pending | ZNS WAL + LSM compaction |
-| 5 | Pending | Protocol coordinator (CXL + Raft/RoCEv2) |
-| 6 | Pending | Schema layer (SQL parser + MDL) |
-| 7 | Pending | DPU offload + computational storage pushdown |
-| 8 | Pending | TPC-C / TPC-H benchmark suite |
+| 1 | ✅ Done | Kernel table + memory manager + storage format (Waves 1-3) |
+| 2 | ✅ Done | Full executor with cross-tier joins (Waves 4-45) |
+| 3 | ⚠️ Stub | CXL-aware buffer pool + migration policy (stubs only, not production) |
+| 4 | ✅ Done | WAL + checkpoint (Waves 14, 37, 50, 51) |
+| 5 | ⚠️ Stub | Protocol coordinator (CXL/Raft stubs exist, not wired to executor) |
+| 6 | ✅ Done | SQL parser + schema layer (Waves 3, 6, 12, 22, 36) |
+| 7 | ⚠️ Stub | DPU offload + computational storage pushdown (stubs only) |
+| 8 | ✅ Done | TPC-H benchmark suite (Waves 10, 24, 28) |
+
+## Current SQL surface
+
+The following SQL features work end-to-end through `QueryEngine::execute()`:
+
+- **DDL**: `CREATE TABLE`, `DROP TABLE`, `CREATE SCHEMA`, `CREATE VIEW`, `DROP VIEW`, `CREATE PROCEDURE`
+- **DML**: `INSERT`, `UPDATE`, `DELETE` with WHERE clauses supporting `=`, `!=`, `<>`, `<`, `>`, `<=`, `>=`, `AND`, `OR`
+- **SELECT**: `SELECT *`, `SELECT col`, `SELECT col1, col2`, `SELECT count(*)`, `SELECT sum/avg/min/max(col)`, `SELECT count(DISTINCT col)`
+- **JOIN**: `INNER JOIN`, `LEFT [OUTER] JOIN`, `RIGHT [OUTER] JOIN`, `FULL [OUTER] JOIN`, `CROSS JOIN` (with ON clause)
+- **GROUP BY**: single-key and multi-key, with multiple aggregates in one query
+- **ORDER BY**: ascending/descending, string-aware (uses StringSearchColumn sidecar when present)
+- **LIMIT**: row count limiting
+- **WHERE**: `=`, `!=`, `<>`, `<`, `>`, `<=`, `>=`, `LIKE` (with `%` wildcards), `AND`, `OR`
+- **NULL semantics**: NULL bitmaps track NULL cells; `COUNT(col)` excludes NULLs; pgwire sends NULL as `-1` length
+- **Transactions**: `BEGIN`, `COMMIT`, `ROLLBACK` with snapshot isolation
+- **WAL**: write-ahead log with BEGIN/COMMIT/ROLLBACK markers, base64-encoded SQL, replay on restart
+- **Checkpoint**: type-preserving (FLOAT, VARCHAR, NULL all round-trip correctly)
+- **CTE**: `WITH ... AS (...) SELECT ...` including recursive CTEs
+- **Views**: `CREATE VIEW` + `SELECT FROM view` (materialized on query)
+- **Procedures**: `CREATE PROCEDURE` + `EXEC proc_name [args]`
+- **MERGE**: `MERGE INTO target WHEN MATCHED THEN UPDATE/DELETE/INSERT`
+- **Temporal**: `FOR SYSTEM_TIME AS OF <timestamp>` (requires pre-registered TemporalTable)
+- **Window functions**: `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `SUM()`, `COUNT()` with `OVER (PARTITION BY ... ORDER BY ...)`
+- **pgwire server**: extended query protocol (Parse/Bind/Describe/Execute/Sync), NULL handling, max_rows/cursor support
+- **Data loading**: CSV, Parquet (with NULL bitmap and StringSearchColumn sidecar)
+
+## Known limitations
+
+- **No persistent storage**: all data is in-memory; WAL+checkpoint provide durability across restarts but there's no on-disk page store
+- **CXL/RoCEv2/IB are stubs**: the protocol modules exist but are not wired to the executor; single-node only
+- **Morsel executor not used**: `executor/morsel.rs` exists but the SQL executor uses dispatch + vectorized kernels, not morsel-driven parallelism
+- **DPccp/MCTS planners not wired**: `planner/dpccp.rs` and `planner/mcts.rs` exist but the executor uses a simple cost-based optimizer
+- **No concurrent write transactions**: snapshot isolation supports one transaction at a time per engine; concurrent connections each get their own engine
+- **String columns hashed**: strings are stored as xxh3 hashes in u64 cells; the original text is preserved in a `StringSearchColumn` sidecar (not all operations consult the sidecar)
+- **PIVOT/UNPIVOT SQL syntax not parsed**: the `pivot()` / `unpivot()` functions are callable but `PIVOT (...)` clause in SELECT is not yet parsed
+- **JSON functions not in expression evaluator**: `JSON_VALUE`, `JSON_QUERY`, etc. are callable as module functions but not yet integrated into the SELECT expression evaluator
+- **Describe returns NoData**: the pgwire Describe message always returns NoData without inferring the schema (psql tolerates this)
+- **No indexes used by executor**: `index/manager.rs` and `index/lsh.rs` exist but the executor does full scans
 
 See `ARCHITECTURE.md` and `docs/` for the full design.
 
 ## License
 
-MIT OR Apache-2.0.
+MIT OR Apache-2.0. (The `Cargo.toml` says `CCL-X-1.2` for historical reasons;
+the effective license is MIT OR Apache-2.0 — pick one.)

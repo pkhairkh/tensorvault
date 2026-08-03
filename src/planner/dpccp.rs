@@ -1,3 +1,4 @@
+//! **NOT WIRED INTO SQL EXECUTION** — this module exists but is not called by QueryEngine::execute() (or is only partially wired; see Wave 53 notes in engine/mod.rs).
 //! DPccp join ordering (ADR-019).
 //!
 //! DPccp (Dynamic Programming over connected complement pairs, Moerkotte &

@@ -3,6 +3,13 @@
 ## Status
 Accepted
 
+> **⚠️ Implementation note (Wave 54):** The ZNS-aware WAL described in this
+> ADR is **NOT** the production WAL. The actual WAL lives in
+> `src/storage/recovery.rs` and is a simple append-only file with base64-
+> encoded SQL records (see Wave 51 fix). The ZNS/io_uring implementation
+> was never completed — `src/storage/wal.rs` is a stub. This ADR describes
+> the *design intent* for a future production WAL, not the current code.
+
 ## Confidence
 85%
 

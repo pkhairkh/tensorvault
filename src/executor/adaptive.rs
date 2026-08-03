@@ -1,3 +1,4 @@
+//! **NOT WIRED INTO SQL EXECUTION** — this module exists but is not called by QueryEngine::execute() (or is only partially wired; see Wave 53 notes in engine/mod.rs).
 //! Adaptive plan switching based on observed cardinality.
 //!
 //! The planner picks a plan based on *estimated* cardinalities. If the

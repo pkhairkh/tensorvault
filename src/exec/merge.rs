@@ -1,3 +1,4 @@
+//! **WIRED INTO SQL EXECUTION (Wave 53)** — this module is reachable through QueryEngine::execute() via the dispatch path in engine/mod.rs.
 //! # MERGE statement + TRY_CONVERT/TRY_CAST (Wave 10).
 //!
 //! MERGE: upsert operation that INSERTs new rows, UPDATEs matching rows,

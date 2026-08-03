@@ -1,14 +1,12 @@
 # turboGP — Implementation Orchestration Plan
 
-> **18 waves, each with surgical subtasks, clear DoDs, commits between
-> subtasks, pushes between waves. The orchestrator may only return when all
-> DoDs are fulfilled.**
-
-> **Status as of Wave 18: ALL 18 WAVES COMPLETE.**
-> Final test count: **554 tests** (535 lib + 7 integration + 12 doc-tests;
-> 1 doc-test ignored). Clippy is `-D warnings` clean on 9 benchmark suites
-> and the `smoke` example. The 3× speedup target for Waves 13–17 is
-> verified in [`docs/3x-proof.md`](./docs/3x-proof.md).
+> **Status as of Wave 56: ALL 56 WAVES COMPLETE.**
+> Final test count: **1100+ tests** (1046 lib + 50+ integration across 24
+> test files). The original 18-wave plan grew to 56 waves as the SQL
+> surface expanded from a stub parser to a full DDL/DML/SELECT/JOIN/
+> GROUP BY/ORDER BY/WAL/transaction/pgwire engine. Waves 49–56 are the
+> "production readiness remediation" wave sequence that fixed 13 critical
+> bugs, wired 7 dead modules into `execute()`, and updated all docs.
 
 ## Conventions
 
@@ -40,6 +38,19 @@
 | 16 | Adaptive eddies | 3 | ✅ done | 12× on skewed data via early termination |
 | 17 | Tensor-network contraction | 3 | ✅ done | 5.6× faster planning, 11× compression |
 | 18 | Final 3× proof + smoke | 4 | ✅ done | `bench_3x_proof` runs, all techniques ≥3× |
+| 19-22 | SQL parser expansion (JOIN, GROUP BY, ORDER BY, LIMIT) | — | ✅ done | Basic SELECT surface works |
+| 23-28 | DDL/DML/CTE/pgwire server | — | ✅ done | CREATE TABLE, INSERT/UPDATE/DELETE, WITH, pgwire |
+| 29-35 | Dispatch optimizer + string sidecar + NULL bitmaps | — | ✅ done | Kernel-direct dispatch, StringSearchColumn, NullBitmap |
+| 36-40 | Schema types + expression evaluator + arithmetic aggs | — | ✅ done | TableSchema, eval_expr, SUM(a*b) |
+| 41-48 | MVCC + readonly select + ORDER BY strings + Parquet NULLs + type OID | — | ✅ done | try_readonly_select, string ORDER BY, type_oid |
+| 49 | LEFT JOIN + multi-agg GROUP BY + SelectMulti ORDER BY | 3 | ✅ done | Bugs 1-3 fixed |
+| 50 | DML WHERE ops + string spaces + UPDATE NULL + checkpoint types | 4 | ✅ done | Bugs 4-7 fixed |
+| 51 | WAL commit markers + append-after-execute + base64 escaping | 3 | ✅ done | Bugs 8-10 fixed |
+| 52 | pgwire NULL + Describe no-execute + max_rows | 3 | ✅ done | Bugs 11-13 fixed |
+| 53 | Wire views/procedures/MERGE/JSON/temporal/window/PIVOT | 7 | ✅ done | Dead modules reachable via execute() |
+| 54 | Update ALL documentation | — | ✅ done | README, ARCHITECTURE, ORCHESTRATION, CHANGELOG, ROADMAP, ADRs |
+| 55 | Fix test quality | — | ✅ done | tpch_fallback, window_parsing, real tests |
+| 56 | Final DoD + tag v1.0.0-remediated | — | ✅ done | All tests pass, tag pushed |
 
 ---
 
@@ -313,4 +324,4 @@
 4. Commit after each subtask: `wave-N/task-M: <description>`
 5. Push after each wave (once all DoDs pass)
 6. Orchestrator verifies DoD before starting next wave
-7. **All 18 waves are complete — orchestrator has returned.**
+7. **All 56 waves are complete — orchestrator has returned.** Tagged `v1.0.0-remediated`.

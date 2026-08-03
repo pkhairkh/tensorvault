@@ -3,6 +3,15 @@
 ## Status
 Accepted
 
+> **⚠️ Implementation note (Wave 54):** DPccp is **NOT** wired to the SQL
+> executor. `src/planner/dpccp.rs` exists as a research prototype with unit
+> tests, but `QueryEngine::execute()` does not call it. The actual join
+> ordering uses a simple heuristic in `src/planner/optimizer.rs` that picks
+> between KernelDirect, Vectorized, HashJoin, and TpchFallback strategies.
+> Similarly, `src/planner/mcts.rs` (MCTS plan search) and
+> `src/planner/learned.rs` (learned cardinality) are not wired to the
+> executor.
+
 ## Confidence
 85%
 

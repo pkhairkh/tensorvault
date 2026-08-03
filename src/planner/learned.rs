@@ -1,3 +1,4 @@
+//! **NOT WIRED INTO SQL EXECUTION** — this module exists but is not called by QueryEngine::execute() (or is only partially wired; see Wave 53 notes in engine/mod.rs).
 //! Learned cardinality estimation (ADR-023 follow-on).
 //!
 //! A lightweight "learned" cardinality estimator that augments the simple

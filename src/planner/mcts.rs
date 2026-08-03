@@ -1,3 +1,4 @@
+//! **NOT WIRED INTO SQL EXECUTION** — this module exists but is not called by QueryEngine::execute() (or is only partially wired; see Wave 53 notes in engine/mod.rs).
 //! Monte Carlo Tree Search (MCTS) join ordering for `n > 15` relations
 //! (ADR-019, Wave 15).
 //!

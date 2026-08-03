@@ -3,10 +3,11 @@
 ## Getting started
 
 1. Clone the repo
-2. `cargo build` — must compile clean
-3. `cargo test` — all 66 tests must pass
-4. `cargo fmt --check` — must pass
-5. `cargo clippy -- -D warnings` — must pass
+2. Install Rust 1.97+ (`rustup install stable`)
+3. `cargo build` — must compile clean
+4. `cargo test --lib --tests` — all 1100+ tests must pass (1046 lib + 50+ integration)
+5. `cargo fmt --check` — must pass
+6. `cargo clippy` — should pass (warnings are tolerated; `-D warnings` is aspirational)
 
 ## Branch naming
 

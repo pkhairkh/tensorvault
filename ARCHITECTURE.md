@@ -67,7 +67,14 @@ the huge page granularity and amortizes TLB cost.
 
 ### 3. Protocols define coherence and reach boundaries
 
-The transaction coordinator (`src/protocol/`) runs at protocol boundaries:
+> **⚠️ Status note (Wave 54):** The protocol coordinator (`src/protocol/`)
+> is a **stub**. CXL, Raft-over-RoCEv2, and IB modules exist as type
+> definitions but are **not wired** to the executor. turboGP is currently
+> single-node, in-memory. The protocol boundary diagram below describes
+> the *design intent*, not the current implementation.
+
+The transaction coordinator (`src/protocol/`) is designed to run at
+protocol boundaries:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -84,7 +91,7 @@ The transaction coordinator (`src/protocol/`) runs at protocol boundaries:
 
 The engine never crosses a protocol boundary unintentionally. Single-rack
 transactions use CXL coherence for visibility; cross-rack transactions use
-Raft over RoCEv2.
+Raft over RoCEv2. **(Not implemented — see status note above.)**
 
 ## Storage format: instruction-shaped, not schema-shaped
 
@@ -127,29 +134,68 @@ A logical column is a linked list of tablets, each tagged with its row range.
 The schema layer maps SQL column references to (tablet list, kernel id) pairs
 at query parse time.
 
-## The executor: a scheduler of instruction streams
+## The executor: dispatch-based, not DAG-based
 
-The executor (`src/executor/`) is not a Volcano-style pipeline. It's a
-scheduler that:
+The executor (`src/engine/`) is **not** a Volcano-style pipeline or a DAG
+scheduler. It is a **dispatch-based** executor that pattern-matches the
+SQL shape and calls the appropriate vectorized kernel directly.
 
-1. Receives a logical plan from the parser
-2. Lowers it to a DAG of kernel invocations
-3. For each invocation, picks the kernel matching (cpu, tier)
-4. Schedules invocations respecting data dependencies and tier bandwidth
-5. Manages the L1/L2 working set explicitly (4 KB batches in, 4 KB out)
-
-For `SELECT COUNT(*) FROM logs WHERE level = 'ERROR'`:
+### Execution flow
 
 ```
-Kernel: scan_eq_u64  (tier=L3, cpu=detected)
-  input:  logs.region[42]  (2 MB, 262144 cells)
-  target: Cell::from_short_str("ERROR")
-  output: count (u64)
+SQL string
+    │
+    ▼  QueryEngine::execute()          [src/engine/mod.rs]
+    │  (transaction control, WAL, routing)
+    │
+    ▼  execute_inner()                 [src/engine/mod.rs]
+    │  (CTE → views → procedures → MERGE → DDL → DML → temporal → SELECT)
+    │
+    ▼  parse_with_extensions()         [src/sql/]
+    │  (lexer + parser → SelectQuery)
+    │
+    ▼  execute_select()                [src/engine/executor.rs]
+    │  (optimizer → dispatch → fallback)
+    │
+    ▼  dispatch::execute_dispatched()  [src/engine/dispatch.rs]
+    │  (pattern-match QueryShape → call kernel)
+    │
+    ▼  vectorized kernels              [src/exec/vectorized.rs]
+    │  (SIMD scan, filter, aggregate)
+    │
+    ▼  QueryResult                     [src/engine/result.rs]
 ```
 
-The scheduler allocates a 4 KB output buffer in L1, issues the scan kernel in
-4 KB batches (64 batches for a 2 MB region), and accumulates the count in a
-register. Total cost: 262144 cells / 6.4 cells/cycle = ~41K cycles = ~14 µs.
+### Dispatch shapes
+
+The dispatcher (`classify_query`) recognises these query shapes and calls
+the appropriate kernel directly:
+
+- `CountAll` — `SELECT count(*) FROM t`
+- `CountFilter` — `SELECT count(*) FROM t WHERE ...`
+- `SumCol` / `AvgCol` / `MinMax` / `CountDistinct` — single-aggregate queries
+- `GroupByCount` / `GroupBySum` / `GroupByOrderByLimit` — GROUP BY queries
+- `SelectStar` / `SelectColumn` / `SelectMulti` — projection queries
+- `Complex` — falls back to the TPC-H interpreter (`src/engine/tpch.rs`)
+
+### TPC-H fallback
+
+When the dispatcher classifies a query as `Complex` (e.g. HAVING, CASE WHEN,
+subqueries, multi-table implicit joins, arithmetic in aggregates), the
+executor falls back to `tpch::parse_and_execute()`. This interpreter has a
+richer parser and a type-aware row-based evaluator that handles the full
+TPC-H query set.
+
+### What the executor is NOT
+
+- **Not a DAG scheduler.** The `src/executor/` directory contains
+  `pipeline.rs`, `scheduler.rs`, `morsel.rs`, `eddy.rs`, `adaptive.rs` —
+  these are research prototypes that are **not wired** to the SQL executor.
+  The dispatch path in `src/engine/` is the actual execution path.
+- **Not morsel-driven.** `executor/morsel.rs` exists but is not used.
+- **Not cost-based.** The planner (`src/planner/`) has DPccp, MCTS, and
+  learned cost models, but the executor uses a simple heuristic optimizer
+  (`planner/optimizer.rs`) that picks KernelDirect vs TpchFallback.
 
 ## The kernel table: the moat
 

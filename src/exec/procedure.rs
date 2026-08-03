@@ -1,3 +1,4 @@
+//! **WIRED INTO SQL EXECUTION (Wave 53)** — this module is reachable through QueryEngine::execute() via the dispatch path in engine/mod.rs.
 //! # Stored procedures, functions, TVPs, SESSION_CONTEXT (Wave 13).
 //!
 //! Implements:
