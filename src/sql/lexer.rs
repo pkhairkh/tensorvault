@@ -135,6 +135,11 @@ pub const KEYWORDS: &[&str] = &[
     "CURRENT",
     "ROW",
     "NUMBER",
+
+    // ClickBench parser fixes (Wave 16)
+    "BETWEEN",
+    "IN",
+    "IS",
 ];
 
 /// A single SQL token.

@@ -497,10 +497,13 @@ impl Parser {
 
     fn parse_comparison_expr(&mut self) -> Result<Expr, String> {
         let left = self.parse_additive_expr()?;
+        // Comparison operators: = != <> < > <= >=
         if let Token::Op(op) = self.peek().clone() {
-            if matches!(op.as_str(), "=" | "!=" | "<" | ">" | "<=" | ">=") {
+            if matches!(op.as_str(), "=" | "!=" | "<>" | "<" | ">" | "<=" | ">=") {
                 self.next();
                 let right = self.parse_additive_expr()?;
+                // Normalize <> to != so the executor's existing arm handles it.
+                let op = if op == "<>" { "!=".to_string() } else { op };
                 return Ok(Expr::Binary { left: Box::new(left), op, right: Box::new(right) });
             }
         }
@@ -516,6 +519,124 @@ impl Parser {
                 return Ok(Expr::Binary { left: Box::new(left), op: "NOT LIKE".to_string(), right: Box::new(right) });
             }
             // NOT could be part of another construct; put it back
+            self.pos -= 1;
+        }
+        // BETWEEN x AND y — lower to (expr >= x AND expr <= y)
+        if self.match_keyword("BETWEEN") {
+            let low = self.parse_additive_expr()?;
+            // Expect AND
+            if !self.match_keyword("AND") {
+                return Err("expected AND after BETWEEN low".into());
+            }
+            let high = self.parse_additive_expr()?;
+            let ge = Expr::Binary {
+                left: Box::new(left.clone()),
+                op: ">=".to_string(),
+                right: Box::new(low),
+            };
+            let le = Expr::Binary {
+                left: Box::new(left),
+                op: "<=".to_string(),
+                right: Box::new(high),
+            };
+            return Ok(Expr::Binary {
+                left: Box::new(ge),
+                op: "AND".to_string(),
+                right: Box::new(le),
+            });
+        }
+        // NOT BETWEEN
+        if self.match_keyword("NOT") {
+            if self.match_keyword("BETWEEN") {
+                let low = self.parse_additive_expr()?;
+                if !self.match_keyword("AND") {
+                    return Err("expected AND after NOT BETWEEN low".into());
+                }
+                let high = self.parse_additive_expr()?;
+                // NOT BETWEEN → (expr < low OR expr > high)
+                let lt = Expr::Binary {
+                    left: Box::new(left.clone()),
+                    op: "<".to_string(),
+                    right: Box::new(low),
+                };
+                let gt = Expr::Binary {
+                    left: Box::new(left),
+                    op: ">".to_string(),
+                    right: Box::new(high),
+                };
+                return Ok(Expr::Binary {
+                    left: Box::new(lt),
+                    op: "OR".to_string(),
+                    right: Box::new(gt),
+                });
+            }
+            self.pos -= 1;
+        }
+        // IN (val1, val2, ...) — lower to (expr = val1 OR expr = val2 OR ...)
+        if self.match_keyword("IN") {
+            if self.peek() != &Token::LParen {
+                return Err("expected ( after IN".into());
+            }
+            self.next(); // consume (
+            let mut or_expr: Option<Expr> = None;
+            loop {
+                let val = self.parse_additive_expr()?;
+                let eq = Expr::Binary {
+                    left: Box::new(left.clone()),
+                    op: "=".to_string(),
+                    right: Box::new(val),
+                };
+                match or_expr {
+                    None => or_expr = Some(eq),
+                    Some(existing) => {
+                        or_expr = Some(Expr::Binary {
+                            left: Box::new(existing),
+                            op: "OR".to_string(),
+                            right: Box::new(eq),
+                        });
+                    }
+                }
+                match self.peek() {
+                    Token::Comma => { self.next(); }
+                    Token::RParen => { self.next(); break; }
+                    other => return Err(format!("expected , or ) in IN list, got {other:?}")),
+                }
+            }
+            return Ok(or_expr.unwrap_or(left));
+        }
+        // NOT IN
+        if self.match_keyword("NOT") {
+            if self.match_keyword("IN") {
+                if self.peek() != &Token::LParen {
+                    return Err("expected ( after NOT IN".into());
+                }
+                self.next();
+                let mut and_expr: Option<Expr> = None;
+                loop {
+                    let val = self.parse_additive_expr()?;
+                    let ne = Expr::Binary {
+                        left: Box::new(left.clone()),
+                        op: "!=".to_string(),
+                        right: Box::new(val),
+                    };
+                    match and_expr {
+                        None => and_expr = Some(ne),
+                        Some(existing) => {
+                            and_expr = Some(Expr::Binary {
+                                left: Box::new(existing),
+                                op: "AND".to_string(),
+                                right: Box::new(ne),
+                            });
+                        }
+                    }
+                    match self.peek() {
+                        Token::Comma => { self.next(); }
+                        Token::RParen => { self.next(); break; }
+                        other => return Err(format!("expected , or ) in NOT IN list, got {other:?}")),
+                    }
+                }
+                return Ok(and_expr.unwrap_or(left));
+            }
             self.pos -= 1;
         }
         Ok(left)
