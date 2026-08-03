@@ -18,3 +18,4 @@ pub mod json;
 pub mod merge;
 pub mod temporal;
 pub mod procedure;
+pub mod parallel;
