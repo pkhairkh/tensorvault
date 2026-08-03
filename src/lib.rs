@@ -59,6 +59,7 @@ pub mod memory;
 pub mod planner;
 pub mod protocol;
 pub mod schema;
+pub mod server;
 pub mod sketch;
 pub mod sql;
 pub mod storage;
