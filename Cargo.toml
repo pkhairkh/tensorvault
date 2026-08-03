@@ -64,68 +64,102 @@ memchr = "2"
 [dev-dependencies]
 tempfile = "3.10"
 criterion = { version = "0.5", features = ["html_reports"] }
-# In-process DuckDB for benchmark baseline (Wave 2). `bundled` compiles libduckdb
-# statically so no system libduckdb is required.
-duckdb = { version = "1.1", features = ["bundled"] }
-# In-process ClickHouse for benchmark baseline (Wave 3). Native TCP client to a
-# running clickhouse-server — no CLI subprocess overhead.
-clickhouse = { version = "0.15", features = ["rustls-tls"] }
+# tokio is needed by integration tests for the async server (Wave 2 server mode).
+# Heavy benchmark baselines (DuckDB bundled C++, ClickHouse TCP client) were moved
+# behind an optional `bench-external` feature flag so unit tests don't require
+# compiling ~1 GB of C++ just to run `cargo test --lib`.
 tokio = { version = "1", features = ["full"] }
+
+[features]
+default = []
+# External benchmark baselines. Compile with `--features bench-external` to enable
+# DuckDB (bundled libduckdb C++) and ClickHouse TCP client. Used by examples/bench_*.
+bench-external = ["dep:duckdb", "dep:clickhouse"]
+
+# Optional external benchmark deps (only resolved when `bench-external` is enabled).
+[dependencies.duckdb]
+version = "1.1"
+features = ["bundled"]
+optional = true
+
+[dependencies.clickhouse]
+version = "0.15"
+features = ["rustls-tls"]
+optional = true
 
 [[bench]]
 name = "throughput"
 harness = false
 path = "benches/throughput.rs"
+required-features = ["bench-external"]
 
 [[bench]]
 name = "bench_kernels"
 harness = false
 path = "benches/bench_kernels.rs"
+required-features = ["bench-external"]
 
 [[bench]]
 name = "bench_tpch"
 harness = false
 path = "benches/bench_tpch.rs"
+required-features = ["bench-external"]
 
 [[bench]]
 name = "bench_sketches"
 harness = false
 path = "benches/bench_sketches.rs"
+required-features = ["bench-external"]
 
 [[bench]]
 name = "bench_wcoj"
 harness = false
 path = "benches/bench_wcoj.rs"
+required-features = ["bench-external"]
 
 [[bench]]
 name = "bench_cardinality"
 harness = false
 path = "benches/bench_cardinality.rs"
+required-features = ["bench-external"]
 
 [[bench]]
 name = "bench_planner"
 harness = false
 path = "benches/bench_planner.rs"
+required-features = ["bench-external"]
 
 [[bench]]
 name = "bench_eddy"
 harness = false
 path = "benches/bench_eddy.rs"
+required-features = ["bench-external"]
 
 [[bench]]
 name = "bench_tensor"
 harness = false
 path = "benches/bench_tensor.rs"
+required-features = ["bench-external"]
 
 [[bench]]
 name = "bench_3x_proof"
 harness = false
 path = "benches/bench_3x_proof.rs"
+required-features = ["bench-external"]
 
 [[bench]]
 name = "bench_tpch_full"
 harness = false
 path = "benches/bench_tpch_full.rs"
+required-features = ["bench-external"]
+
+[[example]]
+name = "bench_duckdb_inproc"
+required-features = ["bench-external"]
+
+[[example]]
+name = "bench_clickhouse_inproc"
+required-features = ["bench-external"]
 
 [profile.release]
 opt-level = 3
