@@ -124,6 +124,17 @@ pub const KEYWORDS: &[&str] = &[
     "ALL",
     "OPTION",
     "MAXRECURSION",
+
+    // Window function keywords (Wave 7)
+    "OVER",
+    "PARTITION",
+    "ROWS",
+    "RANGE",
+    "PRECEDING",
+    "FOLLOWING",
+    "CURRENT",
+    "ROW",
+    "NUMBER",
 ];
 
 /// A single SQL token.
