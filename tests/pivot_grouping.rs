@@ -6,7 +6,7 @@ use turbogp::exec::pivot::*;
 fn make_result(names: &[&str], cols: &[Vec<u64>]) -> QueryResult {
     let mut r = QueryResult::empty();
     for (i, name) in names.iter().enumerate() {
-        r.push_column(ResultColumn { name: name.to_string(), values: cols[i].clone() })
+        r.push_column(ResultColumn { name: name.to_string(), values: cols[i].clone(), string_values: None })
             .unwrap();
     }
     r
