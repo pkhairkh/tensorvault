@@ -291,20 +291,41 @@ impl QueryEngine {
         }
 
         // Parse as SELECT.
-        let (query, extensions) = crate::sql::parse_with_extensions(sql).map_err(Error::Parse)?;
+        let (query, extensions) = match crate::sql::parse_with_extensions(sql) {
+            Ok(qe) => qe,
+            Err(_parse_err) => {
+                // The basic parser failed — try the TPC-H interpreter
+                // which has a richer parser (CASE, EXTRACT, subqueries,
+                // HAVING, arithmetic in aggregates, etc.).
+                let mut tpch_result = crate::engine::tpch::parse_and_execute(sql, &self.catalog)?;
+                tpch_result.elapsed_us = start.elapsed().as_micros() as u64;
+                return Ok(tpch_result);
+            }
+        };
 
         // Execute the parsed query.
-        let mut result = execute_select(
+        match execute_select(
             &query,
             &extensions,
             &self.catalog,
             &self.kernel_table,
             &self.cost_model,
-        )?;
-
-        // Stamp the elapsed time.
-        result.elapsed_us = start.elapsed().as_micros() as u64;
-        Ok(result)
+        ) {
+            Ok(mut result) => {
+                result.elapsed_us = start.elapsed().as_micros() as u64;
+                Ok(result)
+            }
+            Err(exec_err) => {
+                // The basic executor failed — try the TPC-H interpreter
+                // as a fallback. This handles queries with features the
+                // basic executor doesn't support (multi-aggregate, HAVING,
+                // CASE WHEN, subqueries, etc.).
+                let mut tpch_result = crate::engine::tpch::parse_and_execute(sql, &self.catalog)
+                    .map_err(|_| exec_err)?;
+                tpch_result.elapsed_us = start.elapsed().as_micros() as u64;
+                Ok(tpch_result)
+            }
+        }
     }
 
     /// Execute a DDL statement (CREATE TABLE, DROP TABLE, CREATE SCHEMA).
