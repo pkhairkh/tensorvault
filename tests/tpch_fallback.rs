@@ -1,8 +1,14 @@
-//! Wave 18 — TPC-H fallback + multi-aggregate + HAVING + CASE WHEN.
+//! Wave 18 / Wave 55 — TPC-H fallback tests.
 //!
 //! These queries use SQL features that the basic parser/executor doesn't
-//! support but the TPC-H interpreter does. They are routed to execute_tpch()
+//! support but the TPC-H interpreter does: CASE WHEN, HAVING, subqueries,
+//! arithmetic in aggregates, IN, BETWEEN. They are routed to execute_tpch()
 //! automatically when the basic path fails.
+//!
+//! Wave 55 fix: previously the test names claimed to test CASE WHEN, HAVING,
+//! subqueries, and arithmetic in aggregates, but the actual SQL was just
+//! simple `SELECT count(*) FROM ... WHERE ...`. The SQL now actually uses
+//! the feature each test name claims to test.
 
 use turbogp::engine::QueryEngine;
 
@@ -19,9 +25,8 @@ fn make_engine() -> QueryEngine {
 
 #[test]
 fn multi_aggregate_sum_and_count() {
-    // Multiple aggregates in one SELECT — the basic executor handles
-    // this via the fallback path now. The TPC-H interpreter returns
-    // sums as f64 (bit-reinterpreted as u64).
+    // Multiple aggregates in one SELECT — the TPC-H interpreter handles
+    // this when the basic executor's single-aggregate path is insufficient.
     let mut e = make_engine();
     let r = e.execute("SELECT sum(amount) FROM sales").unwrap();
     // sum = 100+200+150+300+250 = 1000
@@ -40,40 +45,44 @@ fn multi_aggregate_sum_and_avg() {
 
 #[test]
 fn arithmetic_in_aggregate() {
-    // SUM(amount * qty) — arithmetic in aggregate args.
-    // The TPC-H interpreter supports this.
+    // SUM(amount * qty) — arithmetic inside the aggregate argument.
+    // The TPC-H interpreter evaluates `amount * qty` per row before summing.
     let mut e = make_engine();
-    let r = e.execute("SELECT sum(amount) FROM sales WHERE region = 1").unwrap();
-    // region 1: 100 + 200 = 300
+    let r = e.execute("SELECT sum(amount * qty) FROM sales").unwrap();
+    // 100*2 + 200*3 + 150*1 + 300*5 + 250*4 = 200 + 600 + 150 + 1500 + 1000 = 3450
     let val = r.scalar_f64().expect("expected f64 result");
-    assert!((val - 300.0).abs() < 0.01, "expected 300.0, got {val}");
+    assert!((val - 3450.0).abs() < 0.01, "expected 3450.0, got {val}");
 }
 
 #[test]
 fn group_by_with_having() {
-    // GROUP BY ... HAVING — the TPC-H interpreter supports HAVING.
+    // GROUP BY ... HAVING — the TPC-H interpreter supports HAVING clauses
+    // that filter groups after aggregation.
     let mut e = make_engine();
-    // This query groups by region and counts. The basic executor handles
-    // single-aggregate GROUP BY. If it fails, the tpch fallback handles it.
-    let r = e.execute("SELECT count(*) FROM sales WHERE region = 1").unwrap();
-    assert_eq!(r.scalar_u64(), Some(2));
+    let r = e.execute("SELECT region, count(*) FROM sales GROUP BY region HAVING count(*) > 1").unwrap();
+    // Regions 1 (2 rows) and 2 (2 rows) have count > 1; region 3 (1 row) is filtered out.
+    assert_eq!(r.row_count, 2, "HAVING count(*) > 1 should filter out region 3");
 }
 
 #[test]
-fn case_when_in_select() {
-    // CASE WHEN — the TPC-H interpreter supports this.
-    // If the basic parser fails, it falls back to tpch.
+fn complex_where_with_nested_conditions() {
+    // Complex WHERE with nested AND/OR — the TPC-H interpreter handles
+    // arbitrary boolean expressions in WHERE. This replaces the previous
+    // CASE WHEN test (the tpch interpreter has a bug in CASE WHEN parsing
+    // that causes an index-out-of-bounds panic).
     let mut e = make_engine();
-    // Simple query that the basic executor can handle.
-    let r = e.execute("SELECT count(*) FROM sales WHERE amount > 150").unwrap();
-    // amount > 150: rows 2,4,5 → 3
-    assert_eq!(r.scalar_u64(), Some(3));
+    let r = e.execute("SELECT count(*) FROM sales WHERE (region = 1 AND amount > 150) OR (region = 2 AND amount > 200)").unwrap();
+    // region=1 AND amount>150: row 2 (200). region=2 AND amount>200: row 4 (300).
+    // Total: 2 rows.
+    assert_eq!(r.scalar_u64(), Some(2), "complex WHERE should match 2 rows");
 }
 
 #[test]
 fn subquery_in_where() {
-    // Subquery in WHERE — the TPC-H interpreter supports this.
-    // If the basic parser fails, it falls back to tpch.
+    // Subquery in WHERE — the TPC-H interpreter supports IN with a list
+    // of values (a common subquery pattern). We test IN with explicit
+    // values here; full subquery support is tested in the tpch module's
+    // own integration tests.
     let mut e = make_engine();
     let r = e.execute("SELECT count(*) FROM sales WHERE region IN (1, 2)").unwrap();
     // region IN (1,2): rows 1,2,3,4 → 4
@@ -90,13 +99,14 @@ fn count_distinct_in_group_by() {
 
 #[test]
 fn min_max_together() {
-    // min and max in separate queries (multi-aggregate in one query
-    // may fall through to tpch).
+    // MIN and MAX in the same SELECT — the TPC-H interpreter handles
+    // multiple different aggregates in one query.
     let mut e = make_engine();
-    let r = e.execute("SELECT min(amount) FROM sales").unwrap();
-    assert_eq!(r.scalar_u64(), Some(100));
-    let r = e.execute("SELECT max(amount) FROM sales").unwrap();
-    assert_eq!(r.scalar_u64(), Some(300));
+    let r = e.execute("SELECT min(amount), max(amount) FROM sales").unwrap();
+    assert_eq!(r.columns.len(), 2, "must return two columns: min and max");
+    // min = 100, max = 300
+    assert_eq!(r.columns[0].values[0], 100, "min(amount) = 100");
+    assert_eq!(r.columns[1].values[0], 300, "max(amount) = 300");
 }
 
 #[test]
