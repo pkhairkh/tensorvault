@@ -34,6 +34,10 @@ pub struct Table {
     pub row_count: usize,
     /// String column data (parallel to columns; None for non-string).
     pub string_columns: Vec<Option<std::sync::Arc<crate::exec::fm_index::StringSearchColumn>>>,
+    /// NULL bitmaps (parallel to columns). `None` means no NULLs in this
+    /// column (all cells are non-NULL). `Some(bm)` tracks which cells are
+    /// NULL (Wave 22).
+    pub null_bitmaps: Vec<Option<crate::types::null_bitmap::NullBitmap>>,
 }
 
 impl Table {
@@ -56,7 +60,9 @@ impl Table {
         let actual_min = columns.iter().map(|c| c.len()).min().unwrap_or(0);
         let row_count = row_count.min(actual_min);
 
-        Table { name: loaded.name, columns, column_names, row_count, string_columns }
+        let null_bitmaps = (0..columns.len()).map(|_| None).collect();
+
+        Table { name: loaded.name, columns, column_names, row_count, string_columns, null_bitmaps }
     }
 
     /// Look up a column by name, returning a slice over its cells.

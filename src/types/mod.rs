@@ -29,6 +29,7 @@
 pub mod cxl_ref;
 pub mod datetime;
 pub mod null;
+pub mod null_bitmap;
 pub mod raft_ref;
 pub mod string_col;
 

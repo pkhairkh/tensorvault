@@ -38,6 +38,7 @@ pub fn union_all(left: &Table, right: &Table) -> Result<Table, Error> {
         column_names: left.column_names.clone(),
         row_count: left.row_count + right.row_count,
         string_columns: vec![],
+        null_bitmaps: vec![],
     })
 }
 
@@ -60,6 +61,7 @@ pub fn union_distinct(left: &Table, right: &Table) -> Result<Table, Error> {
         column_names: combined.column_names.clone(),
         row_count: out_cols[0].len(),
         string_columns: vec![],
+        null_bitmaps: vec![],
     })
 }
 
@@ -84,6 +86,7 @@ pub fn intersect(left: &Table, right: &Table) -> Result<Table, Error> {
         column_names: left.column_names.clone(),
         row_count: out_cols[0].len(),
         string_columns: vec![],
+        null_bitmaps: vec![],
     })
 }
 
@@ -108,6 +111,7 @@ pub fn except(left: &Table, right: &Table) -> Result<Table, Error> {
         column_names: left.column_names.clone(),
         row_count: out_cols[0].len(),
         string_columns: vec![],
+        null_bitmaps: vec![],
     })
 }
 
@@ -124,6 +128,7 @@ mod tests {
             column_names: cols.iter().map(|(n, _)| n.to_string()).collect(),
             row_count,
             string_columns: vec![],
+            null_bitmaps: vec![],
         }
     }
 

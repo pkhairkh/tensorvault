@@ -38,6 +38,7 @@ impl JoinResult {
             column_names: self.column_names,
             row_count: self.row_count,
             string_columns: vec![],
+            null_bitmaps: vec![],
         }
     }
 }
@@ -239,6 +240,7 @@ mod tests {
             column_names: cols.iter().map(|(n, _)| n.to_string()).collect(),
             row_count,
             string_columns: vec![],
+            null_bitmaps: vec![],
         }
     }
 
