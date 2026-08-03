@@ -400,8 +400,15 @@ impl PgConn {
             body.extend_from_slice(col.name.as_bytes()); body.push(0);
             body.extend_from_slice(&0u32.to_be_bytes()); // table OID
             body.extend_from_slice(&0u16.to_be_bytes()); // col attr
-            body.extend_from_slice(&20u32.to_be_bytes()); // type OID = int8
-            body.extend_from_slice(&8i16.to_be_bytes());  // type size
+            // Type OID: if the column has string_values, report TEXT (OID 25);
+            // otherwise report INT8 (OID 20). (Wave 34)
+            let (type_oid, type_size) = if col.has_strings() {
+                (25u32, -1i16) // TEXT, variable size
+            } else {
+                (20u32, 8i16)  // INT8, 8 bytes
+            };
+            body.extend_from_slice(&type_oid.to_be_bytes());
+            body.extend_from_slice(&type_size.to_be_bytes());
             body.extend_from_slice(&(-1i32).to_be_bytes()); // type mod
             body.extend_from_slice(&0i16.to_be_bytes()); // format = text
         }
@@ -413,8 +420,26 @@ impl PgConn {
             let mut body = Vec::new();
             body.extend_from_slice(&(r.columns.len() as u16).to_be_bytes());
             for col in &r.columns {
-                let v = col.values.get(row_idx).copied().unwrap_or(0);
-                let s = v.to_string();
+                // If the column has string_values, send the original string.
+                // Otherwise, send the u64 cell as a decimal string. (Wave 34)
+                let s = if let Some(sv) = &col.string_values {
+                    sv.get(row_idx).cloned().unwrap_or_default()
+                } else {
+                    let v = col.values.get(row_idx).copied().unwrap_or(0);
+                    // Check if this might be an f64 (bit-reinterpreted).
+                    // Heuristic: if the value is very large (> 2^60), it's
+                    // likely an f64 bit pattern. Format as f64 in that case.
+                    if v > (1u64 << 60) {
+                        let f = f64::from_bits(v);
+                        if f.is_finite() && f.abs() < 1e15 {
+                            format!("{f}")
+                        } else {
+                            v.to_string()
+                        }
+                    } else {
+                        v.to_string()
+                    }
+                };
                 body.extend_from_slice(&(s.len() as i32).to_be_bytes());
                 body.extend_from_slice(s.as_bytes());
             }
