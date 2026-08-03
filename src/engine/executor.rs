@@ -341,6 +341,21 @@ fn execute_group_by(
     Ok(result)
 }
 
+/// Check if a cell is NULL using the column's NULL bitmap (Wave 33).
+/// Returns true if the cell is NULL, false otherwise.
+/// If no bitmap exists, falls back to checking if the cell value is 0
+/// (the legacy behavior).
+fn is_cell_null(table: &Table, col_idx: usize, row_idx: usize) -> bool {
+    if col_idx < table.null_bitmaps.len() {
+        if let Some(ref bm) = table.null_bitmaps[col_idx] {
+            return bm.is_null(row_idx);
+        }
+    }
+    // Legacy: no bitmap → treat 0 as NULL for COUNT(col) compatibility.
+    // But only for COUNT semantics, not for SUM/AVG (where 0 is a real value).
+    false
+}
+
 fn compute_aggregate(func: &str, arg: &str, indices: &[usize], table: &Table) -> u64 {
     let func_upper = func.to_uppercase();
     match func_upper.as_str() {
@@ -349,38 +364,58 @@ fn compute_aggregate(func: &str, arg: &str, indices: &[usize], table: &Table) ->
                 indices.len() as u64
             } else {
                 let idx = table.column_idx(arg).unwrap_or(0);
-                indices.iter().filter(|&&i| table.columns[idx][i] != 0).count() as u64
+                // COUNT(col) counts non-NULL values. Check the NULL bitmap.
+                indices.iter().filter(|&&i| !is_cell_null(table, idx, i)).count() as u64
             }
         }
         "COUNT_DISTINCT" => {
-            // COUNT(DISTINCT col) — count unique non-zero values.
+            // COUNT(DISTINCT col) — count unique non-NULL values.
             use std::collections::HashSet;
             let idx = table.column_idx(arg).unwrap_or(0);
             let unique: HashSet<u64> = indices
                 .iter()
+                .filter(|&&i| !is_cell_null(table, idx, i))
                 .map(|&i| table.columns[idx][i])
-                .filter(|&v| v != 0)
                 .collect();
             unique.len() as u64
         }
         "SUM" => {
             let idx = table.column_idx(arg).unwrap_or(0);
-            let sum: u64 = indices.iter().map(|&i| table.columns[idx][i]).sum();
-            sum
+            // SUM ignores NULLs (they're stored as 0, so summing them is harmless,
+            // but we should be explicit).
+            indices.iter()
+                .filter(|&&i| !is_cell_null(table, idx, i))
+                .map(|&i| table.columns[idx][i])
+                .sum()
         }
         "AVG" => {
             let idx = table.column_idx(arg).unwrap_or(0);
-            if indices.is_empty() { return 0; }
-            let sum: u64 = indices.iter().map(|&i| table.columns[idx][i]).sum();
-            sum / indices.len() as u64
+            // AVG: sum of non-NULL values / count of non-NULL values.
+            let non_null: Vec<usize> = indices.iter()
+                .filter(|&&i| !is_cell_null(table, idx, i))
+                .copied()
+                .collect();
+            if non_null.is_empty() { return 0; }
+            let sum: u64 = non_null.iter().map(|&i| table.columns[idx][i]).sum();
+            sum / non_null.len() as u64
         }
         "MIN" => {
             let idx = table.column_idx(arg).unwrap_or(0);
-            indices.iter().map(|&i| table.columns[idx][i]).min().unwrap_or(0)
+            // MIN ignores NULLs.
+            indices.iter()
+                .filter(|&&i| !is_cell_null(table, idx, i))
+                .map(|&i| table.columns[idx][i])
+                .min()
+                .unwrap_or(0)
         }
         "MAX" => {
             let idx = table.column_idx(arg).unwrap_or(0);
-            indices.iter().map(|&i| table.columns[idx][i]).max().unwrap_or(0)
+            // MAX ignores NULLs.
+            indices.iter()
+                .filter(|&&i| !is_cell_null(table, idx, i))
+                .map(|&i| table.columns[idx][i])
+                .max()
+                .unwrap_or(0)
         }
         _ => 0,
     }
@@ -532,7 +567,8 @@ fn execute_count(arg: &str, name: &str, where_clause: &WhereClause, table: &Tabl
         indices.len() as u64
     } else {
         let idx = table.column_idx(arg).unwrap_or(0);
-        indices.iter().filter(|&&i| table.columns[idx][i] != 0).count() as u64
+        // COUNT(col) counts non-NULL values — consult the NULL bitmap (Wave 33).
+        indices.iter().filter(|&&i| !is_cell_null(table, idx, i)).count() as u64
     };
     Ok(QueryResult {
         columns: vec![ResultColumn { name: name.into(), values: vec![count] , string_values: None }],

@@ -137,32 +137,55 @@ fn execute_shape(shape: QueryShape, query: &SelectQuery, table: &Table) -> Resul
         }
         QueryShape::CountFilter => {
             let mask = build_filter_mask(query, table)?;
-            let count = vectorized::count_masked(&mask);
+            // For COUNT(col) (not COUNT(*)), exclude NULL values (Wave 33).
+            let (func, arg) = if let SelectItem::Aggregate { func, arg, .. } = &query.select[0] {
+                (func.to_uppercase(), arg.clone())
+            } else {
+                (String::new(), String::new())
+            };
+            let count = if func == "COUNT" && arg != "*" {
+                let col_idx = resolve_col_name(&arg, table).unwrap_or(0);
+                let mut count = 0u64;
+                for (i, &m) in mask.iter().enumerate() {
+                    if m && !is_cell_null_dispatch(table, col_idx, i) {
+                        count += 1;
+                    }
+                }
+                count
+            } else {
+                vectorized::count_masked(&mask)
+            };
             Ok(single_value("count", count))
         }
         QueryShape::SumCol => {
             let mask = build_filter_mask(query, table)?;
             let col_idx = resolve_agg_col(&query.select[0], table)?;
-            let sum = vectorized::sum_masked(&table.columns[col_idx], &mask);
+            // Exclude NULLs (Wave 33).
+            let null_adjusted_mask = adjust_mask_for_nulls(&mask, table, col_idx);
+            let sum = vectorized::sum_masked(&table.columns[col_idx], &null_adjusted_mask);
             Ok(single_value("sum", sum))
         }
         QueryShape::AvgCol => {
             let mask = build_filter_mask(query, table)?;
             let col_idx = resolve_agg_col(&query.select[0], table)?;
-            let avg = vectorized::avg_masked(&table.columns[col_idx], &mask);
+            // Exclude NULLs (Wave 33).
+            let null_adjusted_mask = adjust_mask_for_nulls(&mask, table, col_idx);
+            let avg = vectorized::avg_masked(&table.columns[col_idx], &null_adjusted_mask);
             Ok(single_value("avg", avg))
         }
         QueryShape::MinMax => {
             let mask = build_filter_mask(query, table)?;
             let col_idx = resolve_agg_col(&query.select[0], table)?;
+            // Exclude NULLs (Wave 33).
+            let null_adjusted_mask = adjust_mask_for_nulls(&mask, table, col_idx);
             let func = if let SelectItem::Aggregate { func, .. } = &query.select[0] {
                 func.to_uppercase()
             } else {
                 return Err(Error::Other("expected aggregate".into()));
             };
             let val = match func.as_str() {
-                "MIN" => vectorized::min_masked(&table.columns[col_idx], &mask),
-                "MAX" => vectorized::max_masked(&table.columns[col_idx], &mask),
+                "MIN" => vectorized::min_masked(&table.columns[col_idx], &null_adjusted_mask),
+                "MAX" => vectorized::max_masked(&table.columns[col_idx], &null_adjusted_mask),
                 _ => return Err(Error::Other(format!("unsupported: {func}"))),
             };
             Ok(single_value(&func.to_lowercase(), val))
@@ -170,7 +193,9 @@ fn execute_shape(shape: QueryShape, query: &SelectQuery, table: &Table) -> Resul
         QueryShape::CountDistinct => {
             let mask = build_filter_mask(query, table)?;
             let col_idx = resolve_agg_col(&query.select[0], table)?;
-            let count = vectorized::count_distinct_masked(&table.columns[col_idx], &mask);
+            // Exclude NULLs (Wave 33).
+            let null_adjusted_mask = adjust_mask_for_nulls(&mask, table, col_idx);
+            let count = vectorized::count_distinct_masked(&table.columns[col_idx], &null_adjusted_mask);
             Ok(single_value("count", count))
         }
         QueryShape::GroupByCount | QueryShape::GroupBySum | QueryShape::GroupByOrderByLimit => {
@@ -816,6 +841,30 @@ fn execute_string_group_by(
     }
 
     Ok(QueryResult { columns: result_cols, row_count, elapsed_us: 0 })
+}
+
+// -----------------------------------------------------------------------
+// NULL bitmap helpers (Wave 33)
+// -----------------------------------------------------------------------
+
+/// Check if a cell is NULL using the column's NULL bitmap.
+fn is_cell_null_dispatch(table: &Table, col_idx: usize, row_idx: usize) -> bool {
+    if col_idx < table.null_bitmaps.len() {
+        if let Some(ref bm) = table.null_bitmaps[col_idx] {
+            return bm.is_null(row_idx);
+        }
+    }
+    false
+}
+
+/// Adjust a filter mask to also exclude NULL values for a given column.
+/// Returns a new mask where `true` = (matches filter AND not NULL).
+fn adjust_mask_for_nulls(mask: &[bool], table: &Table, col_idx: usize) -> Vec<bool> {
+    if col_idx >= table.null_bitmaps.len() || table.null_bitmaps[col_idx].is_none() {
+        return mask.to_vec();
+    }
+    let bm = table.null_bitmaps[col_idx].as_ref().unwrap();
+    mask.iter().enumerate().map(|(i, &m)| m && !bm.is_null(i)).collect()
 }
 
 #[cfg(test)]
