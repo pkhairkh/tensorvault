@@ -265,6 +265,10 @@ fn build_filter_mask(query: &SelectQuery, table: &Table) -> Result<Vec<bool>> {
             if let Some(mask) = try_string_like_filter(expr, table) {
                 return Ok(mask);
             }
+            // Wave 42: Check for range predicates on string columns.
+            if let Some(mask) = eval_predicate_mask(expr, table) {
+                return Ok(mask);
+            }
             // Fall back to vectorized u64 filter
             let indices = vectorized::filter_rows(&table.columns, &table.column_names, table.row_count, expr);
             let mut mask = vec![false; table.row_count];
@@ -345,6 +349,31 @@ fn eval_predicate_mask(expr: &crate::sql::parser::Expr, table: &Table) -> Option
             let col_idx = resolve_col_name(&col_name, table).ok()?;
             if col_idx >= table.columns.len() { return None; }
             let col = &table.columns[col_idx];
+
+            // Wave 42: For range predicates (<, >, <=, >=) on string columns
+            // with a StringSearchColumn sidecar, compare the original strings
+            // lexicographically instead of comparing u64 hashes.
+            if matches!(op_upper.as_str(), "<" | ">" | "<=" | ">=") {
+                if let Value::String(ref s) = val {
+                    if col_idx < table.string_columns.len() {
+                        if let Some(ref sc) = table.string_columns[col_idx] {
+                            let mask: Vec<bool> = (0..table.row_count).map(|i| {
+                                let cell_str = sc.get(i);
+                                match op_upper.as_str() {
+                                    "<" => cell_str < s.as_str(),
+                                    ">" => cell_str > s.as_str(),
+                                    "<=" => cell_str <= s.as_str(),
+                                    ">=" => cell_str >= s.as_str(),
+                                    _ => false,
+                                }
+                            }).collect();
+                            return Some(mask);
+                        }
+                    }
+                }
+            }
+
+            // For = and != on string columns, use hash comparison (works probabilistically).
             let cell = match &val {
                 Value::Int(i) => *i as u64,
                 Value::Float(f) => f.to_bits(),
