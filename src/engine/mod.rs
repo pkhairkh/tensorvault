@@ -88,6 +88,10 @@ pub struct QueryEngine {
     cost_model: CostModel,
     /// Transaction manager for BEGIN/COMMIT/ROLLBACK (Wave 5).
     txn_manager: crate::txn::TxnManager,
+    /// Index manager for secondary indexes (Wave 31).
+    pub index_manager: crate::index::manager::IndexManager,
+    /// Hash column registry for materialized string hashes (Wave 31).
+    pub hash_registry: crate::exec::hash_column::HashColumnRegistry,
 }
 
 impl QueryEngine {
@@ -113,6 +117,8 @@ impl QueryEngine {
             kernel_table: Arc::new(KernelTable::new()),
             cost_model: CostModel::default(),
             txn_manager: crate::txn::TxnManager::new(),
+            index_manager: crate::index::manager::IndexManager::new(),
+            hash_registry: crate::exec::hash_column::HashColumnRegistry::new(),
         }
     }
 
@@ -247,6 +253,21 @@ impl QueryEngine {
     pub fn load_csv(&mut self, path: &str, table_name: &str, has_header: bool) -> Result<usize> {
         let loaded = read_csv(path, has_header).map_err(|e| Error::Other(e.to_string()))?;
         let row_count = loaded.row_count;
+
+        // Materialize hash columns for string columns (Wave 31).
+        // This pre-computes xxh3 hashes so GROUP BY doesn't re-hash per query.
+        for col in &loaded.columns {
+            if col.string_search.is_some() {
+                // The cells are already xxh3 hashes (computed by the CSV reader).
+                // Register them as a HashColumn so GROUP BY can use the pre-computed
+                // hashes instead of re-hashing per query.
+                let hash_col = crate::exec::hash_column::HashColumn {
+                    hashes: col.cells.clone(),
+                };
+                self.hash_registry.register(table_name, &col.name, hash_col);
+            }
+        }
+
         let mut table = Table::from_loaded(loaded);
         table.name = table_name.to_string();
         self.catalog.register(table);
