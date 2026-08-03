@@ -98,17 +98,37 @@ pub fn execute_select(
     // 3. Pick the memory tier
     let tier = pick_tier(extensions);
 
-    // 4. Execute based on select-list shape
-    let result = if !query.group_by.is_empty() {
+    // 4. Execute based on select-list shape.
+    //
+    // Wave 53: if the SELECT list contains window functions, strip them
+    // before executing. The caller (execute_inner) will apply the window
+    // functions as a post-processing step via apply_window_functions().
+    // If ALL select items are window functions, default to Star so the
+    // base rows are still returned.
+    let has_window = query.select.iter().any(|s| matches!(s, SelectItem::Window { .. }));
+    let effective_query: crate::sql::parser::SelectQuery;
+    let query_ref: &crate::sql::parser::SelectQuery = if has_window {
+        let mut stripped = query.clone();
+        stripped.select.retain(|s| !matches!(s, SelectItem::Window { .. }));
+        if stripped.select.is_empty() {
+            stripped.select.push(SelectItem::Star);
+        }
+        effective_query = stripped;
+        &effective_query
+    } else {
+        query
+    };
+
+    let result = if !query_ref.group_by.is_empty() {
         // GROUP BY query
-        execute_group_by(query, &filter, table, tier, kernel_table)?
-    } else if query.select.len() == 1 {
-        match &query.select[0] {
+        execute_group_by(query_ref, &filter, table, tier, kernel_table)?
+    } else if query_ref.select.len() == 1 {
+        match &query_ref.select[0] {
             SelectItem::Aggregate { func, arg, alias } => {
                 execute_aggregate(func, arg, alias.as_deref(), &filter, table, tier, kernel_table)?
             }
-            SelectItem::Star => execute_select_star(&filter, table, query.limit)?,
-            SelectItem::Column(name) => execute_select_column(name, &filter, table, query.limit)?,
+            SelectItem::Star => execute_select_star(&filter, table, query_ref.limit)?,
+            SelectItem::Column(name) => execute_select_column(name, &filter, table, query_ref.limit)?,
             // `SELECT <int>` — emit a single-row, single-column literal.
             SelectItem::Literal(v) => {
                 QueryResult {
@@ -120,27 +140,27 @@ pub fn execute_select(
                     elapsed_us: 0,
                 }
             }
-            // Window functions are handled by the tpch fallback.
+            // Window functions are stripped above; this branch is unreachable.
             SelectItem::Window { .. } => {
-                return Err(Error::Other("window function in execute_select — should use tpch fallback".into()));
+                return Err(Error::Other("internal: window item not stripped".into()));
             }
         }
-    } else if query.select.len() > 1 {
+    } else if query_ref.select.len() > 1 {
         // Multi-column select (could be columns or column+aggregate without GROUP BY)
-        let has_agg = query.select.iter().any(|s| matches!(s, SelectItem::Aggregate { .. }));
+        let has_agg = query_ref.select.iter().any(|s| matches!(s, SelectItem::Aggregate { .. }));
         if has_agg {
             // Treat as implicit GROUP BY (aggregate without group = single row)
-            execute_aggregate_no_group(&query.select, &filter, table, tier, kernel_table)?
+            execute_aggregate_no_group(&query_ref.select, &filter, table, tier, kernel_table)?
         } else {
-            execute_select_multi(&query.select, &filter, table, query.order_by.as_slice(), query.limit)?
+            execute_select_multi(&query_ref.select, &filter, table, query_ref.order_by.as_slice(), query_ref.limit)?
         }
     } else {
         return Err(Error::Other("empty SELECT list".into()));
     };
 
     // 5. Apply ORDER BY if needed (for non-group-by queries)
-    let result = if !query.order_by.is_empty() && query.group_by.is_empty() {
-        apply_order_by(result, &query.order_by, table)?
+    let result = if !query_ref.order_by.is_empty() && query_ref.group_by.is_empty() {
+        apply_order_by(result, &query_ref.order_by, table)?
     } else {
         result
     };

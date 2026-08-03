@@ -446,8 +446,11 @@ impl Parser {
                 _ => break,
             }
         }
+        // Wave 53: allow empty args for no-argument window functions like
+        // ROW_NUMBER() and DENSE_RANK(). Previously this returned an error,
+        // which meant `SELECT ROW_NUMBER() OVER (...) FROM t` couldn't parse.
         if parts.is_empty() {
-            return Err(format!("expected aggregate argument, got {:?}", self.peek()));
+            return Ok(String::new());
         }
         Ok(parts.join(" "))
     }

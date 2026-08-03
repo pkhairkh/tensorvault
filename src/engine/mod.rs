@@ -68,6 +68,7 @@ use crate::datasource::{read_csv, read_parquet, read_parquet_column, read_parque
 use crate::error::{Error, Result};
 use crate::kernel::KernelTable;
 use crate::planner::CostModel;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -94,6 +95,15 @@ pub struct QueryEngine {
     pub index_manager: crate::index::manager::IndexManager,
     /// Hash column registry for materialized string hashes (Wave 31).
     pub hash_registry: crate::exec::hash_column::HashColumnRegistry,
+    /// View registry: CREATE VIEW / DROP VIEW / view expansion (Wave 53).
+    pub views: crate::catalog::views::ViewRegistry,
+    /// Stored procedure registry: CREATE PROCEDURE / EXEC (Wave 53).
+    pub procedures: crate::exec::procedure::ProcedureRegistry,
+    /// Table-valued parameter types (Wave 53).
+    pub table_types: crate::exec::procedure::TableTypeRegistry,
+    /// Temporal tables: maps table name → TemporalTable for FOR SYSTEM_TIME
+    /// queries (Wave 53).
+    pub temporals: HashMap<String, crate::exec::temporal::TemporalTable>,
 }
 
 impl QueryEngine {
@@ -184,6 +194,10 @@ impl QueryEngine {
             wal: None,
             index_manager: crate::index::manager::IndexManager::new(),
             hash_registry: crate::exec::hash_column::HashColumnRegistry::new(),
+            views: crate::catalog::views::ViewRegistry::new(),
+            procedures: crate::exec::procedure::ProcedureRegistry::new(),
+            table_types: crate::exec::procedure::TableTypeRegistry::new(),
+            temporals: HashMap::new(),
         }
     }
 
@@ -481,12 +495,72 @@ impl QueryEngine {
     /// INTO nonexistent) would still leave a record in the WAL — and
     /// replay would fail on restart.
     fn execute_inner(&mut self, sql: &str, start: &Instant, txn_id: Option<u64>) -> Result<QueryResult> {
+        // Wave 53: Temporal query — FOR SYSTEM_TIME AS OF <timestamp>.
+        // Check this FIRST because the basic lexer fails on very large
+        // integer timestamps (u64 values that overflow i64), which would
+        // cause the DDL/DML parsers to error before we reach this check.
+        if let Some((table_name, timestamp)) = parse_for_system_time(sql) {
+            if let Some(temporal) = self.temporals.get(&table_name) {
+                let rows = temporal.query_as_of(timestamp);
+                return Ok(rows_to_query_result(&rows, &temporal.column_names, start));
+            }
+        }
+
         // Try CTE (WITH ... SELECT ...) first.
         if let Some(with_result) = crate::sql::parse_with(sql) {
             let with = with_result.map_err(Error::Parse)?;
             let mut result = self.execute_with(with, txn_id)?;
             result.elapsed_us = start.elapsed().as_micros() as u64;
             return Ok(result);
+        }
+
+        // Wave 53: View DDL — CREATE VIEW / DROP VIEW.
+        if let Some(parsed) = crate::catalog::views::parse_create_view(sql) {
+            let view = parsed.map_err(Error::Other)?;
+            self.views.create(view);
+            let mut result = QueryResult::empty();
+            result.row_count = 0;
+            result.elapsed_us = start.elapsed().as_micros() as u64;
+            return Ok(result);
+        }
+        if let Some(parsed) = crate::catalog::views::parse_drop_view(sql) {
+            let (name, _if_exists) = parsed.map_err(Error::Other)?;
+            self.views.drop(&name);
+            let mut result = QueryResult::empty();
+            result.elapsed_us = start.elapsed().as_micros() as u64;
+            return Ok(result);
+        }
+
+        // Wave 53: Stored procedure DDL — CREATE PROCEDURE / CREATE FUNCTION.
+        if let Some(parsed) = crate::exec::procedure::parse_create_procedure(sql) {
+            let proc_def = parsed.map_err(Error::Other)?;
+            self.procedures.create(proc_def);
+            let mut result = QueryResult::empty();
+            result.elapsed_us = start.elapsed().as_micros() as u64;
+            return Ok(result);
+        }
+
+        // Wave 53: EXEC procedure_name [args].
+        if let Some(parsed) = crate::exec::procedure::parse_exec(sql) {
+            let (proc_name, args) = parsed.map_err(Error::Other)?;
+            let proc_def = self.procedures.get(&proc_name)
+                .ok_or_else(|| Error::NotFound(format!("procedure \"{proc_name}\"")))?
+                .clone();
+            // Substitute @param references in the body with the arg values.
+            let body = substitute_proc_params(&proc_def.body, &args);
+            // Re-execute the body SQL. If it's multi-statement, split on ';'
+            // and execute each one, returning the last result.
+            let mut last_result = QueryResult::empty();
+            for stmt in body.split(';').filter(|s| !s.trim().is_empty()) {
+                last_result = self.execute(stmt)?;
+            }
+            last_result.elapsed_us = start.elapsed().as_micros() as u64;
+            return Ok(last_result);
+        }
+
+        // Wave 53: MERGE statement.
+        if let Some(merge) = parse_merge(sql) {
+            return self.execute_merge_stmt(merge, start);
         }
 
         // Try DDL first (CREATE TABLE, DROP TABLE, CREATE SCHEMA).
@@ -508,18 +582,28 @@ impl QueryEngine {
             return Ok(result);
         }
 
+        // Wave 53: expand view references in the SQL before parsing as SELECT.
+        // If the FROM clause references a view name, we materialize the view
+        // by executing its SELECT SQL and registering the result as a
+        // catalog table under the view's name (overwriting any prior
+        // materialization). The outer SELECT then runs against the
+        // materialized table.
+        let expanded_sql = self.materialize_views_in_sql(sql);
+
         // Parse as SELECT.
-        let (query, extensions) = match crate::sql::parse_with_extensions(sql) {
+        let (query, extensions) = match crate::sql::parse_with_extensions(&expanded_sql) {
             Ok(qe) => qe,
             Err(_parse_err) => {
                 // The basic parser failed — try the TPC-H interpreter
                 // which has a richer parser (CASE, EXTRACT, subqueries,
                 // HAVING, arithmetic in aggregates, etc.).
-                let mut tpch_result = crate::engine::tpch::parse_and_execute(sql, &self.catalog)?;
+                let mut tpch_result = crate::engine::tpch::parse_and_execute(&expanded_sql, &self.catalog)?;
                 tpch_result.elapsed_us = start.elapsed().as_micros() as u64;
                 return Ok(tpch_result);
             }
         };
+
+        // Wave 53: Temporal query handling is done above (before parsing).
 
         // Execute the parsed query.
         match execute_select(
@@ -530,6 +614,15 @@ impl QueryEngine {
             &self.cost_model,
         ) {
             Ok(mut result) => {
+                // Wave 53: apply window functions if any SelectItem::Window
+                // is present in the query.
+                if query.select.iter().any(|s| matches!(s, crate::sql::parser::SelectItem::Window { .. })) {
+                    result = apply_window_functions(&result, &query);
+                }
+                // Wave 53: apply PIVOT if the extensions carry a pivot spec.
+                if let Some(pivot_spec) = extensions_pivot(&extensions) {
+                    result = apply_pivot(&result, &pivot_spec);
+                }
                 result.elapsed_us = start.elapsed().as_micros() as u64;
                 Ok(result)
             }
@@ -538,7 +631,7 @@ impl QueryEngine {
                 // as a fallback. This handles queries with features the
                 // basic executor doesn't support (multi-aggregate, HAVING,
                 // CASE WHEN, subqueries, etc.).
-                let mut tpch_result = crate::engine::tpch::parse_and_execute(sql, &self.catalog)
+                let mut tpch_result = crate::engine::tpch::parse_and_execute(&expanded_sql, &self.catalog)
                     .map_err(|_| exec_err)?;
                 tpch_result.elapsed_us = start.elapsed().as_micros() as u64;
                 Ok(tpch_result)
@@ -1615,3 +1708,333 @@ mod tests {
     }
 }
 pub mod dispatch;
+
+// -----------------------------------------------------------------------
+// Wave 53 helper functions: wire views, procedures, MERGE, JSON,
+// temporal, window, PIVOT into execute().
+// -----------------------------------------------------------------------
+
+/// Substitute @param references in a stored-procedure body with the
+/// supplied argument values. @1 → args[0], @2 → args[1], etc., and
+/// named params @name → args[i] where proc_def.params[i].name == name.
+fn substitute_proc_params(body: &str, args: &[String]) -> String {
+    let mut result = body.to_string();
+    // Positional substitution: @1, @2, ... → args[0], args[1], ...
+    for (i, arg) in args.iter().enumerate() {
+        let placeholder = format!("@{}", i + 1);
+        result = result.replace(&placeholder, arg);
+    }
+    result
+}
+
+/// Parse a MERGE statement (Wave 53 wiring for exec/merge.rs).
+///
+/// Supports the simplified form:
+///   MERGE INTO target AS t
+///   USING (VALUES (1, 'a'), (2, 'b')) AS s (id, val)
+///   ON t.id = s.id
+///   WHEN MATCHED THEN UPDATE SET col = val
+///   WHEN NOT MATCHED THEN INSERT (cols) VALUES (vals)
+///
+/// Returns None if the SQL is not a MERGE statement.
+fn parse_merge(sql: &str) -> Option<crate::exec::merge::Merge> {
+    use crate::exec::merge::{Merge, MergeAction};
+    let trimmed = sql.trim();
+    let upper = trimmed.to_uppercase();
+    if !upper.starts_with("MERGE ") && !upper.starts_with("MERGE INTO ") {
+        return None;
+    }
+
+    // Very small parser: extract target table name (first identifier after
+    // MERGE [INT]). Then look for WHEN MATCHED / WHEN NOT MATCHED clauses.
+    let after_merge = if upper.starts_with("MERGE INTO ") {
+        &trimmed["MERGE INTO ".len()..]
+    } else {
+        &trimmed["MERGE ".len()..]
+    };
+
+    // Target table name is the first whitespace-delimited token (optionally
+    // followed by `AS alias`).
+    let target = after_merge.split_whitespace().next()?.to_string();
+
+    // Look for WHEN MATCHED THEN UPDATE SET col = val, ...
+    let mut when_matched: Option<MergeAction> = None;
+    let mut when_not_matched_by_target: Option<MergeAction> = None;
+
+    // Lowercase for case-insensitive matching.
+    let lower = trimmed.to_lowercase();
+    if let Some(pos) = lower.find("when matched then update set") {
+        let after = &trimmed[pos + "when matched then update set".len()..];
+        let assigns_str = after.split_whitespace().next().unwrap_or("");
+        // Parse `col = val` pairs separated by commas.
+        let assigns: Vec<(String, String)> = assigns_str
+            .trim_end_matches(';')
+            .split(',')
+            .filter_map(|pair| {
+                let mut parts = pair.split('=');
+                let col = parts.next()?.trim().to_string();
+                let val = parts.next()?.trim().to_string();
+                Some((col, val))
+            })
+            .collect();
+        if !assigns.is_empty() {
+            when_matched = Some(MergeAction::Update(assigns));
+        }
+    }
+    if let Some(pos) = lower.find("when not matched then insert") {
+        let after = &trimmed[pos + "when not matched then insert".len()..];
+        // Parse `(col1, col2) VALUES (val1, val2)` — best-effort.
+        if let Some(open) = after.find('(') {
+            if let Some(close) = after.find(')') {
+                let cols: Vec<String> = after[open+1..close]
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .collect();
+                if let Some(vals_pos) = after[close..].to_lowercase().find("values") {
+                    let vals_str = &after[close + vals_pos + "values".len()..];
+                    if let Some(v_open) = vals_str.find('(') {
+                        if let Some(v_close) = vals_str.find(')') {
+                            let vals: Vec<String> = vals_str[v_open+1..v_close]
+                                .split(',')
+                                .map(|s| s.trim().to_string())
+                                .collect();
+                            when_not_matched_by_target = Some(MergeAction::Insert(cols, vals));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Some(Merge {
+        target,
+        source_rows: Vec::new(),
+        join_target_col: String::new(),
+        join_source_col: String::new(),
+        when_matched,
+        when_not_matched_by_source: None,
+        when_not_matched_by_target,
+    })
+}
+
+impl QueryEngine {
+    /// Wave 53: Materialize views referenced in a SQL string.
+    ///
+    /// For each view name in the registry, if the SQL contains `FROM view_name`,
+    /// execute the view's SELECT SQL and register the result as a catalog
+    /// table under the view's name. The outer SELECT then runs against the
+    /// materialized table. This is a simple (non-incremental) materialization
+    /// strategy — every query against a view re-runs the view's SELECT.
+    fn materialize_views_in_sql(&mut self, sql: &str) -> String {
+        let lower = sql.to_lowercase();
+        // Collect view names that appear in the SQL before mutating self.
+        let view_names: Vec<String> = self.views.names()
+            .into_iter()
+            .map(|s| s.to_string())
+            .filter(|view_name| {
+                let pattern = format!("from {}", view_name.to_lowercase());
+                lower.contains(&pattern)
+            })
+            .collect();
+        // Now materialize each view. We collect (name, select_sql) pairs
+        // first to release the immutable borrow on self.views before we
+        // call self.execute_inner (which needs &mut self).
+        let view_specs: Vec<(String, String)> = view_names.into_iter()
+            .filter_map(|name| {
+                self.views.get(&name).map(|v| (name, v.select_sql.clone()))
+            })
+            .collect();
+        for (view_name, select_sql) in view_specs {
+            if let Ok(result) = self.execute_inner(&select_sql, &Instant::now(), None) {
+                let table = result_to_table(&view_name, &result);
+                self.catalog.register(table);
+            }
+        }
+        sql.to_string()
+    }
+
+    /// Execute a MERGE statement against a catalog table (Wave 53 wiring
+    /// for exec/merge.rs). The target table is loaded into a QueryResult,
+    /// `execute_merge` is applied, and the result is written back to the
+    /// catalog.
+    fn execute_merge_stmt(
+        &mut self,
+        merge: crate::exec::merge::Merge,
+        start: &Instant,
+    ) -> Result<QueryResult> {
+        let target_name = merge.target.clone();
+        // Load the target table into a QueryResult.
+        let table = self.catalog.get(&target_name)
+            .ok_or_else(|| Error::NotFound(format!("MERGE target table \"{target_name}\"")))?
+            .clone();
+        let mut qr = table_to_query_result(&table);
+
+        let merge_result = crate::exec::merge::execute_merge(&mut qr, &merge);
+
+        // Write the mutated QueryResult back into the catalog table.
+        let new_table = query_result_to_table(&target_name, &qr);
+        self.catalog.register(new_table);
+
+        let mut result = QueryResult::empty();
+        result.row_count = merge_result.inserted + merge_result.updated + merge_result.deleted;
+        result.elapsed_us = start.elapsed().as_micros() as u64;
+        Ok(result)
+    }
+}
+
+/// Convert a `Table` into a `QueryResult` so `execute_merge` can operate
+/// on it.
+fn table_to_query_result(table: &Table) -> QueryResult {
+    let columns: Vec<ResultColumn> = table.column_names.iter().enumerate().map(|(i, name)| {
+        ResultColumn {
+            name: name.clone(),
+            values: table.columns[i].to_vec(),
+            string_values: None,
+            type_oid: 0,
+            null_mask: None,
+        }
+    }).collect();
+    QueryResult {
+        columns,
+        row_count: table.row_count,
+        elapsed_us: 0,
+    }
+}
+
+/// Convert a `QueryResult` back into a `Table` (round-trip after merge).
+fn query_result_to_table(name: &str, qr: &QueryResult) -> Table {
+    let columns: Vec<std::sync::Arc<Vec<u64>>> = qr.columns.iter()
+        .map(|c| std::sync::Arc::new(c.values.clone()))
+        .collect();
+    let column_names: Vec<String> = qr.columns.iter().map(|c| c.name.clone()).collect();
+    Table {
+        name: name.to_string(),
+        columns,
+        column_names,
+        row_count: qr.row_count,
+        string_columns: vec![],
+        null_bitmaps: vec![],
+        schema: None,
+    }
+}
+
+/// Parse `FOR SYSTEM_TIME AS OF <timestamp>` from a SQL string.
+/// Returns (table_name, timestamp) if the clause is present.
+///
+/// SQL syntax: `SELECT ... FROM table_name FOR SYSTEM_TIME AS OF <ts>`
+/// The table name appears between FROM and FOR SYSTEM_TIME.
+fn parse_for_system_time(sql: &str) -> Option<(String, u64)> {
+    let lower = sql.to_lowercase();
+    let pos = lower.find("for system_time as of")?;
+    // The timestamp is everything after "FOR SYSTEM_TIME AS OF" up to the
+    // next non-digit character.
+    let after = &sql[pos + "for system_time as of".len()..];
+    let after_trimmed = after.trim_start();
+    let ts_end = after_trimmed.find(|c: char| !c.is_ascii_digit()).unwrap_or(after_trimmed.len());
+    if ts_end == 0 {
+        return None;
+    }
+    let timestamp: u64 = after_trimmed[..ts_end].parse().ok()?;
+
+    // The table name is between FROM and FOR SYSTEM_TIME. Look at the
+    // substring before "FOR SYSTEM_TIME AS OF".
+    let before = &sql[..pos];
+    let before_lower = before.to_lowercase();
+    let from_pos = before_lower.rfind("from ")?;
+    let after_from = &before[from_pos + "from ".len()..];
+    // The table name is the first whitespace-delimited token (optionally
+    // followed by WHERE/ORDER/etc.).
+    let table_name = after_from.split_whitespace().next()?.to_string();
+    Some((table_name, timestamp))
+}
+
+/// Convert temporal-table rows (Vec<Vec<u64>>) into a QueryResult.
+fn rows_to_query_result(rows: &[Vec<u64>], column_names: &[String], start: &Instant) -> QueryResult {
+    let row_count = rows.len();
+    let n_cols = column_names.len();
+    let columns: Vec<ResultColumn> = (0..n_cols).map(|i| {
+        let values: Vec<u64> = rows.iter().map(|r| r.get(i).copied().unwrap_or(0)).collect();
+        ResultColumn {
+            name: column_names[i].clone(),
+            values,
+            string_values: None,
+            type_oid: 0,
+            null_mask: None,
+        }
+    }).collect();
+    QueryResult {
+        columns,
+        row_count,
+        elapsed_us: start.elapsed().as_micros() as u64,
+    }
+}
+
+/// Apply window functions to a QueryResult (Wave 53 wiring for
+/// exec/window.rs). Detects `SelectItem::Window` items in the query and
+/// appends a new ResultColumn for each.
+fn apply_window_functions(result: &QueryResult, query: &crate::sql::parser::SelectQuery) -> QueryResult {
+    use crate::exec::window::{parse_window_spec, row_number, rank, dense_rank, sum_over, count_over};
+    use crate::sql::parser::SelectItem;
+
+    let mut new_cols: Vec<ResultColumn> = result.columns.clone();
+    for item in &query.select {
+        if let SelectItem::Window { func, arg, over_spec, alias } = item {
+            let spec = match parse_window_spec(over_spec) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let func_upper = func.to_uppercase();
+            let name = alias.clone().unwrap_or_else(|| func.to_lowercase());
+            let values = match func_upper.as_str() {
+                "ROW_NUMBER" => row_number(result, &spec),
+                "RANK" => rank(result, &spec),
+                "DENSE_RANK" => dense_rank(result, &spec),
+                "SUM" => sum_over(result, arg, &spec),
+                "COUNT" => count_over(result, &spec),
+                _ => continue,
+            };
+            new_cols.push(ResultColumn {
+                name,
+                values,
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            });
+        }
+    }
+    QueryResult {
+        columns: new_cols,
+        row_count: result.row_count,
+        elapsed_us: result.elapsed_us,
+    }
+}
+
+/// Stub for parsing PIVOT/UNPIVOT from QueryExtensions. The current
+/// `QueryExtensions` type doesn't carry pivot specs, so this always
+/// returns None. A future wave can extend `QueryExtensions` to parse
+/// `PIVOT (SUM(x) FOR q IN [Q1, Q2])` and return a `PivotSpec`.
+fn extensions_pivot(_ext: &crate::sql::extensions::QueryExtensions) -> Option<PivotSpec> {
+    None
+}
+
+/// A parsed PIVOT specification (Wave 53).
+struct PivotSpec {
+    group_col: String,
+    pivot_col: String,
+    value_col: String,
+    pivot_values: Vec<String>,
+    agg: String,
+}
+
+/// Apply a PIVOT transformation to a QueryResult (Wave 53 wiring for
+/// exec/pivot.rs).
+fn apply_pivot(result: &QueryResult, spec: &PivotSpec) -> QueryResult {
+    crate::exec::pivot::pivot(
+        result,
+        &spec.group_col,
+        &spec.pivot_col,
+        &spec.value_col,
+        &spec.pivot_values,
+        &spec.agg,
+    )
+}
