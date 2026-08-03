@@ -24,9 +24,16 @@ pub enum MergeAction {
 pub struct Merge {
     /// Target table name.
     pub target: String,
-    /// Source: (table_name, join_column, value) rows to merge.
-    /// For simplicity, the source is inline values rather than a subquery.
+    /// Source: (join_key, full_row) tuples to merge. The join_key is the
+    /// stringified value of the join column; the full_row carries all source
+    /// column values in `source_col_names` order.
     pub source_rows: Vec<(String, Vec<String>)>,
+    /// Names of the source columns (parallel to each row in `source_rows`).
+    /// Used to resolve `source.col` references in INSERT/UPDATE actions.
+    /// Wave 56a: previously this field did not exist, so `source.col`
+    /// references in WHEN NOT MATCHED THEN INSERT ... VALUES (source.col, ...)
+    /// could not be resolved and the insert always wrote 0.
+    pub source_col_names: Vec<String>,
     /// Join condition: target.col = source.col.
     pub join_target_col: String,
     pub join_source_col: String,
@@ -93,6 +100,12 @@ pub fn iif<'a>(condition: bool, true_val: &'a str, false_val: &'a str) -> &'a st
 /// This is a simplified implementation that operates on QueryResult
 /// rather than the live catalog — the engine's execute_merge method
 /// will call this with the target table's data.
+///
+/// Wave 56a: now resolves `source.col` references in INSERT/UPDATE vals by
+/// looking up the column index in `merge.source_col_names` and substituting
+/// the corresponding value from the current source row. Previously, such
+/// references were passed to `parse_cell` as opaque strings, which produced
+/// 0 for every column — so inserts always wrote zeros.
 pub fn execute_merge(target: &mut QueryResult, merge: &Merge) -> MergeResult {
     let mut result = MergeResult::default();
 
@@ -107,7 +120,7 @@ pub fn execute_merge(target: &mut QueryResult, merge: &Merge) -> MergeResult {
     let mut matched_mask = vec![false; target.row_count];
 
     // Process source rows.
-    for (source_val_str, _source_row) in &merge.source_rows {
+    for (source_val_str, source_row) in &merge.source_rows {
         let source_val = parse_cell(source_val_str);
 
         // Find matching target row.
@@ -127,7 +140,8 @@ pub fn execute_merge(target: &mut QueryResult, merge: &Merge) -> MergeResult {
                     for (col_name, val_str) in assigns {
                         if let Some(idx) = target.columns.iter().position(|c| c.name == *col_name) {
                             if row < target.columns[idx].values.len() {
-                                target.columns[idx].values[row] = parse_cell(val_str);
+                                let resolved = resolve_val(val_str, &merge.source_col_names, source_row);
+                                target.columns[idx].values[row] = parse_cell(&resolved);
                             }
                         }
                     }
@@ -149,7 +163,8 @@ pub fn execute_merge(target: &mut QueryResult, merge: &Merge) -> MergeResult {
                 };
                 for (i, &col_idx) in cols_to_set.iter().enumerate() {
                     if i < vals.len() {
-                        target.columns[col_idx].values.push(parse_cell(&vals[i]));
+                        let resolved = resolve_val(&vals[i], &merge.source_col_names, source_row);
+                        target.columns[col_idx].values.push(parse_cell(&resolved));
                     } else {
                         target.columns[col_idx].values.push(0);
                     }
@@ -181,6 +196,26 @@ pub fn execute_merge(target: &mut QueryResult, merge: &Merge) -> MergeResult {
     }
 
     result
+}
+
+/// Resolve a value reference in a MERGE action. If `val` looks like
+/// `alias.col` (e.g. `source.id`), look up `col` in `source_col_names`
+/// and return the corresponding value from `source_row`. Otherwise,
+/// return `val` unchanged (it's a literal like `42` or `'hello'`).
+fn resolve_val(val: &str, source_col_names: &[String], source_row: &[String]) -> String {
+    // Detect `alias.col` — a dot-separated identifier pair.
+    if let Some(dot_pos) = val.rfind('.') {
+        let col_part = val[dot_pos + 1..].trim();
+        // Skip if either side is empty or col_part is not a simple identifier.
+        if !col_part.is_empty() && col_part.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            if let Some(idx) = source_col_names.iter().position(|c| c.eq_ignore_ascii_case(col_part)) {
+                if let Some(v) = source_row.get(idx) {
+                    return v.clone();
+                }
+            }
+        }
+    }
+    val.to_string()
 }
 
 fn parse_cell(s: &str) -> u64 {
@@ -280,6 +315,7 @@ mod tests {
         let merge = Merge {
             target: "t".into(),
             source_rows: vec![("2".into(), vec!["2".into(), "99".into()])],
+            source_col_names: vec!["id".into(), "val".into()],
             join_target_col: "id".into(),
             join_source_col: "id".into(),
             when_matched: Some(MergeAction::Update(vec![("val".into(), "99".into())])),
@@ -297,6 +333,7 @@ mod tests {
         let merge = Merge {
             target: "t".into(),
             source_rows: vec![("3".into(), vec!["3".into(), "30".into()])],
+            source_col_names: vec!["id".into(), "val".into()],
             join_target_col: "id".into(),
             join_source_col: "id".into(),
             when_matched: None,
@@ -319,6 +356,7 @@ mod tests {
         let merge = Merge {
             target: "t".into(),
             source_rows: vec![("2".into(), vec!["2".into(), "20".into()])],
+            source_col_names: vec!["id".into(), "val".into()],
             join_target_col: "id".into(),
             join_source_col: "id".into(),
             when_matched: None,
@@ -340,6 +378,7 @@ mod tests {
                 ("2".into(), vec!["2".into(), "99".into()]),
                 ("3".into(), vec!["3".into(), "30".into()]),
             ],
+            source_col_names: vec!["id".into(), "val".into()],
             join_target_col: "id".into(),
             join_source_col: "id".into(),
             when_matched: Some(MergeAction::Update(vec![("val".into(), "99".into())])),
@@ -355,5 +394,54 @@ mod tests {
         assert_eq!(target.row_count, 3);
         assert_eq!(target.columns[0].values, vec![1, 2, 3]);
         assert_eq!(target.columns[1].values, vec![10, 99, 30]);
+    }
+
+    /// Wave 56a: WHEN NOT MATCHED INSERT VALUES (source.col, ...) must
+    /// resolve the source column references against the current source row.
+    /// Previously, `source.id` and `source.val` were passed to `parse_cell`
+    /// as opaque strings and produced 0 for every column.
+    #[test]
+    fn merge_insert_with_source_col_refs() {
+        let mut target = make_result(&["id", "val"], &[vec![1, 2], vec![10, 20]]);
+        let merge = Merge {
+            target: "t".into(),
+            source_rows: vec![("3".into(), vec!["3".into(), "30".into()])],
+            source_col_names: vec!["id".into(), "val".into()],
+            join_target_col: "id".into(),
+            join_source_col: "id".into(),
+            when_matched: None,
+            when_not_matched_by_source: None,
+            when_not_matched_by_target: Some(MergeAction::Insert(
+                vec!["id".into(), "val".into()],
+                vec!["source.id".into(), "source.val".into()],
+            )),
+        };
+        let result = execute_merge(&mut target, &merge);
+        assert_eq!(result.inserted, 1);
+        assert_eq!(target.row_count, 3);
+        // The inserted row must be (3, 30), not (0, 0).
+        assert_eq!(target.columns[0].values, vec![1, 2, 3]);
+        assert_eq!(target.columns[1].values, vec![10, 20, 30]);
+    }
+
+    /// Wave 56a: WHEN MATCHED UPDATE SET col = source.col must resolve
+    /// the source column reference against the matched source row.
+    #[test]
+    fn merge_update_with_source_col_ref() {
+        let mut target = make_result(&["id", "val"], &[vec![1, 2], vec![10, 20]]);
+        let merge = Merge {
+            target: "t".into(),
+            source_rows: vec![("2".into(), vec!["2".into(), "999".into()])],
+            source_col_names: vec!["id".into(), "val".into()],
+            join_target_col: "id".into(),
+            join_source_col: "id".into(),
+            when_matched: Some(MergeAction::Update(vec![("val".into(), "source.val".into())])),
+            when_not_matched_by_source: None,
+            when_not_matched_by_target: None,
+        };
+        let result = execute_merge(&mut target, &merge);
+        assert_eq!(result.updated, 1);
+        // The updated row must have val=999, not val=0.
+        assert_eq!(target.columns[1].values, vec![10, 999]);
     }
 }

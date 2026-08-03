@@ -3058,3 +3058,16 @@ Stage Summary:
     variance. Favorable drift on Q2/Q4/Q5/Q8/Q13/Q15/Q16/Q17/Q20.
 - Commit hash: b5d466b
 - Push: deferred to wave gate
+
+---
+Task ID: W56-setup
+Agent: orchestrator
+Task: turboGP Final Remediation — Waves 56-61. Fix all remaining issues from prior waves.
+
+Work Log:
+- Verified baseline: 1317 tests pass, 0 failures at commit 2003de6 (wave-55-fix).
+- Reproduced CASE WHEN panic: src/engine/tpch.rs:3584, `t.col_types[idx]` index out of bounds (len 0). Root cause: `tpch_col_types()` returns empty Vec for user-created tables (only knows TPC-H schemas).
+- Surveyed Wave 53 wirings: MERGE has source_rows=Vec::new() hardcoded, PIVOT extensions_pivot always returns None, JSON_VALUE not parsed, temporal needs DDL detection.
+
+Stage Summary:
+- Ready to start Wave 56.

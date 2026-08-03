@@ -71,27 +71,43 @@ fn create_procedure_with_params_and_exec() {
 
 // -----------------------------------------------------------------------
 // MERGE: WHEN MATCHED THEN UPDATE / WHEN NOT MATCHED THEN INSERT.
+// Wave 56a: the previous test passed even though source_rows was always
+// empty (the parser hardcoded `Vec::new()`), so the WHEN MATCHED branch
+// was dead code. We now parse USING (VALUES ...) and assert that the
+// update + insert actually mutate the target table.
 // -----------------------------------------------------------------------
 
 #[test]
 fn merge_executes_through_engine() {
     let mut e = QueryEngine::new();
     e.execute("CREATE TABLE target (id INT, val INT)").unwrap();
-    e.execute("INSERT INTO target (id, val) VALUES (1, 10)").unwrap();
+    e.execute("INSERT INTO target (id, val) VALUES (1, 10), (2, 20)").unwrap();
 
-    // MERGE that updates the matched row. The simplified parser only
-    // extracts the target table name and the WHEN clauses. The merge.rs
-    // execute_merge operates on the target's QueryResult directly.
-    let sql = "MERGE INTO target WHEN MATCHED THEN UPDATE SET val=99";
+    // MERGE that updates the matched row (id=2) and inserts a new row (id=3).
+    let sql = "MERGE INTO target USING (VALUES (2, 99), (3, 30)) AS source (id, val) \
+               ON target.id = source.id \
+               WHEN MATCHED THEN UPDATE SET val = source.val \
+               WHEN NOT MATCHED THEN INSERT (id, val) VALUES (source.id, source.val)";
     let r = e.execute(sql);
     assert!(r.is_ok(), "MERGE must execute without error; got: {:?}", r.err());
-    // The merge module may or may not apply the update depending on
-    // whether source_rows is populated. We only require that the engine
-    // dispatches MERGE to execute_merge and returns a result.
     let r = r.unwrap();
-    // row_count is inserted + updated + deleted; with empty source_rows
-    // it will be 0, but the statement must execute cleanly.
-    let _ = r.row_count;
+    // 1 updated + 1 inserted = 2 rows affected.
+    assert_eq!(r.row_count, 2, "MERGE must report 1 updated + 1 inserted = 2 rows affected");
+
+    // Verify the target table now has 3 rows: (1,10), (2,99), (3,30).
+    let after = e.execute("SELECT id, val FROM target ORDER BY id").unwrap();
+    assert_eq!(after.row_count, 3, "target table must have 3 rows after MERGE");
+    let id_col = after.columns.iter().find(|c| c.name == "id").expect("id column");
+    let val_col = after.columns.iter().find(|c| c.name == "val").expect("val column");
+    // Row 0: id=1, val=10 (unchanged).
+    assert_eq!(id_col.values[0], 1, "id=1 must be unchanged");
+    assert_eq!(val_col.values[0], 10, "val=10 must be unchanged");
+    // Row 1: id=2, val=99 (updated from 20 → 99).
+    assert_eq!(id_col.values[1], 2, "id=2 must be the matched row");
+    assert_eq!(val_col.values[1], 99, "val must be updated from 20 to 99 via source.val");
+    // Row 2: id=3, val=30 (inserted via source.id / source.val).
+    assert_eq!(id_col.values[2], 3, "id=3 must be the inserted row");
+    assert_eq!(val_col.values[2], 30, "val=30 must be inserted via source.val");
 }
 
 // -----------------------------------------------------------------------
