@@ -14,3 +14,4 @@ pub mod fixed_agg;
 pub mod simd_agg;
 pub mod window;
 pub mod pivot;
+pub mod json;
