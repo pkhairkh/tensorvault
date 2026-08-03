@@ -17,3 +17,4 @@ pub mod pivot;
 pub mod json;
 pub mod merge;
 pub mod temporal;
+pub mod procedure;
