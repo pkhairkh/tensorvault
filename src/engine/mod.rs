@@ -88,6 +88,8 @@ pub struct QueryEngine {
     cost_model: CostModel,
     /// Transaction manager for BEGIN/COMMIT/ROLLBACK (Wave 5).
     txn_manager: crate::txn::TxnManager,
+    /// Write-ahead log for durability (Wave 37). None when not configured.
+    wal: Option<crate::storage::recovery::Wal>,
     /// Index manager for secondary indexes (Wave 31).
     pub index_manager: crate::index::manager::IndexManager,
     /// Hash column registry for materialized string hashes (Wave 31).
@@ -118,8 +120,42 @@ impl QueryEngine {
             kernel_table: Arc::new(KernelTable::new()),
             cost_model: CostModel::default(),
             txn_manager: crate::txn::TxnManager::new(),
+            wal: None,
             index_manager: crate::index::manager::IndexManager::new(),
             hash_registry: crate::exec::hash_column::HashColumnRegistry::new(),
+        }
+    }
+
+    /// Open a QueryEngine with a WAL for durability (Wave 37).
+    /// Replays the WAL on startup to restore committed state.
+    pub fn open<P: AsRef<std::path::Path>>(wal_path: P) -> Result<Self> {
+        let mut engine = Self::new();
+        let wal = crate::storage::recovery::Wal::open(&wal_path)?;
+        // Replay committed transactions.
+        let stats = crate::storage::recovery::replay_wal(&mut engine, &wal)?;
+        log::info!("WAL replay: {} records replayed, {} skipped, {} errors",
+            stats.replayed, stats.skipped, stats.errors);
+        engine.wal = Some(wal);
+        Ok(engine)
+    }
+
+    /// Enable WAL on an existing engine.
+    pub fn enable_wal<P: AsRef<std::path::Path>>(&mut self, wal_path: P) -> Result<()> {
+        let wal = crate::storage::recovery::Wal::open(&wal_path)?;
+        self.wal = Some(wal);
+        Ok(())
+    }
+
+    /// Append a record to the WAL (if enabled).
+    fn wal_append(&mut self, sql: &str) {
+        if let Some(ref mut wal) = self.wal {
+            let _ = wal.append(&crate::storage::recovery::WalRecord {
+                txn_id: 0, // autocommit
+                sql: sql.to_string(),
+                is_commit: false,
+                is_rollback: false,
+            });
+            let _ = wal.sync();
         }
     }
 
@@ -465,6 +501,9 @@ impl QueryEngine {
 
     /// Execute a DML statement (INSERT, UPDATE, DELETE).
     fn execute_dml(&mut self, dml: crate::sql::DmlStatement) -> Result<QueryResult> {
+        // Append to WAL before executing (Wave 37).
+        let sql_repr = format!("{:?}", dml);
+        self.wal_append(&sql_repr);
         match dml {
             crate::sql::DmlStatement::Insert(ins) => self.execute_insert(ins),
             crate::sql::DmlStatement::Update(upd) => self.execute_update(upd),
