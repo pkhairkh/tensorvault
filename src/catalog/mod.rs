@@ -22,6 +22,8 @@
 //! so the registry itself never sees concurrent access during a
 //! query.
 
+pub mod views;
+
 use crate::datasource::table::Table;
 use std::collections::HashMap;
 
