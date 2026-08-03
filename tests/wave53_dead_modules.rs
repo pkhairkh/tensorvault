@@ -216,15 +216,18 @@ fn window_sum_over_through_engine() {
 }
 
 // -----------------------------------------------------------------------
-// PIVOT: pivot() callable through engine via a stored-procedure body.
+// PIVOT: pivot() callable through engine via SQL.
+// Wave 56b: the previous test called the pivot module directly (not through
+// engine.execute), so it didn't verify that PIVOT is actually wired into
+// the SQL execution path. We now detect `PIVOT (...)` in the SQL string
+// and route to the pivot module end-to-end.
 // -----------------------------------------------------------------------
 
 #[test]
 fn pivot_function_callable_via_engine() {
-    // PIVOT/UNPIVOT SQL syntax is not yet parsed by the basic parser,
-    // so this test verifies that the pivot() function is reachable via
-    // the engine's module surface. A future wave can add PIVOT/UNPIVOT
-    // clause parsing to the SELECT parser.
+    // Wave 56b: this test still calls the pivot module directly to verify
+    // the module surface is exported. The end-to-end SQL test below covers
+    // the wiring through engine.execute().
     use turbogp::engine::{QueryResult, ResultColumn};
     let input = QueryResult {
         columns: vec![
@@ -240,4 +243,37 @@ fn pivot_function_callable_via_engine() {
     assert_eq!(result.row_count, 2, "pivot must produce one row per dept");
     // Two pivot columns + one group column = 3 columns.
     assert_eq!(result.columns.len(), 3, "pivot must produce 3 columns: dept, Q1_sum, Q2_sum");
+}
+
+/// Wave 56b: PIVOT through engine.execute() — verify the PIVOT clause is
+/// detected in the SQL string, the underlying SELECT is executed to produce
+/// input rows, and the pivot transformation is applied end-to-end.
+#[test]
+fn pivot_clause_through_engine_execute() {
+    let mut e = QueryEngine::new();
+    e.execute("CREATE TABLE sales (dept INT, qtr INT, amt INT)").unwrap();
+    e.execute("INSERT INTO sales (dept, qtr, amt) VALUES (1, 1, 100), (1, 2, 200), (2, 1, 150)").unwrap();
+
+    // PIVOT (SUM(amt) FOR qtr IN (1, 2)) — produces one row per dept with
+    // columns: dept, "1", "2" (the summed amt for each quarter).
+    let sql = "SELECT * FROM sales PIVOT (SUM(amt) FOR qtr IN (1, 2)) AS p";
+    let r = e.execute(sql);
+    assert!(r.is_ok(), "PIVOT query must execute; got: {:?}", r.err());
+    let r = r.unwrap();
+    // Two unique depts (1 and 2) → 2 rows.
+    assert_eq!(r.row_count, 2, "PIVOT must produce one row per dept");
+    // 1 group col (dept) + 2 pivot cols ("1", "2") = 3 columns.
+    assert_eq!(r.columns.len(), 3, "PIVOT must produce 3 columns: dept, '1', '2'");
+    // Find the dept column and verify it has both 1 and 2.
+    let dept_col = r.columns.iter().find(|c| c.name == "dept").expect("dept column");
+    assert!(dept_col.values.contains(&1), "dept column must contain 1");
+    assert!(dept_col.values.contains(&2), "dept column must contain 2");
+    // Verify the pivot values: dept 1 has qtr=1 sum=100, qtr=2 sum=200.
+    // Find the row index for dept=1.
+    let dept1_idx = dept_col.values.iter().position(|&v| v == 1).unwrap();
+    // The two pivot columns are named "1" and "2" (the pivot_values).
+    let q1_col = r.columns.iter().find(|c| c.name == "1").expect("pivot col '1'");
+    let q2_col = r.columns.iter().find(|c| c.name == "2").expect("pivot col '2'");
+    assert_eq!(q1_col.values[dept1_idx], 100, "dept 1, qtr 1 sum must be 100");
+    assert_eq!(q2_col.values[dept1_idx], 200, "dept 1, qtr 2 sum must be 200");
 }
