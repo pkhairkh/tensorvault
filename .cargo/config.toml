@@ -1,0 +1,8 @@
+[build]
+incremental = false
+
+[profile.dev]
+incremental = false
+
+[profile.test]
+incremental = false

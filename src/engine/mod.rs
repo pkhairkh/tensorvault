@@ -207,15 +207,28 @@ impl QueryEngine {
         Ok(())
     }
 
-    /// Append a record to the WAL (if enabled).
-    fn wal_append(&mut self, sql: &str) {
+    /// Append a DML/DDL record to the WAL (if enabled).
+    ///
+    /// Wave 51 fix: `txn_id` is `Some(id)` for statements inside an
+    /// explicit transaction, or `None` for autocommit. The record carries
+    /// the txn_id so replay can group statements by transaction.
+    fn wal_append_txn(&mut self, sql: &str, txn_id: Option<u64>) {
         if let Some(ref mut wal) = self.wal {
-            let _ = wal.append(&crate::storage::recovery::WalRecord {
-                txn_id: 0, // autocommit
-                sql: sql.to_string(),
-                is_commit: false,
-                is_rollback: false,
-            });
+            let record = match txn_id {
+                Some(id) => crate::storage::recovery::WalRecord::txn_dml(id, sql),
+                None => crate::storage::recovery::WalRecord::autocommit(sql),
+            };
+            let _ = wal.append(&record);
+            let _ = wal.sync();
+        }
+    }
+
+    /// Append a pre-constructed WAL record (BEGIN / COMMIT / ROLLBACK
+    /// markers, or any other special record). Used by `execute()` to
+    /// write transaction boundary markers (Wave 51 fix).
+    fn wal_append_record(&mut self, record: crate::storage::recovery::WalRecord) {
+        if let Some(ref mut wal) = self.wal {
+            let _ = wal.append(&record);
             let _ = wal.sync();
         }
     }
@@ -395,27 +408,40 @@ impl QueryEngine {
         let start = Instant::now();
 
         // Transaction control: BEGIN/COMMIT/ROLLBACK.
+        //
+        // Wave 51 fix (Bug 8): BEGIN/COMMIT/ROLLBACK now write corresponding
+        // markers to the WAL so replay can reconstruct transaction
+        // boundaries. Previously the WAL only ever saw `txn_id: 0,
+        // is_commit: false`, so a `BEGIN; INSERT; INSERT; COMMIT;` block
+        // was indistinguishable from three autocommit INSERTs on replay
+        // — and a `BEGIN; INSERT; ROLLBACK;` would still replay the INSERT.
         let trimmed = sql.trim();
         let lower = trimmed.to_lowercase();
         if lower.starts_with("begin") || lower.starts_with("start transaction") {
-            let _id = self
+            let id = self
                 .txn_manager
                 .begin(&self.catalog)
                 .map_err(Error::Other)?;
+            self.wal_append_record(crate::storage::recovery::WalRecord::begin(id));
             return Ok(QueryResult::empty());
         }
         if lower.starts_with("commit") {
+            // Capture the txn_id before we drain the transaction.
+            let txn_id = self.txn_manager.active.as_ref().map(|t| t.id).unwrap_or(0);
             let committed = self
                 .txn_manager
                 .commit()
                 .map_err(Error::Other)?;
             self.catalog = committed;
+            self.wal_append_record(crate::storage::recovery::WalRecord::commit(txn_id));
             return Ok(QueryResult::empty());
         }
         if lower.starts_with("rollback") {
+            let txn_id = self.txn_manager.active.as_ref().map(|t| t.id).unwrap_or(0);
             self.txn_manager
                 .rollback()
                 .map_err(Error::Other)?;
+            self.wal_append_record(crate::storage::recovery::WalRecord::rollback(txn_id));
             return Ok(QueryResult::empty());
         }
 
@@ -426,9 +452,10 @@ impl QueryEngine {
         let txn_active = self.txn_manager.is_active();
         if txn_active {
             // Take the snapshot out of the txn manager temporarily.
+            let txn_id = self.txn_manager.active.as_ref().map(|t| t.id).unwrap_or(0);
             let mut txn = self.txn_manager.active.take().expect("txn active");
             std::mem::swap(&mut self.catalog, &mut txn.snapshot);
-            let result = self.execute_inner(sql, &start);
+            let result = self.execute_inner(sql, &start, Some(txn_id));
             // Swap back: self.catalog goes back to being the main catalog
             // (unchanged), txn.snapshot becomes the (possibly modified)
             // transaction state.
@@ -437,35 +464,46 @@ impl QueryEngine {
             return result;
         }
 
-        self.execute_inner(sql, &start)
+        self.execute_inner(sql, &start, None)
     }
 
     /// Inner execution: dispatches DDL, DML, CTE, and SELECT without
     /// transaction awareness. Called by `execute` either with the main
     /// catalog or with the txn snapshot swapped in.
-    fn execute_inner(&mut self, sql: &str, start: &Instant) -> Result<QueryResult> {
+    ///
+    /// `txn_id` is `Some(id)` when executing inside an explicit
+    /// transaction (so the WAL record carries the right txn_id), or
+    /// `None` for autocommit.
+    ///
+    /// Wave 51 fix (Bug 9): the WAL append now happens AFTER a successful
+    /// execute. Previously `wal_append(sql)` was called BEFORE
+    /// `execute_ddl` / `execute_dml`, so a failed execute (e.g. INSERT
+    /// INTO nonexistent) would still leave a record in the WAL — and
+    /// replay would fail on restart.
+    fn execute_inner(&mut self, sql: &str, start: &Instant, txn_id: Option<u64>) -> Result<QueryResult> {
         // Try CTE (WITH ... SELECT ...) first.
         if let Some(with_result) = crate::sql::parse_with(sql) {
             let with = with_result.map_err(Error::Parse)?;
-            let mut result = self.execute_with(with)?;
+            let mut result = self.execute_with(with, txn_id)?;
             result.elapsed_us = start.elapsed().as_micros() as u64;
             return Ok(result);
         }
 
         // Try DDL first (CREATE TABLE, DROP TABLE, CREATE SCHEMA).
         if let Some(ddl) = crate::sql::parse_ddl(sql).map_err(Error::Parse)? {
-            self.wal_append(sql);
             let mut result = self.execute_ddl(ddl)?;
+            // Wave 51 fix: append AFTER successful execute.
+            self.wal_append_txn(sql, txn_id);
             result.elapsed_us = start.elapsed().as_micros() as u64;
             return Ok(result);
         }
 
         // Try DML (INSERT, UPDATE, DELETE).
         if let Some(dml) = crate::sql::parse_dml(sql).map_err(Error::Parse)? {
-            // Append to WAL before executing (Wave 37). Store the raw SQL
-            // so it can be replayed on restart.
-            self.wal_append(sql);
             let mut result = self.execute_dml(dml)?;
+            // Wave 51 fix: append AFTER successful execute. If execute_dml
+            // returns Err, we never reach this line, so the WAL stays clean.
+            self.wal_append_txn(sql, txn_id);
             result.elapsed_us = start.elapsed().as_micros() as u64;
             return Ok(result);
         }
@@ -790,12 +828,15 @@ impl QueryEngine {
     ///    difference), append them to the CTE table, and repeat until
     ///    no new rows or MAXRECURSION is reached.
     /// 3. Execute the outer query, which can reference any CTE by name.
-    fn execute_with(&mut self, with: crate::sql::WithClause) -> Result<QueryResult> {
+    ///
+    /// `txn_id` is threaded through so DML inside a CTE (rare but
+    /// possible) still gets the right transaction marker in the WAL.
+    fn execute_with(&mut self, with: crate::sql::WithClause, txn_id: Option<u64>) -> Result<QueryResult> {
         let mut temp_tables: Vec<String> = Vec::new();
 
         for cte in &with.ctes {
             // Execute the anchor.
-            let anchor_result = self.execute_inner(&cte.anchor, &Instant::now())?;
+            let anchor_result = self.execute_inner(&cte.anchor, &Instant::now(), txn_id)?;
 
             // Register the anchor result as a temp table.
             let temp_name = cte.name.clone();
@@ -813,7 +854,7 @@ impl QueryEngine {
 
                 for _ in 0..max_iter {
                     // Execute the recursive query with the current CTE state.
-                    let rec_result = self.execute_inner(recursive_sql, &Instant::now())?;
+                    let rec_result = self.execute_inner(recursive_sql, &Instant::now(), txn_id)?;
 
                     // Compute new rows: rows in rec_result that aren't already
                     // in the CTE table. For simplicity, we compare by row
@@ -852,7 +893,7 @@ impl QueryEngine {
         }
 
         // Execute the outer query.
-        let result = self.execute_inner(&with.outer_query, &Instant::now())?;
+        let result = self.execute_inner(&with.outer_query, &Instant::now(), txn_id)?;
 
         // Clean up temp tables.
         for name in &temp_tables {

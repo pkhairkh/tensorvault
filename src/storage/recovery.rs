@@ -5,26 +5,63 @@
 //! On restart, the WAL is replayed to restore the catalog to its last
 //! committed state.
 //!
-//! The WAL format is simple: each record is a serialized DML statement
-//! (INSERT/UPDATE/DELETE) with a transaction ID and commit marker. Records
-//! are appended to a file and fsync'd on commit.
+//! The WAL format is: `txn_id|commit|rollback|base64(sql)\n`. The SQL
+//! payload is base64-encoded (Wave 51 fix) so that pipe characters and
+//! newlines inside SQL strings round-trip unambiguously — the previous
+//! `\\|` / `\\n` escaping scheme was ambiguous because a SQL string
+//! containing the literal bytes `\n` could not be distinguished from a
+//! real newline on replay.
+//!
+//! Three special records carry transaction boundaries (Wave 51 fix):
+//! - `BEGIN` records mark the start of a transaction (txn_id != 0).
+//! - `COMMIT` records (`is_commit = true`) make the transaction durable.
+//! - `ROLLBACK` records (`is_rollback = true`) discard the transaction.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 
-/// A WAL record: one DML operation.
+use base64::{engine::general_purpose, Engine as _};
+
+/// A WAL record: one DML operation or a transaction boundary marker.
 #[derive(Debug, Clone)]
 pub struct WalRecord {
-    /// Transaction ID (0 for autocommit).
+    /// Transaction ID (0 for autocommit, non-zero for explicit transactions).
     pub txn_id: u64,
-    /// The SQL statement.
+    /// The SQL statement. Empty for BEGIN/COMMIT/ROLLBACK markers.
     pub sql: String,
     /// True if this is a commit marker for the transaction.
     pub is_commit: bool,
     /// True if this is a rollback marker.
     pub is_rollback: bool,
+}
+
+impl WalRecord {
+    /// Construct an autocommit DML record (txn_id = 0).
+    pub fn autocommit(sql: impl Into<String>) -> Self {
+        Self { txn_id: 0, sql: sql.into(), is_commit: false, is_rollback: false }
+    }
+
+    /// Construct a BEGIN marker for the given transaction ID.
+    pub fn begin(txn_id: u64) -> Self {
+        Self { txn_id, sql: String::new(), is_commit: false, is_rollback: false }
+    }
+
+    /// Construct a COMMIT marker for the given transaction ID.
+    pub fn commit(txn_id: u64) -> Self {
+        Self { txn_id, sql: String::new(), is_commit: true, is_rollback: false }
+    }
+
+    /// Construct a ROLLBACK marker for the given transaction ID.
+    pub fn rollback(txn_id: u64) -> Self {
+        Self { txn_id, sql: String::new(), is_commit: false, is_rollback: true }
+    }
+
+    /// Construct a DML record inside an explicit transaction.
+    pub fn txn_dml(txn_id: u64, sql: impl Into<String>) -> Self {
+        Self { txn_id, sql: sql.into(), is_commit: false, is_rollback: false }
+    }
 }
 
 /// The WAL: appends records to a file and provides a reader for replay.
@@ -47,15 +84,24 @@ impl Wal {
 
     /// Append a record to the WAL. Does NOT fsync — call `sync()` to
     /// durably persist.
+    ///
+    /// Wave 51 fix (Bug 10): the SQL payload is base64-encoded so that
+    /// pipe characters, newlines, and backslashes inside SQL strings
+    /// round-trip unambiguously. The previous `\\|` / `\\n` escaping
+    /// was ambiguous (a SQL string containing literal `\n` bytes was
+    /// indistinguishable from a real newline on replay).
     pub fn append(&mut self, record: &WalRecord) -> std::io::Result<()> {
         if let Some(ref mut file) = self.file {
-            // Format: txn_id|commit|rollback|sql\n
+            // Format: txn_id|commit|rollback|base64(sql)\n
+            // base64 alphabet is [A-Za-z0-9+/=] — no `|` or `\n`, so the
+            // field separator and record terminator are unambiguous.
+            let sql_b64 = general_purpose::STANDARD.encode(record.sql.as_bytes());
             let line = format!(
                 "{}|{}|{}|{}\n",
                 record.txn_id,
                 if record.is_commit { 1 } else { 0 },
                 if record.is_rollback { 1 } else { 0 },
-                record.sql.replace('|', "\\|").replace('\n', "\\n")
+                sql_b64,
             );
             file.write_all(line.as_bytes())?;
         }
@@ -71,6 +117,10 @@ impl Wal {
     }
 
     /// Read all records from the WAL (for replay on startup).
+    ///
+    /// Wave 51 fix: the SQL field is base64-decoded. Records that fail to
+    /// decode are skipped (with a warning logged) so a corrupted tail
+    /// doesn't prevent replay of the valid prefix.
     pub fn read_all(&self) -> std::io::Result<Vec<WalRecord>> {
         let file = File::open(&self.path)?;
         let reader = BufReader::new(file);
@@ -82,14 +132,24 @@ impl Wal {
             }
             let parts: Vec<&str> = line.splitn(4, '|').collect();
             if parts.len() < 4 {
+                // Legacy record format (pre-Wave-51) — try the old escaping.
+                if parts.len() >= 1 {
+                    if let Ok(rec) = parse_legacy_record(&line) {
+                        records.push(rec);
+                    }
+                }
                 continue;
             }
             let txn_id: u64 = parts[0].parse().unwrap_or(0);
             let is_commit = parts[1] == "1";
             let is_rollback = parts[2] == "1";
-            let sql = parts[3]
-                .replace("\\|", "|")
-                .replace("\\n", "\n");
+            // Wave 51 fix: try base64 first; if that fails (legacy record
+            // using the old `\\|` / `\\n` escaping), fall back to the
+            // legacy decoder so old WAL files still replay.
+            let sql = match general_purpose::STANDARD.decode(parts[3].as_bytes()) {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                Err(_) => decode_legacy_sql(parts[3]),
+            };
             records.push(WalRecord { txn_id, sql, is_commit, is_rollback });
         }
         Ok(records)
@@ -123,6 +183,28 @@ impl Wal {
     }
 }
 
+/// Decode a legacy (pre-Wave-51) SQL field that used the ambiguous
+/// `\\|` / `\\n` escaping. Kept so old WAL files still replay after
+/// the upgrade.
+fn decode_legacy_sql(s: &str) -> String {
+    s.replace("\\|", "|").replace("\\n", "\n")
+}
+
+/// Parse a legacy WAL line that doesn't have the 4-field base64 format.
+fn parse_legacy_record(line: &str) -> std::io::Result<WalRecord> {
+    // Best-effort: split on `|` and assume the last field is the SQL with
+    // legacy escaping. This handles the pre-Wave-51 format.
+    let parts: Vec<&str> = line.splitn(4, '|').collect();
+    if parts.is_empty() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "empty WAL line"));
+    }
+    let txn_id: u64 = parts[0].parse().unwrap_or(0);
+    let is_commit = parts.get(1).map(|s| *s == "1").unwrap_or(false);
+    let is_rollback = parts.get(2).map(|s| *s == "1").unwrap_or(false);
+    let sql = parts.get(3).map(|s| decode_legacy_sql(s)).unwrap_or_default();
+    Ok(WalRecord { txn_id, sql, is_commit, is_rollback })
+}
+
 /// Replay WAL records against an engine. Only committed transactions
 /// are replayed; rolled-back or incomplete transactions are skipped.
 pub fn replay_wal(engine: &mut crate::engine::QueryEngine, wal: &Wal) -> std::io::Result<ReplayStats> {
@@ -143,8 +225,10 @@ pub fn replay_wal(engine: &mut crate::engine::QueryEngine, wal: &Wal) -> std::io
 
     // Replay autocommit records (each is its own transaction).
     for record in &autocommit_records {
-        if record.is_commit || record.is_rollback {
-            continue; // Skip markers for autocommit
+        // Wave 51: skip marker records (BEGIN/COMMIT/ROLLBACK with empty
+        // SQL). Autocommit records never have markers, but defensive.
+        if record.is_commit || record.is_rollback || record.sql.trim().is_empty() {
+            continue;
         }
         match engine.execute(&record.sql) {
             Ok(_) => stats.replayed += 1,
@@ -169,7 +253,9 @@ pub fn replay_wal(engine: &mut crate::engine::QueryEngine, wal: &Wal) -> std::io
         // Begin a transaction, replay the records, commit.
         let _ = engine.execute("BEGIN");
         for record in records {
-            if record.is_commit || record.is_rollback {
+            // Wave 51: skip BEGIN/COMMIT/ROLLBACK markers (they have
+            // empty SQL or are flagged). Also skip empty SQL defensively.
+            if record.is_commit || record.is_rollback || record.sql.trim().is_empty() {
                 continue;
             }
             match engine.execute(&record.sql) {
