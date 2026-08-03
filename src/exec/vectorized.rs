@@ -185,7 +185,20 @@ fn value_to_u64(val: &crate::sql::parser::Value) -> Option<u64> {
     match val {
         Value::Int(i) => Some(*i as u64),
         Value::Float(f) => Some(f.to_bits()),
-        Value::String(s) => Some(s.parse::<u64>().ok().unwrap_or(0)),
+        // For string values, try parsing as integer first; if that fails,
+        // hash with xxh3_64 to match the storage format (strings are stored
+        // as xxh3 hashes in u64 cells — see datasource/parquet.rs).
+        // This makes WHERE col = 'string' and WHERE col <> 'string' work
+        // correctly against string columns.
+        Value::String(s) => {
+            if let Ok(n) = s.parse::<u64>() {
+                Some(n)
+            } else if let Ok(n) = s.parse::<i64>() {
+                Some(n as u64)
+            } else {
+                Some(xxhash_rust::xxh3::xxh3_64(s.as_bytes()))
+            }
+        }
         Value::Hex(bytes) => {
             Some(bytes.iter().enumerate().fold(0u64, |acc, (i, &b)| acc | ((b as u64) << (8 * i))))
         }

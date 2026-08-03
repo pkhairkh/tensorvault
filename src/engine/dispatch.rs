@@ -232,38 +232,98 @@ fn build_filter_mask(query: &SelectQuery, table: &Table) -> Result<Vec<bool>> {
     }
 }
 
-/// Check if the WHERE clause is a LIKE on a string column.
+/// Check if the WHERE clause contains a LIKE on a string column.
 /// If so, use StringSearchColumn for real string matching.
+/// Handles mixed predicates: `LIKE '%x%' AND col = val` by evaluating
+/// the LIKE part via StringSearchColumn and the equality part via the
+/// u64 column, then AND-ing the masks.
 fn try_string_like_filter(expr: &crate::sql::parser::Expr, table: &Table) -> Option<Vec<bool>> {
     use crate::sql::parser::{Expr as PExpr, Value};
     match expr {
         PExpr::Binary { left, op, right } => {
             let op_upper = op.to_uppercase();
-            if op_upper != "LIKE" && op_upper != "NOT LIKE" {
-                if op_upper == "AND" {
-                    let left_mask = try_string_like_filter(left, table)?;
-                    let right_mask = try_string_like_filter(right, table)?;
-                    return Some(left_mask.iter().zip(right_mask.iter()).map(|(&a, &b)| a && b).collect());
+            if op_upper == "LIKE" || op_upper == "NOT LIKE" {
+                let (col_name, pattern) = match (left.as_ref(), right.as_ref()) {
+                    (PExpr::Column(name), PExpr::Literal(Value::String(s))) => (name.clone(), s.clone()),
+                    (PExpr::Literal(Value::String(s)), PExpr::Column(name)) => (name.clone(), s.clone()),
+                    _ => return None,
+                };
+                let col_idx = resolve_col_name(&col_name, table).ok()?;
+                if col_idx >= table.string_columns.len() { return None; }
+                let string_col = table.string_columns[col_idx].as_ref()?;
+                let mut mask = build_like_mask(string_col, &pattern);
+                if op_upper == "NOT LIKE" {
+                    for m in mask.iter_mut() { *m = !*m; }
                 }
-                if op_upper == "OR" {
-                    let left_mask = try_string_like_filter(left, table)?;
-                    let right_mask = try_string_like_filter(right, table)?;
-                    return Some(left_mask.iter().zip(right_mask.iter()).map(|(&a, &b)| a || b).collect());
-                }
-                return None;
+                return Some(mask);
             }
-            let (col_name, pattern) = match (left.as_ref(), right.as_ref()) {
-                (PExpr::Column(name), PExpr::Literal(Value::String(s))) => (name.clone(), s.clone()),
-                (PExpr::Literal(Value::String(s)), PExpr::Column(name)) => (name.clone(), s.clone()),
+            if op_upper == "AND" {
+                // Try to evaluate each side independently. If either side
+                // is a LIKE, evaluate it via StringSearchColumn. If the
+                // other side is an equality/range, evaluate it via the u64
+                // column. Then AND the masks.
+                let left_mask = eval_predicate_mask(left, table)?;
+                let right_mask = eval_predicate_mask(right, table)?;
+                return Some(left_mask.iter().zip(right_mask.iter()).map(|(&a, &b)| a && b).collect());
+            }
+            if op_upper == "OR" {
+                let left_mask = eval_predicate_mask(left, table)?;
+                let right_mask = eval_predicate_mask(right, table)?;
+                return Some(left_mask.iter().zip(right_mask.iter()).map(|(&a, &b)| a || b).collect());
+            }
+            // Comparison operators on string columns — try to evaluate.
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Evaluate a single predicate (LIKE or comparison) against a table,
+/// returning a row mask. This handles the mixed case where a WHERE
+/// clause combines LIKE and equality predicates.
+fn eval_predicate_mask(expr: &crate::sql::parser::Expr, table: &Table) -> Option<Vec<bool>> {
+    use crate::sql::parser::{Expr as PExpr, Value};
+    match expr {
+        PExpr::Binary { left, op, right } => {
+            let op_upper = op.to_uppercase();
+            // LIKE / NOT LIKE — use StringSearchColumn.
+            if op_upper == "LIKE" || op_upper == "NOT LIKE" {
+                return try_string_like_filter(expr, table);
+            }
+            // AND / OR — recurse.
+            if op_upper == "AND" || op_upper == "OR" {
+                return try_string_like_filter(expr, table);
+            }
+            // Comparison: col op value. Evaluate against the u64 column.
+            let (col_name, val) = match (left.as_ref(), right.as_ref()) {
+                (PExpr::Column(name), PExpr::Literal(v)) => (name.clone(), v.clone()),
+                (PExpr::Literal(v), PExpr::Column(name)) => (name.clone(), v.clone()),
                 _ => return None,
             };
             let col_idx = resolve_col_name(&col_name, table).ok()?;
-            if col_idx >= table.string_columns.len() { return None; }
-            let string_col = table.string_columns[col_idx].as_ref()?;
-            let mut mask = build_like_mask(string_col, &pattern);
-            if op_upper == "NOT LIKE" {
-                for m in mask.iter_mut() { *m = !*m; }
-            }
+            if col_idx >= table.columns.len() { return None; }
+            let col = &table.columns[col_idx];
+            let cell = match &val {
+                Value::Int(i) => *i as u64,
+                Value::Float(f) => f.to_bits(),
+                Value::String(s) => {
+                    if let Ok(n) = s.parse::<u64>() { n }
+                    else if let Ok(n) = s.parse::<i64>() { n as u64 }
+                    else { xxhash_rust::xxh3::xxh3_64(s.as_bytes()) }
+                }
+                Value::Hex(bytes) => {
+                    bytes.iter().enumerate().fold(0u64, |acc, (i, &b)| acc | ((b as u64) << (8 * i)))
+                }
+            };
+            let mask: Vec<bool> = match op_upper.as_str() {
+                "=" => col.iter().map(|&c| c == cell).collect(),
+                "!=" => col.iter().map(|&c| c != cell).collect(),
+                "<" => col.iter().map(|&c| c < cell).collect(),
+                ">" => col.iter().map(|&c| c > cell).collect(),
+                "<=" => col.iter().map(|&c| c <= cell).collect(),
+                ">=" => col.iter().map(|&c| c >= cell).collect(),
+                _ => return None,
+            };
             Some(mask)
         }
         _ => None,

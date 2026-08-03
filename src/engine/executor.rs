@@ -317,6 +317,17 @@ fn compute_aggregate(func: &str, arg: &str, indices: &[usize], table: &Table) ->
                 indices.iter().filter(|&&i| table.columns[idx][i] != 0).count() as u64
             }
         }
+        "COUNT_DISTINCT" => {
+            // COUNT(DISTINCT col) — count unique non-zero values.
+            use std::collections::HashSet;
+            let idx = table.column_idx(arg).unwrap_or(0);
+            let unique: HashSet<u64> = indices
+                .iter()
+                .map(|&i| table.columns[idx][i])
+                .filter(|&v| v != 0)
+                .collect();
+            unique.len() as u64
+        }
         "SUM" => {
             let idx = table.column_idx(arg).unwrap_or(0);
             let sum: u64 = indices.iter().map(|&i| table.columns[idx][i]).sum();
