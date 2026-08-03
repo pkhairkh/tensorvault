@@ -85,6 +85,7 @@ pub mod kingman;
 pub mod learned;
 pub mod lowerer;
 pub mod mcts;
+pub mod optimizer;
 pub mod tensor;
 pub mod wcoj;
 
