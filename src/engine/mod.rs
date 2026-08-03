@@ -596,6 +596,15 @@ impl QueryEngine {
             return Ok(result);
         }
 
+        // Wave 56c: JSON_VALUE / JSON_QUERY. Detect `JSON_VALUE(` in the SQL
+        // and intercept: rewrite the SQL to replace each JSON_VALUE(col, path)
+        // with `col AS __json_value_N__`, execute the rewritten SQL, then
+        // post-process the result columns by applying json::json_value() to
+        // each string value.
+        if contains_json_value_call(sql) {
+            return self.execute_with_json_value(sql, start, txn_id);
+        }
+
         // Try DDL first (CREATE TABLE, DROP TABLE, CREATE SCHEMA).
         if let Some(ddl) = crate::sql::parse_ddl(sql).map_err(Error::Parse)? {
             let mut result = self.execute_ddl(ddl)?;
@@ -738,6 +747,13 @@ impl QueryEngine {
     }
 
     /// Execute an INSERT statement.
+    ///
+    /// Wave 56c fix: when inserting a string literal into a VARCHAR / NVARCHAR
+    /// / TEXT column, the original string is now preserved in the column's
+    /// `string_columns` sidecar (`StringSearchColumn`). Previously, the string
+    /// was hashed to a u64 (via `parse_value_cell`) and the original was lost —
+    /// so subsequent `SELECT col` could only return the hash, and JSON_VALUE
+    /// / LIKE / range comparisons on inserted strings were broken.
     fn execute_insert(&mut self, ins: crate::sql::Insert) -> Result<QueryResult> {
         let table = self
             .catalog
@@ -769,6 +785,16 @@ impl QueryEngine {
 
         let n_new_rows = ins.values.len();
 
+        // Wave 56c: track which columns had string literals inserted, so we
+        // can update their string_columns sidecar after the loop. We collect
+        // the string values into a per-column Vec<String> and rebuild the
+        // StringSearchColumn at the end.
+        let mut string_inserts: std::collections::HashMap<usize, Vec<String>> = std::collections::HashMap::new();
+        // Determine which columns are string-typed (VARCHAR / NVARCHAR / TEXT).
+        let string_cols: std::collections::HashSet<usize> = (0..table.columns.len())
+            .filter(|&i| table.schema.as_ref().map(|s| s.is_string(i)).unwrap_or(false))
+            .collect();
+
         // Extend each column with the new values.
         for row_vals in &ins.values {
             for (i, &col_idx) in col_indices.iter().enumerate() {
@@ -779,6 +805,20 @@ impl QueryEngine {
                 // sole owner, or clones if shared.
                 let col = std::sync::Arc::make_mut(&mut table.columns[col_idx]);
                 col.push(cell);
+
+                // Wave 56c: if this is a string column and the value is a
+                // string literal, preserve the original string.
+                if string_cols.contains(&col_idx) && !is_null {
+                    let inner = extract_string_literal(val_str);
+                    if let Some(s) = inner {
+                        string_inserts.entry(col_idx).or_default().push(s);
+                    } else {
+                        // Non-literal value in a string column (e.g. a number).
+                        // Push the raw string as a fallback so the sidecar
+                        // stays aligned with the column length.
+                        string_inserts.entry(col_idx).or_default().push(val_str.trim().to_string());
+                    }
+                }
 
                 // Update the NULL bitmap (Wave 32): mark the cell as NULL
                 // if the value was explicitly NULL.
@@ -796,6 +836,10 @@ impl QueryEngine {
                     } else {
                         table.null_bitmaps[col_idx].as_mut().unwrap().push_null();
                     }
+                    // Wave 56c: also push an empty string to keep the sidecar aligned.
+                    if string_cols.contains(&col_idx) {
+                        string_inserts.entry(col_idx).or_default().push(String::new());
+                    }
                 } else {
                     // Non-NULL value: ensure bitmap exists and push non-null.
                     if col_idx < table.null_bitmaps.len() {
@@ -807,6 +851,34 @@ impl QueryEngine {
             }
         }
         table.row_count += n_new_rows;
+
+        // Wave 56c: rebuild the string_columns sidecar for any column that
+        // received string inserts. We merge with any existing strings.
+        for (col_idx, new_strings) in string_inserts {
+            // Ensure string_columns is sized.
+            while table.string_columns.len() <= col_idx {
+                table.string_columns.push(None);
+            }
+            // If there's an existing StringSearchColumn, merge; else build fresh.
+            let existing = table.string_columns[col_idx].clone();
+            let merged_strings: Vec<String> = if let Some(sc) = existing {
+                let mut v = sc.strings.clone();
+                v.extend(new_strings);
+                v
+            } else {
+                // Pad with empty strings for any rows before the inserted ones
+                // (in case the column had rows before string tracking was added).
+                let mut v = Vec::with_capacity(table.row_count);
+                for _ in 0..(table.row_count - new_strings.len()) {
+                    v.push(String::new());
+                }
+                v.extend(new_strings);
+                v
+            };
+            table.string_columns[col_idx] = Some(std::sync::Arc::new(
+                crate::exec::fm_index::StringSearchColumn::new(merged_strings),
+            ));
+        }
 
         // Return a result with the number of rows inserted.
         let mut result = QueryResult::empty();
@@ -1052,6 +1124,24 @@ impl Default for QueryEngine {
 // -----------------------------------------------------------------------
 // DML helper functions (Wave 4)
 // -----------------------------------------------------------------------
+
+/// Extract the inner string from a SQL string literal `'...'`, handling
+/// the `''` escape (a literal single quote inside the string). Returns
+/// None if `s` is not a string literal.
+///
+/// Wave 56c: used by `execute_insert` to preserve the original string
+/// value when inserting into a VARCHAR / NVARCHAR / TEXT column, so that
+/// subsequent SELECTs can recover the string (via the `string_columns`
+/// sidecar) and JSON_VALUE / LIKE / range comparisons work correctly.
+fn extract_string_literal(s: &str) -> Option<String> {
+    let trimmed = s.trim();
+    if !(trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2) {
+        return None;
+    }
+    let inner = &trimmed[1..trimmed.len() - 1];
+    // Handle the `''` escape (a literal single quote inside the string).
+    Some(inner.replace("''", "'"))
+}
 
 /// Parse a value string from the DML parser into a u64 cell.
 ///
@@ -2425,4 +2515,278 @@ fn apply_pivot(result: &QueryResult, spec: &PivotSpec) -> QueryResult {
         &spec.pivot_values,
         &spec.agg,
     )
+}
+
+// -----------------------------------------------------------------------
+// Wave 56c: JSON_VALUE / JSON_QUERY wiring.
+// -----------------------------------------------------------------------
+
+/// Check whether a SQL string contains a `JSON_VALUE(` or `JSON_QUERY(` call
+/// (case-insensitive). Used by `execute_inner` to decide whether to intercept
+/// the query for JSON post-processing.
+fn contains_json_value_call(sql: &str) -> bool {
+    let lower = sql.to_lowercase();
+    lower.contains("json_value(") || lower.contains("json_query(")
+}
+
+/// A parsed JSON_VALUE / JSON_QUERY call extracted from a SQL string.
+struct JsonValueCall {
+    /// Byte offset in the original SQL where the call begins (the 'J' of
+    /// JSON_VALUE / JSON_QUERY).
+    start: usize,
+    /// Byte offset one past the closing ')' of the call (or past the alias
+    /// if one was present).
+    end: usize,
+    /// The column name argument (first arg).
+    col_name: String,
+    /// The JSON path argument (second arg, without quotes).
+    path: String,
+    /// Whether this is JSON_QUERY (true) or JSON_VALUE (false).
+    is_query: bool,
+    /// Optional `AS alias` that immediately follows the call (consumed from
+    /// the SQL during rewriting).
+    alias: Option<String>,
+    /// 0-indexed position of this call in the SELECT list (count of top-level
+    /// commas between SELECT and the call's byte position). Used to find the
+    /// corresponding result column after execution, since the basic parser
+    /// discards column aliases.
+    select_position: usize,
+}
+
+/// Extract all JSON_VALUE / JSON_QUERY calls from a SQL string. Returns one
+/// entry per call, in order of appearance. Each entry carries the byte range
+/// so the caller can rewrite the SQL.
+fn extract_json_value_calls(sql: &str) -> Vec<JsonValueCall> {
+    let lower = sql.to_lowercase();
+    // Find the SELECT keyword position (to compute select_position).
+    let select_pos = lower.find("select ").or_else(|| lower.find("select\n"));
+    let mut calls = Vec::new();
+    let mut search_from = 0;
+    loop {
+        // Find the next "json_value(" or "json_query(".
+        let jv_pos = lower[search_from..].find("json_value(").map(|p| p + search_from);
+        let jq_pos = lower[search_from..].find("json_query(").map(|p| p + search_from);
+        let (pos, is_query) = match (jv_pos, jq_pos) {
+            (Some(p), Some(q)) => if p <= q { (p, false) } else { (q, true) },
+            (Some(p), None) => (p, false),
+            (None, Some(q)) => (q, true),
+            (None, None) => break,
+        };
+        // Walk forward from `pos` to find the matching close paren.
+        let after_open = lower[pos..].find('(').unwrap() + 1;
+        let mut depth = 1i32;
+        let mut cur = pos + after_open;
+        let bytes = sql.as_bytes();
+        let mut in_str = false;
+        let mut close = None;
+        while cur < bytes.len() {
+            let c = bytes[cur] as char;
+            if in_str {
+                if c == '\'' {
+                    in_str = false;
+                }
+            } else {
+                match c {
+                    '\'' => in_str = true,
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(cur);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            cur += 1;
+        }
+        let close = match close {
+            Some(c) => c,
+            None => break,
+        };
+        // The args are between after_open (relative to pos) and close.
+        let args_str = &sql[pos + after_open..close];
+        // Parse the two arguments: col_name, 'path'.
+        let (col_name, path) = match parse_json_value_args(args_str) {
+            Some(p) => p,
+            None => {
+                search_from = close + 1;
+                continue;
+            }
+        };
+        // Look for an optional `AS alias` after the close paren.
+        let mut after = close + 1;
+        let rest = &sql[after..];
+        let rest_trimmed = rest.trim_start();
+        let leading_ws = rest.len() - rest_trimmed.len();
+        let alias = if rest_trimmed.to_uppercase().starts_with("AS ") {
+            let after_as = &rest_trimmed["AS ".len()..];
+            let alias_len = after_as
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .count();
+            if alias_len > 0 {
+                let alias = after_as[..alias_len].to_string();
+                after += leading_ws + "AS ".len() + alias_len;
+                Some(alias)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        // Compute the 0-indexed position of this call in the SELECT list:
+        // count top-level commas between SELECT and the call's byte position.
+        let select_position = if let Some(sp) = select_pos {
+            count_top_level_commas(&lower[sp..pos])
+        } else {
+            0
+        };
+        calls.push(JsonValueCall {
+            start: pos,
+            end: after,
+            col_name,
+            path,
+            is_query,
+            alias,
+            select_position,
+        });
+        search_from = after;
+    }
+    calls
+}
+
+/// Count top-level commas in a SQL substring (commas not inside parentheses
+/// or string literals). Used to determine a JSON_VALUE call's position in
+/// the SELECT list.
+fn count_top_level_commas(s: &str) -> usize {
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut count = 0;
+    for c in s.chars() {
+        if in_str {
+            if c == '\'' { in_str = false; }
+        } else {
+            match c {
+                '\'' => in_str = true,
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                ',' if depth == 0 => count += 1,
+                _ => {}
+            }
+        }
+    }
+    count
+}
+
+/// Parse the arguments of a JSON_VALUE / JSON_QUERY call: `<col>, '<path>'`.
+/// Returns (col_name, path) or None if the args don't match the expected shape.
+fn parse_json_value_args(args: &str) -> Option<(String, String)> {
+    // Split on the first comma that's not inside a string.
+    let mut in_str = false;
+    let mut comma_pos = None;
+    for (i, c) in args.char_indices() {
+        match c {
+            '\'' => in_str = !in_str,
+            ',' if !in_str => {
+                comma_pos = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let comma_pos = comma_pos?;
+    let col_name = args[..comma_pos].trim().to_string();
+    let path_part = args[comma_pos + 1..].trim();
+    // path_part should be '...' — strip the quotes.
+    let path = if path_part.starts_with('\'') && path_part.ends_with('\'') && path_part.len() >= 2 {
+        path_part[1..path_part.len() - 1].to_string()
+    } else {
+        return None;
+    };
+    if col_name.is_empty() || path.is_empty() {
+        return None;
+    }
+    Some((col_name, path))
+}
+
+impl QueryEngine {
+    /// Execute a SQL string that contains one or more JSON_VALUE / JSON_QUERY
+    /// calls. The approach:
+    /// 1. Extract all JSON_VALUE / JSON_QUERY calls from the SQL, recording
+    ///    each call's byte range and its 0-indexed position in the SELECT list.
+    /// 2. Rewrite the SQL: replace each call (and its optional AS alias) with
+    ///    just the bare column name (e.g. `JSON_VALUE(payload, '$.name')` →
+    ///    `payload`).
+    /// 3. Execute the rewritten SQL via `execute_inner` (the rewritten SQL no
+    ///    longer contains `JSON_VALUE(`, so there's no infinite recursion).
+    /// 4. For each call, find the result column at the call's recorded SELECT
+    ///    position, apply json::json_value() (or json::json_query()) to each
+    ///    string value, and replace the column with a new ResultColumn whose
+    ///    string_values are the extracted JSON values.
+    /// 5. Rename the column to the user's alias (if provided) or to a sensible
+    ///    default like "json_value".
+    fn execute_with_json_value(
+        &mut self,
+        sql: &str,
+        start: &Instant,
+        txn_id: Option<u64>,
+    ) -> Result<QueryResult> {
+        let calls = extract_json_value_calls(sql);
+        if calls.is_empty() {
+            // Shouldn't happen — contains_json_value_call returned true — but
+            // fall through to the normal path just in case.
+            return self.execute_inner(sql, start, txn_id);
+        }
+        // Rewrite the SQL: replace each call with the bare column name.
+        let mut rewritten = String::with_capacity(sql.len());
+        let mut last_end = 0;
+        for c in &calls {
+            rewritten.push_str(&sql[last_end..c.start]);
+            rewritten.push_str(&c.col_name);
+            last_end = c.end;
+        }
+        rewritten.push_str(&sql[last_end..]);
+        // Execute the rewritten SQL. The rewritten SQL has no JSON_VALUE(...)
+        // calls, so this won't re-enter execute_with_json_value.
+        let mut result = self.execute_inner(&rewritten, start, txn_id)?;
+        // Post-process: for each call, find the result column at the call's
+        // SELECT position and apply json_value() / json_query() to its string
+        // values.
+        for c in &calls {
+            let col_idx = c.select_position;
+            if col_idx >= result.columns.len() {
+                continue;
+            }
+            // Get the string values from the column. If string_values is
+            // None, we can't extract JSON — skip this call.
+            let strings = result.columns[col_idx].string_values.clone().unwrap_or_default();
+            if strings.is_empty() {
+                continue;
+            }
+            let extracted: Vec<String> = strings.iter().map(|s| {
+                if c.is_query {
+                    crate::exec::json::json_query(s, &c.path).unwrap_or_default()
+                } else {
+                    crate::exec::json::json_value(s, &c.path).unwrap_or_default()
+                }
+            }).collect();
+            // Replace the column with a new one carrying the extracted strings.
+            use xxhash_rust::xxh3;
+            let values: Vec<u64> = extracted.iter().map(|s| xxh3::xxh3_64(s.as_bytes())).collect();
+            let final_name = c.alias.clone().unwrap_or_else(|| {
+                if c.is_query { "json_query".into() } else { "json_value".into() }
+            });
+            result.columns[col_idx] = ResultColumn {
+                name: final_name,
+                values,
+                string_values: Some(extracted),
+                type_oid: 25, // text OID
+                null_mask: None,
+            };
+        }
+        result.elapsed_us = start.elapsed().as_micros() as u64;
+        Ok(result)
+    }
 }

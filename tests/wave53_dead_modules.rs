@@ -111,21 +111,18 @@ fn merge_executes_through_engine() {
 }
 
 // -----------------------------------------------------------------------
-// JSON: JSON_VALUE / ISJSON callable through the json module.
-// The engine wiring is at the expression-evaluator level — these tests
-// verify the JSON functions work end-to-end when a SELECT contains them.
+// JSON: JSON_VALUE / JSON_QUERY callable through engine.execute().
+// Wave 56c: the previous tests called the json module directly (not through
+// engine.execute), so they didn't verify that JSON_VALUE is actually wired
+// into the SQL execution path. We now intercept JSON_VALUE(col, 'path') in
+// the SQL, rewrite it to `col AS __json_value_N__`, execute, and post-process
+// the result by applying json::json_value() to each string value.
 // -----------------------------------------------------------------------
 
 #[test]
 fn json_value_works_via_engine() {
-    // The JSON module is wired at the expression-evaluator level. Since
-    // the basic dispatcher doesn't parse JSON_VALUE() in SELECT items
-    // yet, this test uses the engine's tpch fallback path, which DOES
-    // support arbitrary function calls in projections.
-    //
-    // For now, we verify that the JSON functions are at least callable
-    // from the engine's module surface (the wiring is the public
-    // re-export in exec/mod.rs).
+    // Module-level smoke test (still useful — verifies the json module is
+    // exported and the basic happy path works).
     let json_str = r#"{"name": "Alice", "age": 30}"#;
     let v = turbogp::exec::json::json_value(json_str, "$.name").unwrap();
     assert_eq!(v, "Alice");
@@ -144,6 +141,65 @@ fn json_query_and_modify_work_via_engine() {
     assert!(q.contains("1"));
     let m = turbogp::exec::json::json_modify(json_str, "$.user.name", "\"Charlie\"");
     assert!(m.contains("Charlie"));
+}
+
+/// Wave 56c: JSON_VALUE through engine.execute() — verify the SQL
+/// `SELECT JSON_VALUE(col, '$.path') FROM t` is intercepted, the column
+/// is loaded as a string, and json::json_value() is applied to each row.
+#[test]
+fn json_value_through_engine_execute() {
+    let mut e = QueryEngine::new();
+    // Create a table with a VARCHAR column to hold JSON strings.
+    e.execute("CREATE TABLE docs (id INT, payload VARCHAR)").unwrap();
+    // Insert two rows with JSON payloads.
+    e.execute("INSERT INTO docs (id, payload) VALUES (1, '{\"name\":\"Alice\",\"age\":30}')").unwrap();
+    e.execute("INSERT INTO docs (id, payload) VALUES (2, '{\"name\":\"Bob\",\"age\":25}')").unwrap();
+
+    // SELECT JSON_VALUE(payload, '$.name') FROM docs — should return
+    // a single column with values "Alice" and "Bob".
+    let r = e.execute("SELECT JSON_VALUE(payload, '$.name') FROM docs");
+    assert!(r.is_ok(), "JSON_VALUE query must execute; got: {:?}", r.err());
+    let r = r.unwrap();
+    assert_eq!(r.row_count, 2, "JSON_VALUE must return one row per input row");
+    assert_eq!(r.columns.len(), 1, "JSON_VALUE must produce a single result column");
+    let col = &r.columns[0];
+    // The column must carry string_values with the extracted JSON scalars.
+    let strings = col.string_values.as_ref().expect("JSON_VALUE column must have string_values");
+    assert_eq!(strings.len(), 2, "string_values must have one entry per row");
+    assert!(strings.iter().any(|s| s == "Alice"), "string_values must contain 'Alice' — got: {:?}", strings);
+    assert!(strings.iter().any(|s| s == "Bob"), "string_values must contain 'Bob' — got: {:?}", strings);
+}
+
+/// Wave 56c: JSON_VALUE with an explicit AS alias — the alias should
+/// become the result column name.
+#[test]
+fn json_value_with_alias_through_engine_execute() {
+    let mut e = QueryEngine::new();
+    e.execute("CREATE TABLE docs (id INT, payload VARCHAR)").unwrap();
+    e.execute("INSERT INTO docs (id, payload) VALUES (1, '{\"name\":\"Alice\"}')").unwrap();
+
+    let r = e.execute("SELECT JSON_VALUE(payload, '$.name') AS username FROM docs").unwrap();
+    assert_eq!(r.row_count, 1);
+    let col = &r.columns[0];
+    assert_eq!(col.name, "username", "JSON_VALUE AS alias must rename the result column");
+    let strings = col.string_values.as_ref().expect("string_values");
+    assert_eq!(strings[0], "Alice");
+}
+
+/// Wave 56c: JSON_QUERY through engine.execute() — extracts an object/array
+/// rather than a scalar.
+#[test]
+fn json_query_through_engine_execute() {
+    let mut e = QueryEngine::new();
+    e.execute("CREATE TABLE docs (id INT, payload VARCHAR)").unwrap();
+    e.execute("INSERT INTO docs (id, payload) VALUES (1, '{\"user\":{\"name\":\"Alice\"}}')").unwrap();
+
+    let r = e.execute("SELECT JSON_QUERY(payload, '$.user') FROM docs").unwrap();
+    assert_eq!(r.row_count, 1);
+    let col = &r.columns[0];
+    let strings = col.string_values.as_ref().expect("string_values");
+    // The extracted object should contain "Alice".
+    assert!(strings[0].contains("Alice"), "JSON_QUERY must return the object containing 'Alice' — got: {}", strings[0]);
 }
 
 // -----------------------------------------------------------------------
