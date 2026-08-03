@@ -208,8 +208,14 @@ impl Parser {
     fn parse_select(&mut self) -> Result<SelectQuery, String> {
         self.expect_keyword("SELECT")?;
         let select = self.parse_select_list()?;
-        self.expect_keyword("FROM")?;
-        let from = self.parse_table_name()?;
+        // FROM is optional — allows `SELECT 1` and `SELECT count(*)`.
+        let from = if self.match_keyword("FROM") {
+            self.parse_table_name()?
+        } else {
+            // No FROM clause — use a synthetic single-row table.
+            // This allows `SELECT 1`, `SELECT count(*)`, etc.
+            "__dummy__".to_string()
+        };
 
         // Parse optional JOIN clauses
         let joins = self.parse_joins()?;
@@ -794,8 +800,10 @@ mod tests {
 
     #[test]
     fn parse_invalid_unexpected_eof() {
+        // FROM is now optional (Wave 6), so "SELECT *" should parse
+        // successfully and use the __dummy__ table.
         let r = parse_sql("SELECT *");
-        assert!(r.is_err(), "expected error for missing FROM");
+        assert!(r.is_ok(), "SELECT * without FROM should parse, got: {r:?}");
     }
 
     #[test]

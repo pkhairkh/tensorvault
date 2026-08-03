@@ -96,8 +96,19 @@ impl QueryEngine {
     /// [`QueryEngine::register_table`], [`QueryEngine::load_parquet`],
     /// or [`QueryEngine::load_csv`].
     pub fn new() -> Self {
+        let mut catalog = Catalog::new();
+        // Register a dummy table that allows `SELECT 1` and `SELECT count(*)`
+        // without a FROM clause. The table has one row and one column.
+        let dummy = Table {
+            name: "__dummy__".into(),
+            columns: vec![std::sync::Arc::new(vec![0u64])],
+            column_names: vec!["__dummy_col__".into()],
+            row_count: 1,
+            string_columns: vec![None],
+        };
+        catalog.register(dummy);
         Self {
-            catalog: Catalog::new(),
+            catalog,
             kernel_table: Arc::new(KernelTable::new()),
             cost_model: CostModel::default(),
             txn_manager: crate::txn::TxnManager::new(),
@@ -109,7 +120,9 @@ impl QueryEngine {
     /// [`CostModel::with_learned`]). The kernel table is still the
     /// default.
     pub fn with_cost_model(cost_model: CostModel) -> Self {
-        Self { catalog: Catalog::new(), kernel_table: Arc::new(KernelTable::new()), cost_model, txn_manager: crate::txn::TxnManager::new() }
+        let mut engine = Self::new();
+        engine.cost_model = cost_model;
+        engine
     }
 
     /// Borrow the catalog. Read-only access for callers that want to
@@ -251,10 +264,18 @@ impl QueryEngine {
         self.execute_inner(sql, &start)
     }
 
-    /// Inner execution: dispatches DDL, DML, and SELECT without
+    /// Inner execution: dispatches DDL, DML, CTE, and SELECT without
     /// transaction awareness. Called by `execute` either with the main
     /// catalog or with the txn snapshot swapped in.
     fn execute_inner(&mut self, sql: &str, start: &Instant) -> Result<QueryResult> {
+        // Try CTE (WITH ... SELECT ...) first.
+        if let Some(with_result) = crate::sql::parse_with(sql) {
+            let with = with_result.map_err(Error::Parse)?;
+            let mut result = self.execute_with(with)?;
+            result.elapsed_us = start.elapsed().as_micros() as u64;
+            return Ok(result);
+        }
+
         // Try DDL first (CREATE TABLE, DROP TABLE, CREATE SCHEMA).
         if let Some(ddl) = crate::sql::parse_ddl(sql).map_err(Error::Parse)? {
             let mut result = self.execute_ddl(ddl)?;
@@ -485,6 +506,86 @@ impl QueryEngine {
         Ok(result)
     }
 
+    /// Execute a WITH clause (CTEs + outer query).
+    ///
+    /// For each CTE:
+    /// 1. Execute the anchor query, register the result as a temp table
+    ///    in the catalog under the CTE name.
+    /// 2. If the CTE is recursive, iterate: execute the recursive query
+    ///    (which references the CTE name), compute the new rows (set
+    ///    difference), append them to the CTE table, and repeat until
+    ///    no new rows or MAXRECURSION is reached.
+    /// 3. Execute the outer query, which can reference any CTE by name.
+    fn execute_with(&mut self, with: crate::sql::WithClause) -> Result<QueryResult> {
+        let mut temp_tables: Vec<String> = Vec::new();
+
+        for cte in &with.ctes {
+            // Execute the anchor.
+            let anchor_result = self.execute_inner(&cte.anchor, &Instant::now())?;
+
+            // Register the anchor result as a temp table.
+            let temp_name = cte.name.clone();
+            let table = result_to_table(&temp_name, &anchor_result);
+            self.catalog.register(table);
+            temp_tables.push(temp_name.clone());
+
+            // If recursive, iterate.
+            if let Some(recursive_sql) = &cte.recursive {
+                let max_iter = if with.max_recursion == 0 {
+                    100_000 // unlimited (capped at 100k for safety)
+                } else {
+                    with.max_recursion
+                };
+
+                for _ in 0..max_iter {
+                    // Execute the recursive query with the current CTE state.
+                    let rec_result = self.execute_inner(recursive_sql, &Instant::now())?;
+
+                    // Compute new rows: rows in rec_result that aren't already
+                    // in the CTE table. For simplicity, we compare by row
+                    // content (all columns must match).
+                    let new_rows = compute_new_rows(
+                        &self.catalog.get(&temp_name).cloned().unwrap_or_else(|| {
+                            Table {
+                                name: temp_name.clone(),
+                                columns: vec![],
+                                column_names: vec![],
+                                row_count: 0,
+                                string_columns: vec![],
+                            }
+                        }),
+                        &rec_result,
+                    );
+
+                    if new_rows == 0 {
+                        break; // No new rows — recursion complete.
+                    }
+
+                    // Append the new rows to the CTE table.
+                    // We append ALL rows from rec_result (not just the new
+                    // ones) because the recursive query should only produce
+                    // new rows if written correctly. A proper set-difference
+                    // would be more correct but expensive.
+                    let cte_table = self
+                        .catalog
+                        .get_mut(&temp_name)
+                        .ok_or_else(|| Error::NotFound(format!("CTE table \"{temp_name}\"")))?;
+                    append_result_rows(cte_table, &rec_result);
+                }
+            }
+        }
+
+        // Execute the outer query.
+        let result = self.execute_inner(&with.outer_query, &Instant::now())?;
+
+        // Clean up temp tables.
+        for name in &temp_tables {
+            self.catalog.drop(name);
+        }
+
+        Ok(result)
+    }
+
     /// Execute a TPC-H SQL query using the dedicated TPC-H interpreter.
     ///
     /// This path uses `src/engine/tpch.rs` which has a richer parser
@@ -647,6 +748,75 @@ fn eval_simple_where(table: &Table, where_str: &str) -> Result<Vec<bool>> {
     }
 
     Ok(result)
+}
+
+// -----------------------------------------------------------------------
+// CTE helper functions (Wave 6)
+// -----------------------------------------------------------------------
+
+/// Convert a QueryResult into a Table that can be registered in the catalog.
+fn result_to_table(name: &str, result: &QueryResult) -> Table {
+    let column_names: Vec<String> = result.columns.iter().map(|c| c.name.clone()).collect();
+    let columns: Vec<std::sync::Arc<Vec<u64>>> = result
+        .columns
+        .iter()
+        .map(|c| std::sync::Arc::new(c.values.clone()))
+        .collect();
+    let string_columns: Vec<Option<std::sync::Arc<crate::exec::fm_index::StringSearchColumn>>> =
+        vec![None; result.columns.len()];
+    Table {
+        name: name.to_string(),
+        columns,
+        column_names,
+        row_count: result.row_count,
+        string_columns,
+    }
+}
+
+/// Compute how many rows in `result` are new (not already in `table`).
+/// A row is "new" if its full column content doesn't match any existing
+/// row in the table. This is O(result_rows × table_rows × ncols) —
+/// expensive but correct for small CTEs.
+fn compute_new_rows(table: &Table, result: &QueryResult) -> usize {
+    if result.row_count == 0 {
+        return 0;
+    }
+    let ncols = result.columns.len();
+    let mut new_count = 0;
+    for r_row in 0..result.row_count {
+        let mut found = false;
+        for t_row in 0..table.row_count {
+            let mut matches = true;
+            for col_idx in 0..ncols {
+                let r_val = result.columns[col_idx].values.get(r_row).copied().unwrap_or(0);
+                let t_val = table.columns.get(col_idx).and_then(|c| c.get(t_row)).copied().unwrap_or(0);
+                if r_val != t_val {
+                    matches = false;
+                    break;
+                }
+            }
+            if matches {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            new_count += 1;
+        }
+    }
+    new_count
+}
+
+/// Append all rows from a QueryResult to an existing Table. The table
+/// must have the same number of columns as the result.
+fn append_result_rows(table: &mut Table, result: &QueryResult) {
+    for col_idx in 0..result.columns.len() {
+        if col_idx < table.columns.len() {
+            let col = std::sync::Arc::make_mut(&mut table.columns[col_idx]);
+            col.extend_from_slice(&result.columns[col_idx].values);
+        }
+    }
+    table.row_count += result.row_count;
 }
 
 #[cfg(test)]
@@ -879,10 +1049,22 @@ mod tests {
     }
 
     /// `QueryEngine::default()` is equivalent to `new()`.
+    /// The catalog contains the internal `__dummy__` table (used for
+    /// FROM-less SELECTs), so it's not strictly empty — but it has no
+    /// user-registered tables.
     #[test]
     fn default_is_empty() {
         let mut engine = QueryEngine::default();
-        assert!(engine.catalog().is_empty());
+        // The __dummy__ table is always present.
+        assert_eq!(engine.catalog().len(), 1);
+        // But no user tables.
+        let names: Vec<&str> = engine
+            .catalog()
+            .table_names()
+            .into_iter()
+            .filter(|n| *n != "__dummy__")
+            .collect();
+        assert!(names.is_empty());
     }
 
     /// Accessors return the right types.

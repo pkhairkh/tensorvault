@@ -31,6 +31,7 @@
 //! the surface area auditable; it also lets the parser grow the seven
 //! turboGP-specific extensions natively rather than via visitor patterns.
 
+pub mod cte;
 pub mod ddl;
 pub mod dml;
 pub mod extensions;
@@ -38,6 +39,7 @@ pub mod lexer;
 pub mod parser;
 pub mod plan;
 
+pub use cte::{parse_with, CteDef, WithClause};
 pub use ddl::{parse_ddl, ColumnDef, ColumnType, CreateTable, DdlStatement, DropTable};
 pub use dml::{parse_dml, Delete, DmlStatement, Insert, Update};
 pub use extensions::{parse_extensions, parse_extensions_and_strip, QueryExtensions};

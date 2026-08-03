@@ -116,6 +116,14 @@ pub const KEYWORDS: &[&str] = &[
     "SET",
     "INTO",
     "OUTPUT",
+
+    // CTE keywords (Wave 6)
+    "WITH",
+    "UNION",
+    "RECURSIVE",
+    "ALL",
+    "OPTION",
+    "MAXRECURSION",
 ];
 
 /// A single SQL token.
