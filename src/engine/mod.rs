@@ -64,7 +64,7 @@ pub use result::{QueryResult, ResultColumn};
 
 use crate::catalog::Catalog;
 use crate::datasource::table::Table;
-use crate::datasource::{read_csv, read_parquet};
+use crate::datasource::{read_csv, read_parquet, read_parquet_column, read_parquet_column_names};
 use crate::error::{Error, Result};
 use crate::kernel::KernelTable;
 use crate::planner::CostModel;
@@ -171,6 +171,62 @@ impl QueryEngine {
     pub fn load_parquet(&mut self, path: &str, table_name: &str) -> Result<usize> {
         let loaded = read_parquet(path).map_err(|e| Error::Other(e.to_string()))?;
         let row_count = loaded.row_count;
+        let mut table = Table::from_loaded(loaded);
+        table.name = table_name.to_string();
+        self.catalog.register(table);
+        Ok(row_count)
+    }
+
+    /// Load a Parquet file with column pruning (Wave 30).
+    ///
+    /// Only loads columns referenced in the SQL query, skipping the rest.
+    /// For a 105-column table where the query references 3 columns, this
+    /// reduces I/O by ~35x.
+    ///
+    /// First loads all column names (cheap metadata read), then uses
+    /// `prune_columns()` to determine which to materialize, then reads
+    /// only those columns via `read_parquet_column()`.
+    pub fn load_parquet_with_projection(
+        &mut self,
+        path: &str,
+        table_name: &str,
+        sql: &str,
+    ) -> Result<usize> {
+        // Step 1: Read all column names from the Parquet file (metadata only, no data).
+        let all_columns = read_parquet_column_names(path)
+            .map_err(|e| Error::Other(e.to_string()))?;
+
+        // Step 2: Determine which columns are needed.
+        let (needed_cols, pruned_count) = crate::datasource::projection::prune_columns(sql, &all_columns);
+        log::debug!(
+            "load_parquet_with_projection: {} of {} columns needed ({} pruned)",
+            needed_cols.len(), all_columns.len(), pruned_count
+        );
+
+        // Step 3: If SELECT * or all columns needed, just load everything.
+        if needed_cols.is_empty() || needed_cols.len() == all_columns.len() {
+            return self.load_parquet(path, table_name);
+        }
+
+        // Step 4: Load only the needed columns.
+        let mut columns: Vec<crate::datasource::LoadedColumn> = Vec::new();
+        let mut row_count = 0usize;
+        for col_name in &needed_cols {
+            if let Ok(loaded_col) = read_parquet_column(path, col_name) {
+                row_count = loaded_col.row_count;
+                columns.push(loaded_col);
+            }
+        }
+
+        if columns.is_empty() {
+            return self.load_parquet(path, table_name);
+        }
+
+        let loaded = crate::datasource::parquet::LoadedTable {
+            name: table_name.into(),
+            columns,
+            row_count,
+        };
         let mut table = Table::from_loaded(loaded);
         table.name = table_name.to_string();
         self.catalog.register(table);

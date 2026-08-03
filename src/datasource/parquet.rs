@@ -190,6 +190,15 @@ pub fn read_parquet(path: &str) -> Result<LoadedTable, Box<dyn Error>> {
 ///
 /// Same as [`read_parquet`], plus `column_name` not found in the
 /// schema.
+/// Read only the column names from a Parquet file (metadata-only, no data read).
+/// Used by column pruning (Wave 30) to determine which columns to load.
+pub fn read_parquet_column_names(path: &str) -> Result<Vec<String>, Box<dyn Error>> {
+    let file = File::open(path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let schema = builder.schema();
+    Ok(schema.fields().iter().map(|f| f.name().to_string()).collect())
+}
+
 pub fn read_parquet_column(path: &str, column_name: &str) -> Result<LoadedColumn, Box<dyn Error>> {
     let file = File::open(path)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
