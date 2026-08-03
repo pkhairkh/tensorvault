@@ -42,6 +42,7 @@
 
 pub mod csv;
 pub mod parquet;
+pub mod projection;
 pub mod table;
 
 pub use csv::read_csv;
