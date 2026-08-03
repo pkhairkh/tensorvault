@@ -212,7 +212,7 @@ fn execute_shape(shape: QueryShape, query: &SelectQuery, table: &Table) -> Resul
             let indices: Vec<usize> = (0..table.row_count).filter(|&i| mask[i]).take(limit).collect();
             let cols: Vec<ResultColumn> = table.column_names.iter().enumerate().map(|(i, name)| {
                 let values: Vec<u64> = indices.iter().map(|&idx| table.columns[i][idx]).collect();
-                ResultColumn { name: name.clone(), values, string_values: None }
+                ResultColumn { name: name.clone(), values, string_values: None, type_oid: 0 }
             }).collect();
             Ok(QueryResult { columns: cols, row_count: indices.len(), elapsed_us: 0 })
         }
@@ -265,7 +265,7 @@ fn execute_shape(shape: QueryShape, query: &SelectQuery, table: &Table) -> Resul
                 } else { None }
             } else { None };
 
-            Ok(QueryResult { columns: vec![ResultColumn { name, values: values.clone(), string_values }], row_count: values.len(), elapsed_us: 0 })
+            Ok(QueryResult { columns: vec![ResultColumn { name, values: values.clone(), string_values, type_oid: 0 }], row_count: values.len(), elapsed_us: 0 })
         }
         QueryShape::SelectMulti => {
             let mask = build_filter_mask(query, table)?;
@@ -276,11 +276,11 @@ fn execute_shape(shape: QueryShape, query: &SelectQuery, table: &Table) -> Resul
                 if let SelectItem::Column(name) = item {
                     let col_idx = resolve_col_name(name, table)?;
                     let values: Vec<u64> = indices.iter().map(|&i| table.columns[col_idx][i]).collect();
-                    cols.push(ResultColumn { name: name.clone(), values, string_values: None });
+                    cols.push(ResultColumn { name: name.clone(), values, string_values: None, type_oid: 0 });
                 } else if let SelectItem::Star = item {
                     for (col_idx, name) in table.column_names.iter().enumerate() {
                         let values: Vec<u64> = indices.iter().map(|&row_idx| table.columns[col_idx][row_idx]).collect();
-                        cols.push(ResultColumn { name: name.clone(), values, string_values: None });
+                        cols.push(ResultColumn { name: name.clone(), values, string_values: None, type_oid: 0 });
                     }
                 }
             }
@@ -554,7 +554,7 @@ fn resolve_col_name(name: &str, table: &Table) -> Result<usize> {
 
 fn single_value(name: &str, value: u64) -> QueryResult {
     QueryResult {
-        columns: vec![ResultColumn { name: name.to_string(), values: vec![value] , string_values: None }],
+        columns: vec![ResultColumn { name: name.to_string(), values: vec![value] , string_values: None, type_oid: 0 }],
         row_count: 1,
         elapsed_us: 0,
     }
@@ -646,10 +646,10 @@ fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
                 // GROUP BY column
                 let gb_name = &query.group_by[0];
                 let gb_values: Vec<u64> = results.iter().map(|(k, _)| *k).collect();
-                result_cols.push(ResultColumn { name: gb_name.clone(), values: gb_values , string_values: None });
+                result_cols.push(ResultColumn { name: gb_name.clone(), values: gb_values , string_values: None, type_oid: 0 });
                 // Aggregate column
                 let agg_values: Vec<u64> = results.iter().map(|(_, v)| *v).collect();
-                result_cols.push(ResultColumn { name: name.to_string(), values: agg_values , string_values: None });
+                result_cols.push(ResultColumn { name: name.to_string(), values: agg_values , string_values: None, type_oid: 0 });
 
                 let row_count = results.len();
                 let mut result = QueryResult { columns: result_cols, row_count, elapsed_us: 0 };
@@ -667,7 +667,7 @@ fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
                     });
                     let new_cols: Vec<ResultColumn> = result.columns.iter().map(|c| {
                         let values: Vec<u64> = idx.iter().map(|&i| c.values[i]).collect();
-                        ResultColumn { name: c.name.clone(), values, string_values: None }
+                        ResultColumn { name: c.name.clone(), values, string_values: None, type_oid: 0 }
                     }).collect();
                     result = QueryResult { columns: new_cols, row_count: result.row_count, elapsed_us: result.elapsed_us };
                 }
@@ -705,7 +705,7 @@ fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
             }
             0
         }).collect();
-        result_cols.push(ResultColumn { name: col_name.clone(), values, string_values: None });
+        result_cols.push(ResultColumn { name: col_name.clone(), values, string_values: None, type_oid: 0 });
     }
 
     for item in &query.select {
@@ -750,7 +750,7 @@ fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
                     _ => 0,
                 }
             }).collect();
-            result_cols.push(ResultColumn { name: name.to_string(), values, string_values: None });
+            result_cols.push(ResultColumn { name: name.to_string(), values, string_values: None, type_oid: 0 });
         }
     }
 
@@ -769,7 +769,7 @@ fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
         });
         let new_cols: Vec<ResultColumn> = result.columns.iter().map(|c| {
             let values: Vec<u64> = idx.iter().map(|&i| c.values[i]).collect();
-            ResultColumn { name: c.name.clone(), values, string_values: None }
+            ResultColumn { name: c.name.clone(), values, string_values: None, type_oid: 0 }
         }).collect();
         result = QueryResult { columns: new_cols, row_count: result.row_count, elapsed_us: result.elapsed_us };
     }
@@ -870,8 +870,7 @@ fn execute_string_group_by(
                 result_cols.push(ResultColumn {
                     name: v.to_string(),
                     values: vec![*v; row_count],
-                    string_values: None,
-                });
+                    string_values: None, type_oid: 0 });
             }
             SelectItem::Column(name) => {
                 // The GROUP BY column — emit the per-group hash. (We
@@ -880,8 +879,7 @@ fn execute_string_group_by(
                 result_cols.push(ResultColumn {
                     name: name.clone(),
                     values: pairs.iter().map(|(h, _)| *h).collect(),
-                    string_values: None,
-                });
+                    string_values: None, type_oid: 0 });
             }
             SelectItem::Aggregate { func, arg: _, alias } => {
                 let func_upper = func.to_uppercase();
@@ -894,8 +892,7 @@ fn execute_string_group_by(
                 result_cols.push(ResultColumn {
                     name,
                     values: pairs.iter().map(|(_, c)| *c).collect(),
-                    string_values: None,
-                });
+                    string_values: None, type_oid: 0 });
             }
             SelectItem::Star => {
                 // `SELECT *` with GROUP BY is not meaningful; skip.

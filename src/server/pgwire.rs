@@ -432,12 +432,21 @@ impl PgConn {
             body.extend_from_slice(col.name.as_bytes()); body.push(0);
             body.extend_from_slice(&0u32.to_be_bytes()); // table OID
             body.extend_from_slice(&0u16.to_be_bytes()); // col attr
-            // Type OID: if the column has string_values, report TEXT (OID 25);
-            // otherwise report INT8 (OID 20). (Wave 34)
-            let (type_oid, type_size) = if col.has_strings() {
-                (25u32, -1i16) // TEXT, variable size
+            // Type OID: use col.type_oid if set (Wave 47), otherwise
+            // fall back to string_values heuristic (Wave 34).
+            let (type_oid, type_size) = if col.type_oid != 0 {
+                // Use the schema-provided type OID.
+                let size = match col.type_oid {
+                    25 => -1i16, // TEXT: variable size
+                    701 | 700 => 8i16, // FLOAT8/FLOAT4
+                    16 => 1i16, // BOOL
+                    _ => 8i16, // default: 8 bytes (INT8)
+                };
+                (col.type_oid, size)
+            } else if col.has_strings() {
+                (25u32, -1i16) // TEXT
             } else {
-                (20u32, 8i16)  // INT8, 8 bytes
+                (20u32, 8i16)  // INT8
             };
             body.extend_from_slice(&type_oid.to_be_bytes());
             body.extend_from_slice(&type_size.to_be_bytes());

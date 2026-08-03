@@ -50,8 +50,7 @@ pub fn pivot(
     out_cols.push(ResultColumn {
         name: group_col.to_string(),
         values: groups.clone(),
-        string_values: None,
-    });
+        string_values: None, type_oid: 0 });
 
     for pv in pivot_values {
         let pv_cell = string_to_cell(pv);
@@ -91,8 +90,7 @@ pub fn pivot(
         out_cols.push(ResultColumn {
             name: pv.clone(),
             values: col_vals,
-        string_values: None,
-    });
+        string_values: None, type_oid: 0 });
     }
 
     let mut result = QueryResult::empty();
@@ -139,8 +137,7 @@ pub fn unpivot(
         out_cols.push(ResultColumn {
             name: id_col_name.clone(),
             values: vals,
-        string_values: None,
-    });
+        string_values: None, type_oid: 0 });
     }
 
     // Label column: the column names repeated for each input row.
@@ -153,8 +150,7 @@ pub fn unpivot(
     out_cols.push(ResultColumn {
         name: label_col_name.to_string(),
         values: label_vals,
-    string_values: None,
-});
+    string_values: None, type_oid: 0 });
 
     // Value column: the actual values from each unpivot column.
     let mut value_vals = Vec::with_capacity(total_out_rows);
@@ -170,8 +166,7 @@ pub fn unpivot(
     out_cols.push(ResultColumn {
         name: value_col_name.to_string(),
         values: value_vals,
-    string_values: None,
-});
+    string_values: None, type_oid: 0 });
 
     let mut result = QueryResult::empty();
     result.row_count = out_row_count;
@@ -198,13 +193,12 @@ pub fn grouping_sets(
         out_cols.push(ResultColumn {
             name: col_name.clone(),
             values: Vec::new(),
-        string_values: None,
-    });
+        string_values: None, type_oid: 0 });
     }
     out_cols.push(ResultColumn {
         name: format!("{}_{}", agg.to_lowercase(), agg_col),
         values: Vec::new(),
-        string_values: None,
+        string_values: None, type_oid: 0,
     });
 
     // For each grouping set, compute the aggregate.
@@ -339,7 +333,7 @@ mod tests {
     fn make_result(names: &[&str], cols: &[Vec<u64>]) -> QueryResult {
         let mut r = QueryResult::empty();
         for (i, name) in names.iter().enumerate() {
-            r.push_column(ResultColumn { name: name.to_string(), values: cols[i].clone() , string_values: None })
+            r.push_column(ResultColumn { name: name.to_string(), values: cols[i].clone() , string_values: None, type_oid: 0 })
                 .unwrap();
         }
         r

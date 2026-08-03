@@ -452,8 +452,7 @@ mod tests {
             r.push_column(ResultColumn {
                 name: name.to_string(),
                 values: cols[i].clone(),
-                string_values: None,
-            })
+                string_values: None, type_oid: 0 })
             .unwrap();
         }
         r

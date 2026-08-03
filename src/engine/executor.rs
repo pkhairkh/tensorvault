@@ -115,8 +115,7 @@ pub fn execute_select(
                     columns: vec![ResultColumn {
                         name: v.to_string(),
                         values: vec![*v],
-                        string_values: None,
-                    }],
+                        string_values: None, type_oid: 0 }],
                     row_count: 1,
                     elapsed_us: 0,
                 }
@@ -324,7 +323,7 @@ fn execute_group_by(
     // GROUP BY columns come first
     for (i, col_name) in query.group_by.iter().enumerate() {
         let values: Vec<u64> = groups.keys().map(|k| k[i]).collect();
-        result_cols.push(ResultColumn { name: col_name.clone(), values, string_values: None });
+        result_cols.push(ResultColumn { name: col_name.clone(), values, string_values: None, type_oid: 0 });
     }
 
     // Aggregate columns
@@ -334,7 +333,7 @@ fn execute_group_by(
             let values: Vec<u64> = groups.values().map(|indices| {
                 compute_aggregate(func, arg, indices, table)
             }).collect();
-            result_cols.push(ResultColumn { name: name.to_string(), values, string_values: None });
+            result_cols.push(ResultColumn { name: name.to_string(), values, string_values: None, type_oid: 0 });
         }
     }
 
@@ -486,7 +485,7 @@ fn order_group_result(result: QueryResult, order_by: &[(String, bool)]) -> Resul
         let string_values = c.string_values.as_ref().map(|sv| {
             indices.iter().map(|&i| sv.get(i).cloned().unwrap_or_default()).collect::<Vec<String>>()
         });
-        ResultColumn { name: c.name.clone(), values, string_values }
+        ResultColumn { name: c.name.clone(), values, string_values, type_oid: 0 }
     }).collect();
 
     Ok(QueryResult { columns: new_cols, row_count: result.row_count, elapsed_us: result.elapsed_us })
@@ -512,18 +511,18 @@ fn execute_aggregate_no_group(
                 let idx = table.column_idx(name)
                     .ok_or_else(|| Error::NotFound(format!("column '{}'", name)))?;
                 let val = if indices.len() == 1 { table.columns[idx][indices[0]] } else { 0 };
-                cols.push(ResultColumn { name: name.clone(), values: vec![val] , string_values: None });
+                cols.push(ResultColumn { name: name.clone(), values: vec![val] , string_values: None, type_oid: 0 });
             }
             SelectItem::Aggregate { func, arg, alias } => {
                 let name = alias.as_deref().unwrap_or(func.as_str());
                 let val = compute_aggregate(func, arg, &indices, table);
-                cols.push(ResultColumn { name: name.to_string(), values: vec![val] , string_values: None });
+                cols.push(ResultColumn { name: name.to_string(), values: vec![val] , string_values: None, type_oid: 0 });
             }
             SelectItem::Star => {
-                cols.push(ResultColumn { name: "count".into(), values: vec![indices.len() as u64] , string_values: None });
+                cols.push(ResultColumn { name: "count".into(), values: vec![indices.len() as u64] , string_values: None, type_oid: 0 });
             }
             SelectItem::Literal(v) => {
-                cols.push(ResultColumn { name: v.to_string(), values: vec![*v] , string_values: None });
+                cols.push(ResultColumn { name: v.to_string(), values: vec![*v] , string_values: None, type_oid: 0 });
             }
             SelectItem::Window { .. } => {
                 return Err(Error::Other("window function in multi-aggregate — should use tpch fallback".into()));
@@ -580,7 +579,7 @@ fn execute_count(arg: &str, name: &str, where_clause: &WhereClause, table: &Tabl
     if arg == "*" {
         if let WhereClause::None = where_clause {
             return Ok(QueryResult {
-                columns: vec![ResultColumn { name: name.into(), values: vec![table.row_count as u64] , string_values: None }],
+                columns: vec![ResultColumn { name: name.into(), values: vec![table.row_count as u64] , string_values: None, type_oid: 0 }],
                 row_count: 1,
                 elapsed_us: 0,
             });
@@ -601,7 +600,7 @@ fn execute_count(arg: &str, name: &str, where_clause: &WhereClause, table: &Tabl
             let mut output = [0u8; 64];
             let result = unsafe { kernel.execute(col.as_ptr() as *const u8, output.as_mut_ptr(), &params) };
             return Ok(QueryResult {
-                columns: vec![ResultColumn { name: name.into(), values: vec![result.count] , string_values: None }],
+                columns: vec![ResultColumn { name: name.into(), values: vec![result.count] , string_values: None, type_oid: 0 }],
                 row_count: 1,
                 elapsed_us: 0,
             });
@@ -618,7 +617,7 @@ fn execute_count(arg: &str, name: &str, where_clause: &WhereClause, table: &Tabl
         indices.iter().filter(|&&i| !is_cell_null(table, idx, i)).count() as u64
     };
     Ok(QueryResult {
-        columns: vec![ResultColumn { name: name.into(), values: vec![count] , string_values: None }],
+        columns: vec![ResultColumn { name: name.into(), values: vec![count] , string_values: None, type_oid: 0 }],
         row_count: 1,
         elapsed_us: 0,
     })
@@ -641,7 +640,7 @@ fn execute_sum(arg: &str, name: &str, where_clause: &WhereClause, table: &Table)
     };
     // Return as f64 bits so scalar_f64() interprets correctly
     Ok(QueryResult {
-        columns: vec![ResultColumn { name: name.into(), values: vec![(sum as f64).to_bits()] , string_values: None }],
+        columns: vec![ResultColumn { name: name.into(), values: vec![(sum as f64).to_bits()] , string_values: None, type_oid: 0 }],
         row_count: 1,
         elapsed_us: 0,
     })
@@ -653,7 +652,7 @@ fn execute_avg(arg: &str, name: &str, where_clause: &WhereClause, table: &Table)
     let indices = filter_indices(where_clause, table);
     if indices.is_empty() {
         return Ok(QueryResult {
-            columns: vec![ResultColumn { name: name.into(), values: vec![0u64] , string_values: None }],
+            columns: vec![ResultColumn { name: name.into(), values: vec![0u64] , string_values: None, type_oid: 0 }],
             row_count: 1,
             elapsed_us: 0,
         });
@@ -661,7 +660,7 @@ fn execute_avg(arg: &str, name: &str, where_clause: &WhereClause, table: &Table)
     let sum: u64 = indices.iter().map(|&i| table.columns[idx][i]).sum();
     let avg = sum as f64 / indices.len() as f64;
     Ok(QueryResult {
-        columns: vec![ResultColumn { name: name.into(), values: vec![avg.to_bits()] , string_values: None }],
+        columns: vec![ResultColumn { name: name.into(), values: vec![avg.to_bits()] , string_values: None, type_oid: 0 }],
         row_count: 1,
         elapsed_us: 0,
     })
@@ -681,7 +680,7 @@ fn execute_min(arg: &str, name: &str, where_clause: &WhereClause, table: &Table)
         indices.iter().map(|&i| table.columns[idx][i]).min().unwrap_or(0)
     };
     Ok(QueryResult {
-        columns: vec![ResultColumn { name: name.into(), values: vec![min] , string_values: None }],
+        columns: vec![ResultColumn { name: name.into(), values: vec![min] , string_values: None, type_oid: 0 }],
         row_count: 1,
         elapsed_us: 0,
     })
@@ -701,7 +700,7 @@ fn execute_max(arg: &str, name: &str, where_clause: &WhereClause, table: &Table)
         indices.iter().map(|&i| table.columns[idx][i]).max().unwrap_or(0)
     };
     Ok(QueryResult {
-        columns: vec![ResultColumn { name: name.into(), values: vec![max] , string_values: None }],
+        columns: vec![ResultColumn { name: name.into(), values: vec![max] , string_values: None, type_oid: 0 }],
         row_count: 1,
         elapsed_us: 0,
     })
@@ -720,7 +719,7 @@ fn execute_count_distinct(arg: &str, name: &str, where_clause: &WhereClause, tab
         seen.insert(table.columns[idx][i]);
     }
     Ok(QueryResult {
-        columns: vec![ResultColumn { name: name.into(), values: vec![seen.len() as u64] , string_values: None }],
+        columns: vec![ResultColumn { name: name.into(), values: vec![seen.len() as u64] , string_values: None, type_oid: 0 }],
         row_count: 1,
         elapsed_us: 0,
     })
@@ -737,7 +736,7 @@ fn execute_select_star(
 
     let cols: Vec<ResultColumn> = table.column_names.iter().enumerate().map(|(i, name)| {
         let values: Vec<u64> = indices.iter().map(|&idx| table.columns[i][idx]).collect();
-        ResultColumn { name: name.clone(), values, string_values: None }
+        ResultColumn { name: name.clone(), values, string_values: None, type_oid: 0 }
     }).collect();
 
     Ok(QueryResult {
@@ -774,7 +773,7 @@ fn execute_select_column(
     };
 
     Ok(QueryResult {
-        columns: vec![ResultColumn { name: name.into(), values, string_values }],
+        columns: vec![ResultColumn { name: name.into(), values, string_values, type_oid: 0 }],
         row_count: indices.len(),
         elapsed_us: 0,
     })
@@ -797,11 +796,11 @@ fn execute_select_multi(
             let idx = table.column_idx(name)
                 .ok_or_else(|| Error::NotFound(format!("column '{}'", name)))?;
             let values: Vec<u64> = indices.iter().map(|&i| table.columns[idx][i]).collect();
-            cols.push(ResultColumn { name: name.clone(), values, string_values: None });
+            cols.push(ResultColumn { name: name.clone(), values, string_values: None, type_oid: 0 });
         } else if let SelectItem::Star = item {
             for (col_idx, name) in table.column_names.iter().enumerate() {
                 let values: Vec<u64> = indices.iter().map(|&row_idx| table.columns[col_idx][row_idx]).collect();
-                cols.push(ResultColumn { name: name.clone(), values, string_values: None });
+                cols.push(ResultColumn { name: name.clone(), values, string_values: None, type_oid: 0 });
             }
         }
     }
@@ -835,7 +834,7 @@ fn apply_order_by(result: QueryResult, order_by: &[(String, bool)], _table: &Tab
 
     let new_cols: Vec<ResultColumn> = result.columns.iter().map(|c| {
         let values: Vec<u64> = indices.iter().map(|&i| c.values[i]).collect();
-        ResultColumn { name: c.name.clone(), values, string_values: None }
+        ResultColumn { name: c.name.clone(), values, string_values: None, type_oid: 0 }
     }).collect();
 
     Ok(QueryResult { columns: new_cols, row_count: result.row_count, elapsed_us: result.elapsed_us })
@@ -980,7 +979,7 @@ fn execute_with_join(
             // TPC-H query set, so this is a defensive default.
             crate::sql::parser::SelectItem::Literal(v) => {
                 Ok(QueryResult {
-                    columns: vec![ResultColumn { name: v.to_string(), values: vec![*v] , string_values: None }],
+                    columns: vec![ResultColumn { name: v.to_string(), values: vec![*v] , string_values: None, type_oid: 0 }],
                     row_count: 1,
                     elapsed_us: 0,
                 })
