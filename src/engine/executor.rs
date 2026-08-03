@@ -431,15 +431,32 @@ fn order_group_result(result: QueryResult, order_by: &[(String, bool)]) -> Resul
         .ok_or_else(|| Error::NotFound(format!("ORDER BY column '{}'", col_name)))?;
 
     let mut indices: Vec<usize> = (0..result.row_count).collect();
-    indices.sort_by(|&a, &b| {
-        let va = result.columns[col_idx].values[a];
-        let vb = result.columns[col_idx].values[b];
-        if *ascending { va.cmp(&vb) } else { vb.cmp(&va) }
-    });
 
+    // Check if the ORDER BY column has string values — sort by string
+    // comparison instead of u64 hash (Wave 38).
+    let has_strings = result.columns[col_idx].string_values.is_some();
+    if has_strings {
+        let sv = result.columns[col_idx].string_values.as_ref().unwrap();
+        indices.sort_by(|&a, &b| {
+            let sa = sv.get(a).map(|s| s.as_str()).unwrap_or("");
+            let sb = sv.get(b).map(|s| s.as_str()).unwrap_or("");
+            if *ascending { sa.cmp(sb) } else { sb.cmp(sa) }
+        });
+    } else {
+        indices.sort_by(|&a, &b| {
+            let va = result.columns[col_idx].values[a];
+            let vb = result.columns[col_idx].values[b];
+            if *ascending { va.cmp(&vb) } else { vb.cmp(&va) }
+        });
+    }
+
+    // Reorder all columns, preserving string_values.
     let new_cols: Vec<ResultColumn> = result.columns.iter().map(|c| {
         let values: Vec<u64> = indices.iter().map(|&i| c.values[i]).collect();
-        ResultColumn { name: c.name.clone(), values, string_values: None }
+        let string_values = c.string_values.as_ref().map(|sv| {
+            indices.iter().map(|&i| sv.get(i).cloned().unwrap_or_default()).collect::<Vec<String>>()
+        });
+        ResultColumn { name: c.name.clone(), values, string_values }
     }).collect();
 
     Ok(QueryResult { columns: new_cols, row_count: result.row_count, elapsed_us: result.elapsed_us })
