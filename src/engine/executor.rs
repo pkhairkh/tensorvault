@@ -37,21 +37,51 @@ pub fn execute_select(
     extensions: &QueryExtensions,
     catalog: &Catalog,
     kernel_table: &KernelTable,
-    _cost_model: &crate::planner::CostModel,
+    cost_model: &crate::planner::CostModel,
 ) -> Result<QueryResult> {
     // 1. Resolve the table(s)
     let table = catalog
         .get(&query.from)
         .ok_or_else(|| Error::NotFound(format!("table '{}'", query.from)))?;
 
+    // 0. Consult the cost-based optimizer to choose an execution strategy.
+    let row_count = table.row_count as u64;
+    let has_where = query.where_clause.is_some();
+    let has_group_by = !query.group_by.is_empty();
+    let has_join = !query.joins.is_empty();
+    let plan = crate::planner::optimizer::choose_plan(
+        cost_model,
+        row_count,
+        has_where,
+        has_group_by,
+        has_join,
+        false, // subquery detection is handled by the tpch fallback
+        query.select.len(),
+    );
+    log::debug!(
+        "execute_select: table='{}' rows={} strategy={:?} est_cost={:.1}us est_rows={}",
+        query.from, row_count, plan.strategy, plan.estimated_cost_us, plan.estimated_rows
+    );
+
     // JOIN support: materialize joined table, then dispatch on it.
-    if !query.joins.is_empty() {
+    if !query.joins.is_empty() || plan.strategy == crate::planner::optimizer::ExecStrategy::HashJoin {
         return execute_with_join(query, extensions, catalog, kernel_table);
     }
 
+    // If the optimizer says TpchFallback, return an error so the caller
+    // (execute_inner) routes to the tpch interpreter.
+    if plan.strategy == crate::planner::optimizer::ExecStrategy::TpchFallback {
+        return Err(Error::Other("optimizer chose tpch fallback".into()));
+    }
+
     // Try kernel-direct dispatch first (10-30x faster than per-row evaluation).
-    if let Some(result) = dispatch::execute_dispatched(query, table) {
-        return result;
+    // Only attempt if the optimizer recommends KernelDirect or doesn't object.
+    if plan.strategy == crate::planner::optimizer::ExecStrategy::KernelDirect
+        || plan.strategy == crate::planner::optimizer::ExecStrategy::Vectorized
+    {
+        if let Some(result) = dispatch::execute_dispatched(query, table) {
+            return result;
+        }
     }
 
     // 2. Parse the WHERE clause
