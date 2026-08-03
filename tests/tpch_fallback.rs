@@ -67,14 +67,48 @@ fn group_by_with_having() {
 #[test]
 fn complex_where_with_nested_conditions() {
     // Complex WHERE with nested AND/OR — the TPC-H interpreter handles
-    // arbitrary boolean expressions in WHERE. This replaces the previous
-    // CASE WHEN test (the tpch interpreter has a bug in CASE WHEN parsing
-    // that causes an index-out-of-bounds panic).
+    // arbitrary boolean expressions in WHERE.
     let mut e = make_engine();
     let r = e.execute("SELECT count(*) FROM sales WHERE (region = 1 AND amount > 150) OR (region = 2 AND amount > 200)").unwrap();
     // region=1 AND amount>150: row 2 (200). region=2 AND amount>200: row 4 (300).
     // Total: 2 rows.
     assert_eq!(r.scalar_u64(), Some(2), "complex WHERE should match 2 rows");
+}
+
+/// Wave 57: CASE WHEN through engine.execute() — the previous wave DELETED
+/// this test because `tpch.rs` panicked with index-out-of-bounds in
+/// `t.col_types[idx]` (col_types was empty for user-created tables). The
+/// root cause was that `tpch_col_types()` only knows TPC-H schemas, so it
+/// returned an empty Vec for tables created via CREATE TABLE. The fix in
+/// `ExecTable::from_catalog` falls back to inferring types from the table's
+/// schema (set by CREATE TABLE), defaulting to ColType::Int.
+#[test]
+fn case_when_in_where_through_engine() {
+    let mut e = make_engine();
+    // CASE WHEN in WHERE: count rows where amount > 200.
+    // CASE WHEN amount > 200 THEN 1 ELSE 0 END = 1
+    // Rows with amount > 200: row 4 (300), row 5 (250). Total: 2.
+    let r = e.execute("SELECT count(*) FROM sales WHERE CASE WHEN amount > 200 THEN 1 ELSE 0 END = 1").unwrap();
+    assert_eq!(r.scalar_u64(), Some(2), "CASE WHEN in WHERE must match 2 rows (amount > 200)");
+}
+
+/// Wave 57: CASE WHEN in SELECT list — the tpch interpreter evaluates
+/// CASE WHEN per row and returns the result as a column.
+#[test]
+fn case_when_in_select_through_engine() {
+    let mut e = make_engine();
+    // CASE WHEN amount > 200 THEN 'big' ELSE 'small' END
+    // Rows: 1(100→small), 2(200→small), 3(150→small), 4(300→big), 5(250→big)
+    let r = e.execute("SELECT CASE WHEN amount > 200 THEN 1 ELSE 0 END FROM sales").unwrap();
+    assert_eq!(r.row_count, 5, "CASE WHEN must return one row per input row");
+    // The result column should have values: 0, 0, 0, 1, 1
+    let col = &r.columns[0];
+    assert_eq!(col.values.len(), 5, "CASE WHEN column must have 5 values");
+    assert_eq!(col.values[0], 0, "row 1 (amount=100) → 0");
+    assert_eq!(col.values[1], 0, "row 2 (amount=200) → 0 (not > 200)");
+    assert_eq!(col.values[2], 0, "row 3 (amount=150) → 0");
+    assert_eq!(col.values[3], 1, "row 4 (amount=300) → 1");
+    assert_eq!(col.values[4], 1, "row 5 (amount=250) → 1");
 }
 
 #[test]

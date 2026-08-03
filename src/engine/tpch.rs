@@ -641,7 +641,37 @@ struct ExecTable {
 
 impl ExecTable {
     fn from_catalog(table: &Table, alias: &str) -> Self {
-        let col_types = tpch_col_types(&table.name);
+        // Wave 57 fix: tpch_col_types() returns an empty Vec for user-created
+        // tables (it only knows TPC-H schemas). When that happens, we fall
+        // back to inferring types from the table's schema (set by CREATE TABLE)
+        // — defaulting to ColType::Int for unknown columns. Previously, the
+        // empty Vec caused `t.col_types[idx]` to panic with index-out-of-bounds
+        // whenever a CASE WHEN / arithmetic / string evaluation ran against a
+        // user-created table through the tpch fallback path.
+        let mut col_types = tpch_col_types(&table.name);
+        if col_types.is_empty() {
+            col_types = (0..table.column_names.len())
+                .map(|i| {
+                    // Infer from the schema if available.
+                    if let Some(ref schema) = table.schema {
+                        if schema.is_float(i) {
+                            ColType::Float
+                        } else if schema.is_string(i) {
+                            ColType::String
+                        } else {
+                            // Check for Date/Timestamp types.
+                            match schema.col_type_at(i) {
+                                Some(crate::sql::ddl::ColumnType::Date) => ColType::Date,
+                                Some(crate::sql::ddl::ColumnType::Timestamp) => ColType::Date,
+                                _ => ColType::Int,
+                            }
+                        }
+                    } else {
+                        ColType::Int
+                    }
+                })
+                .collect();
+        }
         let mut col_map = new_hashmap();
         for (i, name) in table.column_names.iter().enumerate() {
             let lower = name.to_lowercase();
@@ -650,6 +680,7 @@ impl ExecTable {
             if alias != table.name {
                 col_map.entry(format!("{}.{}", table.name.to_lowercase(), name.to_lowercase())).or_insert(i);
             }
+            let _ = lower; // suppress unused-variable warning
         }
         ExecTable {
             columns: table.columns.clone(),
