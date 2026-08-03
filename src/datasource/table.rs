@@ -63,7 +63,15 @@ impl Table {
         let actual_min = columns.iter().map(|c| c.len()).min().unwrap_or(0);
         let row_count = row_count.min(actual_min);
 
-        let null_bitmaps = (0..columns.len()).map(|_| None).collect();
+        let null_bitmaps: Vec<Option<crate::types::null_bitmap::NullBitmap>> = loaded.columns.iter().map(|c| {
+            c.null_bitmap.as_ref().map(|bits| {
+                let mut bm = crate::types::null_bitmap::NullBitmap::new(bits.len());
+                for (i, &is_null) in bits.iter().enumerate() {
+                    if is_null { bm.set_null(i); }
+                }
+                bm
+            })
+        }).collect();
 
         Table { name: loaded.name, columns, column_names, row_count, string_columns, null_bitmaps, schema: None }
     }
@@ -109,8 +117,8 @@ mod tests {
         LoadedTable {
             name: "t".into(),
             columns: vec![
-                LoadedColumn { name: "id".into(), cells: vec![1, 2, 3], row_count: 3, string_search: None },
-                LoadedColumn { name: "v".into(), cells: vec![10, 20, 30], row_count: 3, string_search: None },
+                LoadedColumn { name: "id".into(), cells: vec![1, 2, 3], row_count: 3, string_search: None, null_bitmap: None },
+                LoadedColumn { name: "v".into(), cells: vec![10, 20, 30], row_count: 3, string_search: None, null_bitmap: None },
             ],
             row_count: 3,
         }
@@ -160,8 +168,8 @@ mod tests {
         let loaded = LoadedTable {
             name: "bad".into(),
             columns: vec![
-                LoadedColumn { name: "a".into(), cells: vec![1, 2, 3], row_count: 3, string_search: None },
-                LoadedColumn { name: "b".into(), cells: vec![10, 20], row_count: 2, string_search: None },
+                LoadedColumn { name: "a".into(), cells: vec![1, 2, 3], row_count: 3, string_search: None, null_bitmap: None },
+                LoadedColumn { name: "b".into(), cells: vec![10, 20], row_count: 2, string_search: None, null_bitmap: None },
             ],
             row_count: 5, // lie about row count
         };

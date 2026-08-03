@@ -54,6 +54,8 @@ pub struct LoadedColumn {
     pub row_count: usize,
     /// For string columns: actual string data for LIKE queries.
     pub string_search: Option<crate::exec::fm_index::StringSearchColumn>,
+    /// NULL bitmap: true = cell is NULL. None if no NULLs in this column (Wave 46).
+    pub null_bitmap: Option<Vec<bool>>,
 }
 
 /// A table loaded from Parquet — a name plus a `Vec<LoadedColumn>`.
@@ -105,14 +107,9 @@ pub fn read_parquet(path: &str) -> Result<LoadedTable, Box<dyn Error>> {
     // captured from the first batch's schema.
     let mut col_cells: Vec<Vec<u64>> = Vec::new();
     let mut col_names: Vec<String> = Vec::new();
-    // Per-column string accumulator. Stays empty for non-string columns;
-    // grows to `total_rows` for Utf8/LargeUtf8 columns. We accumulate
-    // strings across batches and build a single `StringSearchColumn`
-    // at the end so that LIKE queries and string GROUP BY see the full
-    // column (previously `read_parquet` discarded the `string_search`
-    // returned by `convert_array_to_u64`, which silently broke LIKE
-    // filtering on any column loaded via this function).
     let mut col_strings: Vec<Vec<String>> = Vec::new();
+    // Per-column NULL bitmap accumulator (Wave 46).
+    let mut col_nulls: Vec<Option<Vec<bool>>> = Vec::new();
     let mut total_rows: usize = 0;
 
     for batch in reader {
@@ -125,15 +122,23 @@ pub fn read_parquet(path: &str) -> Result<LoadedTable, Box<dyn Error>> {
                 col_names.push(field.name().to_string());
                 col_cells.push(Vec::new());
                 col_strings.push(Vec::new());
+                col_nulls.push(None);
             }
         }
 
         for (i, col) in batch.columns().iter().enumerate() {
             // Each batch must have one value per column for every row.
-            let (cells, string_search) = convert_array_to_u64(col);
+            let (cells, string_search, null_bitmap) = convert_array_to_u64(col);
             col_cells[i].extend(cells);
             if let Some(ss) = string_search {
                 col_strings[i].extend(ss.strings);
+            }
+            // Propagate NULL bitmap (Wave 46).
+            if let Some(nb) = null_bitmap {
+                if col_nulls[i].is_none() {
+                    col_nulls[i] = Some(Vec::new());
+                }
+                col_nulls[i].as_mut().unwrap().extend(nb);
             }
         }
         total_rows += batch.num_rows();
@@ -172,6 +177,7 @@ pub fn read_parquet(path: &str) -> Result<LoadedTable, Box<dyn Error>> {
             row_count: total_rows,
             cells: std::mem::take(&mut col_cells[i]),
             string_search,
+            null_bitmap: col_nulls[i].take(),
         });
     }
 
@@ -218,7 +224,7 @@ pub fn read_parquet_column(path: &str, column_name: &str) -> Result<LoadedColumn
     for batch in reader {
         let batch: RecordBatch = batch?;
         let arr: &ArrayRef = batch.column(col_idx);
-        let (new_cells, string_search) = convert_array_to_u64(arr);
+        let (new_cells, string_search, _null_bitmap) = convert_array_to_u64(arr);
         cells.extend(new_cells);
         if let Some(ss) = string_search {
             strings.extend(ss.strings);
@@ -231,7 +237,7 @@ pub fn read_parquet_column(path: &str, column_name: &str) -> Result<LoadedColumn
     } else {
         None
     };
-    Ok(LoadedColumn { name: column_name.to_string(), cells, row_count, string_search })
+    Ok(LoadedColumn { name: column_name.to_string(), cells, row_count, string_search, null_bitmap: None })
 }
 
 /// Convert an Arrow [`ArrayRef`] into turboGP's `Vec<u64>` cell format.
@@ -244,7 +250,7 @@ pub fn read_parquet_column(path: &str, column_name: &str) -> Result<LoadedColumn
 ///
 /// Null values are encoded as `0u64` (the sentinel — see the module
 /// docs).
-fn convert_array_to_u64(array: &ArrayRef) -> (Vec<u64>, Option<crate::exec::fm_index::StringSearchColumn>) {
+fn convert_array_to_u64(array: &ArrayRef) -> (Vec<u64>, Option<crate::exec::fm_index::StringSearchColumn>, Option<Vec<bool>>) {
     let len = array.len();
     let mut out = Vec::with_capacity(len);
     let mut string_search: Option<crate::exec::fm_index::StringSearchColumn> = None;
@@ -411,7 +417,18 @@ fn convert_array_to_u64(array: &ArrayRef) -> (Vec<u64>, Option<crate::exec::fm_i
         out.resize(len, 0);
     }
 
-    (out, string_search)
+    // Build NULL bitmap: check if any nulls exist in the array.
+    let null_bitmap = if array.null_count() > 0 {
+        let mut bits = Vec::with_capacity(len);
+        for i in 0..len {
+            bits.push(array.is_null(i));
+        }
+        Some(bits)
+    } else {
+        None
+    };
+
+    (out, string_search, null_bitmap)
 }
 
 /// Write a `RecordBatch` to a Parquet file at `path`. Used by tests
@@ -550,7 +567,7 @@ mod tests {
     /// the original for re-loads.
     #[test]
     fn loaded_types_are_clone() {
-        let col = LoadedColumn { name: "x".into(), cells: vec![1, 2, 3], row_count: 3, string_search: None };
+        let col = LoadedColumn { name: "x".into(), cells: vec![1, 2, 3], row_count: 3, string_search: None, null_bitmap: None };
         let col2 = col.clone();
         assert_eq!(col.cells, col2.cells);
 

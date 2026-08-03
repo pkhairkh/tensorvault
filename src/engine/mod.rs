@@ -1070,8 +1070,8 @@ mod tests {
         DataSourceTable::from_loaded(LoadedTable {
             name: "t".into(),
             columns: vec![
-                LoadedColumn { name: "id".into(), cells: ids, row_count: n, string_search: None },
-                LoadedColumn { name: "x".into(), cells: xs, row_count: n, string_search: None },
+                LoadedColumn { name: "id".into(), cells: ids, row_count: n, string_search: None, null_bitmap: None },
+                LoadedColumn { name: "x".into(), cells: xs, row_count: n, string_search: None, null_bitmap: None },
             ],
             row_count: n,
         })
@@ -1082,7 +1082,7 @@ mod tests {
         let n = values.len();
         DataSourceTable::from_loaded(LoadedTable {
             name: "ft".into(),
-            columns: vec![LoadedColumn { name: "v".into(), cells: values.to_vec(), row_count: n, string_search: None }],
+            columns: vec![LoadedColumn { name: "v".into(), cells: values.to_vec(), row_count: n, string_search: None, null_bitmap: None }],
             row_count: n,
         })
     }
@@ -1116,9 +1116,8 @@ mod tests {
                 LoadedColumn {
                     name: "id".into(),
                     cells: (0..1000).map(|i| i as u64).collect(),
-                    row_count: 1000, string_search: None,
-                },
-                LoadedColumn { name: "x".into(), cells: xs, row_count: 1000, string_search: None },
+                    row_count: 1000, string_search: None, null_bitmap: None },
+                LoadedColumn { name: "x".into(), cells: xs, row_count: 1000, string_search: None, null_bitmap: None },
             ],
             row_count: 1000,
         });

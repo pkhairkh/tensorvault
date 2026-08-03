@@ -419,8 +419,7 @@ mod tests {
                 name: "id".into(),
                 cells: vec![1, 2, 3],
                 row_count: 3,
-                string_search: None,
-            }],
+                string_search: None, null_bitmap: None }],
             row_count: 3,
         });
         cat.register(t);

@@ -940,9 +940,9 @@ mod tests {
 
     fn make_table(n: usize) -> Table {
         let cols = vec![
-            LoadedColumn { name: "id".into(), cells: (0..n).map(|i| i as u64).collect(), row_count: n, string_search: None },
-            LoadedColumn { name: "val".into(), cells: (0..n).map(|i| (i % 20) as u64).collect(), row_count: n, string_search: None },
-            LoadedColumn { name: "grp".into(), cells: (0..n).map(|i| (i % 5) as u64).collect(), row_count: n, string_search: None },
+            LoadedColumn { name: "id".into(), cells: (0..n).map(|i| i as u64).collect(), row_count: n, string_search: None, null_bitmap: None },
+            LoadedColumn { name: "val".into(), cells: (0..n).map(|i| (i % 20) as u64).collect(), row_count: n, string_search: None, null_bitmap: None },
+            LoadedColumn { name: "grp".into(), cells: (0..n).map(|i| (i % 5) as u64).collect(), row_count: n, string_search: None, null_bitmap: None },
         ];
         Table::from_loaded(LoadedTable { name: "t".into(), columns: cols, row_count: n })
     }
@@ -962,6 +962,7 @@ mod tests {
             cells,
             row_count: n,
             string_search,
+            null_bitmap: None,
         }];
         Table::from_loaded(LoadedTable { name: "t".into(), columns: cols, row_count: n })
     }

@@ -15,8 +15,8 @@ fn make_engine() -> QueryEngine {
     let t = DS::from_loaded(LoadedTable {
         name: "t".into(),
         columns: vec![
-            LoadedColumn { name: "id".into(), cells: vec![1,2,3], row_count: 3, string_search: None },
-            LoadedColumn { name: "v".into(), cells: vec![10,20,30], row_count: 3, string_search: None },
+            LoadedColumn { name: "id".into(), cells: vec![1,2,3], row_count: 3, string_search: None, null_bitmap: None },
+            LoadedColumn { name: "v".into(), cells: vec![10,20,30], row_count: 3, string_search: None, null_bitmap: None },
         ],
         row_count: 3,
     });

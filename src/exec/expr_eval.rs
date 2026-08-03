@@ -226,8 +226,8 @@ mod tests {
         Table::from_loaded(LoadedTable {
             name: "t".into(),
             columns: vec![
-                LoadedColumn { name: "price".into(), cells: vec![100, 200, 300], row_count: 3, string_search: None },
-                LoadedColumn { name: "discount".into(), cells: vec![10, 20, 30], row_count: 3, string_search: None },
+                LoadedColumn { name: "price".into(), cells: vec![100, 200, 300], row_count: 3, string_search: None, null_bitmap: None },
+                LoadedColumn { name: "discount".into(), cells: vec![10, 20, 30], row_count: 3, string_search: None, null_bitmap: None },
             ],
             row_count: 3,
         })

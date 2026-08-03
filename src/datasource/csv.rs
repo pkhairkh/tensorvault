@@ -141,7 +141,7 @@ pub fn read_csv(path: &str, has_header: bool) -> Result<LoadedTable, Box<dyn Err
         } else {
             None
         };
-        columns.push(LoadedColumn { name: name.clone(), cells, row_count, string_search });
+        columns.push(LoadedColumn { name: name.clone(), cells, row_count, string_search, null_bitmap: None });
     }
 
     Ok(LoadedTable { name: LoadedTable::name_from_path(path), columns, row_count })
@@ -544,6 +544,7 @@ pub fn read_tpch_csv(path: &str, table_name: &str) -> Result<LoadedTable, Box<dy
             cells: std::mem::take(&mut col_cells[i]),
             row_count,
             string_search,
+            null_bitmap: None,
         });
     }
 

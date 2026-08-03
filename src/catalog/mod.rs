@@ -103,7 +103,7 @@ mod tests {
     fn make_table(name: &str, col_name: &str, cells: Vec<u64>) -> Table {
         Table::from_loaded(LoadedTable {
             name: name.into(),
-            columns: vec![LoadedColumn { name: col_name.into(), cells, row_count: 3, string_search: None }],
+            columns: vec![LoadedColumn { name: col_name.into(), cells, row_count: 3, string_search: None, null_bitmap: None }],
             row_count: 3,
         })
     }
