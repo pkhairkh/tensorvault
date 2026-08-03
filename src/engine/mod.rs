@@ -653,21 +653,29 @@ impl QueryEngine {
     /// Execute an UPDATE statement. Supports simple `col = value` assignments
     /// and a WHERE clause with `col = value` equality (AND/OR supported
     /// via the existing expression evaluator in a future wave).
+    ///
+    /// Wave 50 fix (Bug 6): when an assignment sets a column to NULL, the
+    /// column's NULL bitmap is now updated so subsequent `COUNT(col)` /
+    /// `AVG(col)` correctly exclude the row. Previously the cell was set
+    /// to 0 but the bitmap still considered it non-NULL.
     fn execute_update(&mut self, upd: crate::sql::Update) -> Result<QueryResult> {
         let table = self
             .catalog
             .get_mut(&upd.table)
             .ok_or_else(|| Error::NotFound(format!("table \"{}\"", upd.table)))?;
 
-        // Parse assignments into (col_idx, new_value_cell) pairs.
-        let mut assigns: Vec<(usize, u64)> = Vec::with_capacity(upd.assignments.len());
+        // Parse assignments into (col_idx, new_value_cell, is_null) triples.
+        // `is_null` is true when the RHS is the literal `NULL`.
+        let mut assigns: Vec<(usize, u64, bool)> = Vec::with_capacity(upd.assignments.len());
         for (col_name, expr) in &upd.assignments {
             let idx = table
                 .column_idx(col_name)
                 .ok_or_else(|| Error::NotFound(format!("column \"{col_name}\"")))?;
+            let trimmed = expr.trim();
+            let is_null = trimmed.eq_ignore_ascii_case("NULL");
             // For now, the expression must be a simple literal.
             let cell = parse_value_cell(expr);
-            assigns.push((idx, cell));
+            assigns.push((idx, cell, is_null));
         }
 
         // Determine which rows match the WHERE clause.
@@ -679,13 +687,50 @@ impl QueryEngine {
             vec![true; n]
         };
 
+        // Ensure NULL bitmaps exist for every column that we might mark NULL.
+        // We grow `null_bitmaps` to match `columns.len()` if needed.
+        while table.null_bitmaps.len() < table.columns.len() {
+            table.null_bitmaps.push(None);
+        }
+
         for (row_idx, &matches) in match_mask.iter().enumerate() {
             if !matches {
                 continue;
             }
-            for &(col_idx, val) in &assigns {
+            for &(col_idx, val, is_null) in &assigns {
                 let col = std::sync::Arc::make_mut(&mut table.columns[col_idx]);
                 col[row_idx] = val;
+                // Wave 50 fix: update the NULL bitmap to reflect the new
+                // value. If we set the cell to NULL, mark the bitmap; if
+                // we set it to a non-NULL value, clear the bitmap entry.
+                if col_idx < table.null_bitmaps.len() {
+                    if is_null {
+                        // Ensure a bitmap exists, then mark this row NULL.
+                        if table.null_bitmaps[col_idx].is_none() {
+                            let mut bm = crate::types::null_bitmap::NullBitmap::new(0);
+                            // Backfill existing rows as non-null so the
+                            // bitmap is correctly sized up to row_idx.
+                            for _ in 0..row_idx {
+                                bm.push_non_null();
+                            }
+                            table.null_bitmaps[col_idx] = Some(bm);
+                        }
+                        // Ensure the bitmap has entries up to row_idx.
+                        let bm = table.null_bitmaps[col_idx].as_mut().unwrap();
+                        while bm.len() <= row_idx {
+                            bm.push_non_null();
+                        }
+                        bm.set_null(row_idx);
+                    } else {
+                        // Clear the NULL flag if a bitmap exists.
+                        if let Some(ref mut bm) = table.null_bitmaps[col_idx] {
+                            while bm.len() <= row_idx {
+                                bm.push_non_null();
+                            }
+                            bm.set_non_null(row_idx);
+                        }
+                    }
+                }
             }
             updated += 1;
         }
@@ -892,52 +937,151 @@ fn parse_value_cell(s: &str) -> u64 {
 
 /// Evaluate a simple WHERE clause against a table, returning a row mask.
 ///
-/// Currently supports: `col = value` and `col = value AND col2 = value2`
-/// and `col = value OR col2 = value2`. More complex expressions will be
-/// supported when the expression evaluator is wired in.
+/// Wave 50 fix (Bugs 4 & 5):
+/// - Previously only supported `=` and split the WHERE string on
+///   whitespace, which broke string literals containing spaces like
+///   `'Alice Bob'`.
+/// - Now uses the SQL lexer (`crate::sql::lexer::tokenize`) so quoted
+///   strings with spaces round-trip correctly, and supports the full set
+///   of comparison operators: `=`, `!=`, `<>`, `<`, `>`, `<=`, `>=`.
+/// - Also supports `AND` / `OR` for combining predicates (left-associative).
 fn eval_simple_where(table: &Table, where_str: &str) -> Result<Vec<bool>> {
     let n = table.row_count;
     if n == 0 {
         return Ok(Vec::new());
     }
-    let trimmed = where_str.trim();
-    // Split on AND / OR (case-insensitive)
-    let parts: Vec<&str> = trimmed.split_whitespace().collect();
-    if parts.is_empty() {
+
+    // Tokenize the WHERE clause so string literals with spaces, embedded
+    // operators, etc. are correctly preserved as single tokens.
+    let tokens = crate::sql::lexer::tokenize(where_str)
+        .map_err(Error::Parse)?;
+    // Drop trailing EOF (and any leading WHERE keyword, in case the caller
+    // passed the full predicate including `WHERE`).
+    let tokens: Vec<crate::sql::lexer::Token> = tokens.into_iter()
+        .filter(|t| !matches!(t, crate::sql::lexer::Token::EOF))
+        .collect();
+    let tokens: Vec<crate::sql::lexer::Token> = if tokens.first().and_then(|t| match t {
+        crate::sql::lexer::Token::Keyword(k) if k.eq_ignore_ascii_case("WHERE") => Some(()),
+        _ => None,
+    }).is_some() {
+        tokens[1..].to_vec()
+    } else {
+        tokens
+    };
+
+    if tokens.is_empty() {
         return Ok(vec![true; n]);
     }
 
-    // Parse into a list of (col_name, value) predicates joined by AND/OR.
-    // Simple approach: tokenize and walk.
-    let mut predicates: Vec<(String, u64)> = Vec::new();
+    // Parse predicates of form: <col> <op> <value>, joined by AND/OR.
+    // Each predicate produces a (col_idx, op, cell_value, is_string_literal, raw_string) tuple.
+    #[derive(Clone)]
+    struct Pred {
+        col_idx: usize,
+        op: String,
+        cell: u64,
+        // Original string literal (if the value was a quoted string), used
+        // for string comparison when the column has a string sidecar.
+        raw_string: Option<String>,
+    }
+
+    let mut predicates: Vec<Pred> = Vec::new();
     let mut operators: Vec<bool> = Vec::new(); // true = AND, false = OR
     let mut i = 0;
-    while i < parts.len() {
-        let part = parts[i];
-        if part.eq_ignore_ascii_case("AND") {
-            operators.push(true);
-            i += 1;
-            continue;
+    while i < tokens.len() {
+        match &tokens[i] {
+            crate::sql::lexer::Token::Keyword(k) if k.eq_ignore_ascii_case("AND") => {
+                operators.push(true);
+                i += 1;
+                continue;
+            }
+            crate::sql::lexer::Token::Keyword(k) if k.eq_ignore_ascii_case("OR") => {
+                operators.push(false);
+                i += 1;
+                continue;
+            }
+            crate::sql::lexer::Token::LParen => {
+                // Parenthesised expressions in DML WHERE are not supported
+                // here — fall back to the dispatcher's mask evaluator if
+                // the caller needs full boolean expression support.
+                return Err(Error::Other(
+                    "parenthesised expressions are not supported in DML WHERE; use SELECT WHERE instead".into(),
+                ));
+            }
+            _ => {}
         }
-        if part.eq_ignore_ascii_case("OR") {
-            operators.push(false);
-            i += 1;
-            continue;
-        }
-        // Expect: col = value
-        if i + 2 >= parts.len() {
-            return Err(Error::Other(format!("incomplete WHERE clause near '{part}'")));
-        }
-        let col_name = part.to_string();
-        let op = parts[i + 1];
-        if op != "=" {
+
+        // Expect: <col> <op> <value>
+        let col_name = match &tokens[i] {
+            crate::sql::lexer::Token::Ident(s) => s.clone(),
+            crate::sql::lexer::Token::Keyword(k) => k.clone(), // tolerate keyword-as-identifier
+            other => return Err(Error::Other(format!(
+                "expected column name in WHERE clause, got {:?}", other
+            ))),
+        };
+        if i + 2 >= tokens.len() {
             return Err(Error::Other(format!(
-                "unsupported WHERE operator '{op}' (only = is supported in DML WHERE)"
+                "incomplete WHERE predicate near '{col_name}'"
             )));
         }
-        let val_str = parts[i + 2];
-        let cell = parse_value_cell(val_str);
-        predicates.push((col_name, cell));
+        let op = match &tokens[i + 1] {
+            crate::sql::lexer::Token::Op(s) => s.clone(),
+            other => return Err(Error::Other(format!(
+                "expected comparison operator after '{col_name}', got {:?}", other
+            ))),
+        };
+        if !matches!(op.as_str(), "=" | "!=" | "<>" | "<" | ">" | "<=" | ">=") {
+            return Err(Error::Other(format!(
+                "unsupported WHERE operator '{op}' in DML WHERE"
+            )));
+        }
+
+        let col_idx = table
+            .column_idx(&col_name)
+            .ok_or_else(|| Error::NotFound(format!("column \"{col_name}\"")))?;
+
+        // Extract the value cell. String literals get the original text
+        // preserved so we can compare against the string sidecar if one
+        // exists; everything else is parsed via parse_value_cell.
+        let (cell, raw_string) = match &tokens[i + 2] {
+            crate::sql::lexer::Token::String(s) => {
+                // Quoted string. If the column has a string sidecar, we
+                // keep the original text for direct comparison; otherwise
+                // we hash it (matching parse_value_cell behaviour).
+                let has_string_sidecar = col_idx < table.string_columns.len()
+                    && table.string_columns[col_idx].is_some();
+                if has_string_sidecar {
+                    (0u64, Some(s.clone()))
+                } else {
+                    (parse_value_cell(&format!("'{}'", s)), None)
+                }
+            }
+            crate::sql::lexer::Token::Int(v) => (*v as u64, None),
+            crate::sql::lexer::Token::Float(f) => (f.to_bits(), None),
+            crate::sql::lexer::Token::Hex(bytes) => {
+                let mut buf = [0u8; 8];
+                for (j, &b) in bytes.iter().take(8).enumerate() {
+                    buf[j] = b;
+                }
+                (u64::from_le_bytes(buf), None)
+            }
+            crate::sql::lexer::Token::Keyword(k) if k.eq_ignore_ascii_case("NULL") => {
+                // NULL in a WHERE predicate — treat as 0 cell. Callers
+                // that need IS NULL / IS NOT NULL should use the
+                // expression evaluator path.
+                (0u64, None)
+            }
+            other => return Err(Error::Other(format!(
+                "expected literal value in WHERE clause, got {:?}", other
+            ))),
+        };
+
+        predicates.push(Pred {
+            col_idx,
+            op: if op == "<>" { "!=".to_string() } else { op },
+            cell,
+            raw_string,
+        });
         i += 3;
     }
 
@@ -945,25 +1089,50 @@ fn eval_simple_where(table: &Table, where_str: &str) -> Result<Vec<bool>> {
         return Ok(vec![true; n]);
     }
 
-    // Find column indices.
-    let mut col_indices: Vec<usize> = Vec::with_capacity(predicates.len());
-    for (col_name, _) in &predicates {
-        let idx = table
-            .column_idx(col_name)
-            .ok_or_else(|| Error::NotFound(format!("column \"{col_name}\"")))?;
-        col_indices.push(idx);
-    }
-
     // Evaluate each predicate per row.
     let mut per_pred_masks: Vec<Vec<bool>> = Vec::with_capacity(predicates.len());
-    for (pred_idx, &(_, val)) in predicates.iter().enumerate() {
-        let col_idx = col_indices[pred_idx];
+    for p in &predicates {
+        let col_idx = p.col_idx;
         let col = &table.columns[col_idx];
-        let mask: Vec<bool> = col.iter().map(|&c| c == val).collect();
+
+        // If we have the original string and the column has a string sidecar,
+        // compare against the sidecar directly (lexicographic).
+        if let Some(ref s) = p.raw_string {
+            if col_idx < table.string_columns.len() {
+                if let Some(ref sc) = table.string_columns[col_idx] {
+                    let mask: Vec<bool> = (0..n).map(|i| {
+                        let cell_str = sc.get(i);
+                        match p.op.as_str() {
+                            "=" => cell_str == s.as_str(),
+                            "!=" => cell_str != s.as_str(),
+                            "<" => cell_str < s.as_str(),
+                            ">" => cell_str > s.as_str(),
+                            "<=" => cell_str <= s.as_str(),
+                            ">=" => cell_str >= s.as_str(),
+                            _ => false,
+                        }
+                    }).collect();
+                    per_pred_masks.push(mask);
+                    continue;
+                }
+            }
+        }
+
+        // Default: compare u64 cells.
+        let val = p.cell;
+        let mask: Vec<bool> = match p.op.as_str() {
+            "=" => col.iter().map(|&c| c == val).collect(),
+            "!=" => col.iter().map(|&c| c != val).collect(),
+            "<" => col.iter().map(|&c| c < val).collect(),
+            ">" => col.iter().map(|&c| c > val).collect(),
+            "<=" => col.iter().map(|&c| c <= val).collect(),
+            ">=" => col.iter().map(|&c| c >= val).collect(),
+            _ => vec![false; n],
+        };
         per_pred_masks.push(mask);
     }
 
-    // Combine: start with first predicate, then AND/OR.
+    // Combine: start with first predicate, then AND/OR (left-associative).
     let mut result = per_pred_masks[0].clone();
     for (i, mask) in per_pred_masks[1..].iter().enumerate() {
         let is_and = operators.get(i).copied().unwrap_or(true);

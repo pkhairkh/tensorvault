@@ -207,12 +207,24 @@ pub struct Checkpoint;
 impl Checkpoint {
     /// Save a checkpoint of the current catalog state to a SQL file.
     /// The file contains:
-    /// 1. CREATE TABLE statements for every table.
-    /// 2. INSERT statements for every row.
+    /// 1. CREATE TABLE statements for every table (with correct column
+    ///    types from `table.schema` when available — Wave 50 fix).
+    /// 2. INSERT statements for every row, with values formatted
+    ///    according to their column type:
+    ///      - String columns (with a `StringSearchColumn` sidecar) emit
+    ///        the original string as a quoted literal with `'` doubled.
+    ///      - Float columns emit `f64::from_bits(value)`.
+    ///      - NULL cells (per `null_bitmaps`) emit the literal `NULL`.
+    ///      - Everything else emits the raw u64.
+    ///
+    /// Wave 50 fix (Bug 7): previously every column was hardcoded as
+    /// `INT` and every value was written as the raw u64 cell — so
+    /// FLOAT and VARCHAR data was destroyed on checkpoint/restart.
     pub fn save<P: AsRef<Path>>(
         catalog: &crate::catalog::Catalog,
         path: P,
     ) -> std::io::Result<usize> {
+        use crate::sql::ddl::ColumnType;
         let mut file = File::create(path)?;
         let mut table_count = 0;
         for name in catalog.table_names() {
@@ -220,22 +232,75 @@ impl Checkpoint {
                 continue;
             }
             if let Some(table) = catalog.get(name) {
-                // Write CREATE TABLE.
-                let cols: Vec<String> = table
-                    .column_names
-                    .iter()
-                    .map(|c| format!("{c} INT"))
-                    .collect();
+                // Resolve column types: prefer `table.schema`, fall back to INT.
+                let col_types: Vec<ColumnType> = if let Some(ref schema) = table.schema {
+                    table.column_names.iter().enumerate().map(|(i, _)| {
+                        schema.col_type_at(i).cloned().unwrap_or(ColumnType::BigInt)
+                    }).collect()
+                } else {
+                    // No schema — infer from sidecars.
+                    table.column_names.iter().enumerate().map(|(i, _)| {
+                        if i < table.string_columns.len() && table.string_columns[i].is_some() {
+                            ColumnType::Varchar(None)
+                        } else {
+                            ColumnType::BigInt
+                        }
+                    }).collect()
+                };
+
+                // Write CREATE TABLE with the correct types.
+                let cols: Vec<String> = table.column_names.iter().enumerate().map(|(i, c)| {
+                    let ty = col_types[i].type_name();
+                    // Emit VARCHAR(n) when a length was specified.
+                    match &col_types[i] {
+                        ColumnType::Varchar(Some(n)) => format!("{c} VARCHAR({n})"),
+                        ColumnType::Nvarchar(Some(n)) => format!("{c} NVARCHAR({n})"),
+                        ColumnType::Decimal(Some(p), Some(s)) => format!("{c} DECIMAL({p},{s})"),
+                        ColumnType::Decimal(Some(p), None) => format!("{c} DECIMAL({p})"),
+                        ColumnType::Numeric(Some(p), Some(s)) => format!("{c} NUMERIC({p},{s})"),
+                        ColumnType::Numeric(Some(p), None) => format!("{c} NUMERIC({p})"),
+                        _ => format!("{c} {ty}"),
+                    }
+                }).collect();
                 writeln!(file, "CREATE TABLE {name} ({});", cols.join(", "))?;
                 table_count += 1;
 
-                // Write INSERT statements.
+                // Write INSERT statements. NULL cells become the literal
+                // `NULL`, not a 0 u64.
                 for row in 0..table.row_count {
-                    let vals: Vec<String> = table
-                        .columns
-                        .iter()
-                        .map(|col| col.get(row).copied().unwrap_or(0).to_string())
-                        .collect();
+                    let vals: Vec<String> = table.columns.iter().enumerate().map(|(col_idx, col)| {
+                        // Check NULL bitmap first.
+                        if col_idx < table.null_bitmaps.len() {
+                            if let Some(ref bm) = table.null_bitmaps[col_idx] {
+                                if bm.is_null(row) {
+                                    return "NULL".to_string();
+                                }
+                            }
+                        }
+                        let cell = col.get(row).copied().unwrap_or(0);
+                        // String column with sidecar: emit the original string.
+                        if col_idx < table.string_columns.len() {
+                            if let Some(ref sc) = table.string_columns[col_idx] {
+                                if row < sc.len() {
+                                    let s = sc.get(row);
+                                    // Double single quotes to escape them.
+                                    let escaped = s.replace('\'', "''");
+                                    return format!("'{escaped}'");
+                                }
+                            }
+                        }
+                        // Float column: emit the decoded f64.
+                        if matches!(col_types[col_idx],
+                            ColumnType::Float | ColumnType::Real
+                            | ColumnType::Decimal(_, _) | ColumnType::Numeric(_, _)) {
+                            let f = f64::from_bits(cell);
+                            if f.is_finite() {
+                                return format!("{f}");
+                            }
+                        }
+                        // Default: raw u64.
+                        cell.to_string()
+                    }).collect();
                     writeln!(file, "INSERT INTO {name} VALUES ({});", vals.join(", "))?;
                 }
             }
