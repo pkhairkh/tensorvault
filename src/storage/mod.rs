@@ -9,6 +9,7 @@ pub mod page;
 pub mod sstable;
 pub mod tablet;
 pub mod wal;
+pub mod recovery;
 
 pub use page::{Page, PageHeader, HEADER_SIZE, PAGE_CELLS, PAGE_SIZE};
 pub use sstable::{SsTableReader, SsTableWriter};
