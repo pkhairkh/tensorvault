@@ -608,6 +608,22 @@ impl QueryEngine {
         // Try DDL first (CREATE TABLE, DROP TABLE, CREATE SCHEMA).
         if let Some(ddl) = crate::sql::parse_ddl(sql).map_err(Error::Parse)? {
             let mut result = self.execute_ddl(ddl)?;
+            // Wave 56d: if the DDL was a CREATE TABLE with
+            // `WITH (SYSTEM_VERSIONING = ON)`, register the table in
+            // self.temporals so FOR SYSTEM_TIME AS OF queries work.
+            if let Some(table_name) = extract_temporal_table_name(sql) {
+                if let Some(table) = self.catalog.get(&table_name) {
+                    let col_names = table.column_names.clone();
+                    self.temporals.insert(
+                        table_name.clone(),
+                        crate::exec::temporal::TemporalTable::new(col_names),
+                    );
+                    // Seed the temporal table with the current rows (if any).
+                    // For a freshly-CREATED table there are none, but if the
+                    // user INSERTs later, execute_insert will update the
+                    // temporal sidecar.
+                }
+            }
             // Wave 51 fix: append AFTER successful execute.
             self.wal_append_txn(sql, txn_id);
             result.elapsed_us = start.elapsed().as_micros() as u64;
@@ -880,6 +896,34 @@ impl QueryEngine {
             ));
         }
 
+        // Wave 56d: if this is a temporal table, sync the inserted rows to
+        // the TemporalTable sidecar so FOR SYSTEM_TIME AS OF queries see them.
+        // We collect the row values (as Vec<u64>) BEFORE releasing the table
+        // borrow, then update the temporal sidecar.
+        let table_name = ins.table.clone();
+        let mut temporal_rows: Vec<Vec<u64>> = Vec::new();
+        if self.temporals.contains_key(&table_name) {
+            // Re-read the table (immutable borrow) to get the just-inserted rows.
+            // The new rows are the last `n_new_rows` of each column.
+            for row_i in 0..n_new_rows {
+                let row_idx = table.row_count - n_new_rows + row_i;
+                let mut row_vals = Vec::with_capacity(table.columns.len());
+                for col_idx in 0..table.columns.len() {
+                    let v = table.columns[col_idx].get(row_idx).copied().unwrap_or(0);
+                    row_vals.push(v);
+                }
+                temporal_rows.push(row_vals);
+            }
+        }
+
+        // Now release the table borrow and update the temporal sidecar.
+        drop(table);
+        if let Some(temporal) = self.temporals.get_mut(&table_name) {
+            for row_vals in temporal_rows {
+                temporal.insert(row_vals);
+            }
+        }
+
         // Return a result with the number of rows inserted.
         let mut result = QueryResult::empty();
         result.row_count = n_new_rows;
@@ -971,6 +1015,47 @@ impl QueryEngine {
             updated += 1;
         }
 
+        // Wave 56d: if this is a temporal table, sync the update to the
+        // TemporalTable sidecar. We collect the matched row indices and
+        // the new values, then call temporal.update(...).
+        let table_name = upd.table.clone();
+        let is_temporal = self.temporals.contains_key(&table_name);
+        if is_temporal {
+            // Collect (predicate_fn, new_values) for the temporal update.
+            // The predicate matches any row whose first column value equals
+            // the matched row's first column value (best-effort — the
+            // TemporalTable's update() takes a closure, so we match by PK).
+            // We build a list of (old_pk, new_row_values) pairs.
+            let mut updates: Vec<(u64, Vec<u64>)> = Vec::new();
+            for (row_idx, &matches) in match_mask.iter().enumerate() {
+                if !matches {
+                    continue;
+                }
+                // Get the old PK (first column) — used to find the row in the
+                // TemporalTable.
+                let old_pk = table.columns.first()
+                    .and_then(|c| c.get(row_idx).copied())
+                    .unwrap_or(0);
+                // Build the new row values: copy the current row, then apply
+                // the assignments.
+                let mut new_row: Vec<u64> = (0..table.columns.len())
+                    .map(|ci| table.columns[ci].get(row_idx).copied().unwrap_or(0))
+                    .collect();
+                for &(col_idx, val, _is_null) in &assigns {
+                    if col_idx < new_row.len() {
+                        new_row[col_idx] = val;
+                    }
+                }
+                updates.push((old_pk, new_row));
+            }
+            drop(table);
+            if let Some(temporal) = self.temporals.get_mut(&table_name) {
+                for (old_pk, new_row) in updates {
+                    temporal.update(|row| row.first().copied() == Some(old_pk), new_row);
+                }
+            }
+        }
+
         let mut result = QueryResult::empty();
         result.row_count = updated;
         Ok(result)
@@ -997,19 +1082,61 @@ impl QueryEngine {
             return Ok(result);
         }
 
-        // Rebuild each column keeping only non-deleted rows.
-        let keep_mask: Vec<bool> = delete_mask.iter().map(|&d| !d).collect();
-        for col in &mut table.columns {
-            let col_ref = std::sync::Arc::make_mut(col);
-            let mut new_vals = Vec::with_capacity(n - deleted);
-            for (i, &keep) in keep_mask.iter().enumerate() {
-                if keep {
-                    new_vals.push(col_ref[i]);
+        // Wave 56d: if this is a temporal table, sync the delete to the
+        // TemporalTable sidecar BEFORE rebuilding the columns (we need the
+        // old row values to identify which rows to delete from the temporal).
+        let table_name = del.table.clone();
+        let is_temporal = self.temporals.contains_key(&table_name);
+        if is_temporal {
+            // Collect the PKs of rows to delete (first column value).
+            let mut pks_to_delete: Vec<u64> = Vec::new();
+            for (row_idx, &delete_flag) in delete_mask.iter().enumerate() {
+                if delete_flag {
+                    let pk = table.columns.first()
+                        .and_then(|c| c.get(row_idx).copied())
+                        .unwrap_or(0);
+                    pks_to_delete.push(pk);
                 }
             }
-            *col_ref = new_vals;
+            drop(table);
+            if let Some(temporal) = self.temporals.get_mut(&table_name) {
+                for pk in pks_to_delete {
+                    temporal.delete(|row| row.first().copied() == Some(pk));
+                }
+            }
+            // Re-acquire the table borrow to rebuild the columns.
+            let table = self
+                .catalog
+                .get_mut(&table_name)
+                .ok_or_else(|| Error::NotFound(format!("table \"{}\"", table_name)))?;
+            // Rebuild each column keeping only non-deleted rows.
+            let keep_mask: Vec<bool> = delete_mask.iter().map(|&d| !d).collect();
+            for col in &mut table.columns {
+                let col_ref = std::sync::Arc::make_mut(col);
+                let mut new_vals = Vec::with_capacity(n - deleted);
+                for (i, &keep) in keep_mask.iter().enumerate() {
+                    if keep {
+                        new_vals.push(col_ref[i]);
+                    }
+                }
+                *col_ref = new_vals;
+            }
+            table.row_count -= deleted;
+        } else {
+            // Rebuild each column keeping only non-deleted rows.
+            let keep_mask: Vec<bool> = delete_mask.iter().map(|&d| !d).collect();
+            for col in &mut table.columns {
+                let col_ref = std::sync::Arc::make_mut(col);
+                let mut new_vals = Vec::with_capacity(n - deleted);
+                for (i, &keep) in keep_mask.iter().enumerate() {
+                    if keep {
+                        new_vals.push(col_ref[i]);
+                    }
+                }
+                *col_ref = new_vals;
+            }
+            table.row_count -= deleted;
         }
-        table.row_count -= deleted;
 
         let mut result = QueryResult::empty();
         result.row_count = deleted;
@@ -2270,6 +2397,56 @@ fn parse_for_system_time(sql: &str) -> Option<(String, u64)> {
     // followed by WHERE/ORDER/etc.).
     let table_name = after_from.split_whitespace().next()?.to_string();
     Some((table_name, timestamp))
+}
+
+/// Detect `WITH (SYSTEM_VERSIONING = ON)` in a CREATE TABLE SQL string
+/// (case-insensitive) and return the table name. Used by `execute_inner`
+/// to register the table in `self.temporals` (Wave 56d).
+///
+/// SQL syntax:
+///   CREATE TABLE <name> (<cols>) WITH (SYSTEM_VERSIONING = ON)
+///   CREATE TABLE <name> (<cols>) WITH (SYSTEM_VERSIONING=ON)
+///
+/// Returns None if the SYSTEM_VERSIONING clause is not present or the
+/// table name can't be extracted.
+fn extract_temporal_table_name(sql: &str) -> Option<String> {
+    let lower = sql.to_lowercase();
+    // Look for "system_versioning" — accept both `SYSTEM_VERSIONING = ON`
+    // and `SYSTEM_VERSIONING=ON` (no spaces around =).
+    if !lower.contains("system_versioning") {
+        return None;
+    }
+    // Check that ON follows (allow whitespace and optional = sign).
+    let sv_pos = lower.find("system_versioning")?;
+    let after_sv = &lower[sv_pos + "system_versioning".len()..];
+    let after_sv_trimmed = after_sv.trim_start();
+    // Optional '='.
+    let after_eq = if after_sv_trimmed.starts_with('=') {
+        &after_sv_trimmed[1..]
+    } else {
+        after_sv_trimmed
+    };
+    let after_eq_trimmed = after_eq.trim_start();
+    if !after_eq_trimmed.starts_with("on") {
+        return None;
+    }
+    // Extract the table name: the first identifier after "CREATE TABLE".
+    let create_pos = lower.find("create table")?;
+    let after_create = &sql[create_pos + "create table".len()..];
+    let after_create_trimmed = after_create.trim_start();
+    // Optional IF NOT EXISTS.
+    let after_ifne = if after_create_trimmed.to_lowercase().starts_with("if not exists") {
+        &after_create_trimmed["if not exists".len()..].trim_start()
+    } else {
+        after_create_trimmed
+    };
+    // The table name is the first identifier (up to whitespace, '.', or '(').
+    let end = after_ifne.find(|c: char| c.is_whitespace() || c == '.' || c == '(')?;
+    let name = &after_ifne[..end];
+    if name.is_empty() {
+        return None;
+    }
+    Some(name.to_string())
 }
 
 /// Convert temporal-table rows (Vec<Vec<u64>>) into a QueryResult.

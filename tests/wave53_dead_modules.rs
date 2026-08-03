@@ -204,25 +204,26 @@ fn json_query_through_engine_execute() {
 
 // -----------------------------------------------------------------------
 // Temporal: FOR SYSTEM_TIME AS OF <timestamp>.
+// Wave 56d: the previous test used the Rust API (e.temporals.insert) to
+// register the temporal table. We now support DDL: CREATE TABLE ... WITH
+// (SYSTEM_VERSIONING = ON) registers the table in self.temporals, and
+// INSERT / UPDATE / DELETE on the table sync to the TemporalTable sidecar.
 // -----------------------------------------------------------------------
 
 #[test]
 fn temporal_query_as_of_through_engine() {
+    // Legacy test: still uses the Rust API to register the temporal table.
+    // This verifies backward compatibility — the Rust API still works.
     use turbogp::exec::temporal::TemporalTable;
     let mut e = QueryEngine::new();
-    // Register a temporal table under the name "history_t".
     let mut t = TemporalTable::new(vec!["id".to_string(), "v".to_string()]);
     t.insert(vec![1, 100]);
     t.insert(vec![2, 200]);
-    // Update row 1 to v=150 — creates a history entry.
     t.update(|row| row[0] == 1, vec![1, 150]);
     e.temporals.insert("history_t".to_string(), t);
 
-    // Query as of a far-future timestamp — should see the current state (v=150 for id=1).
-    // Use u64::MAX so the timestamp is definitely larger than any now_millis() value.
     let r = e.execute("SELECT * FROM history_t FOR SYSTEM_TIME AS OF 18446744073709551615").unwrap();
     assert!(r.row_count >= 1, "temporal query must return rows");
-    // Find the id=1 row and verify v=150 (the updated value).
     let id_col = r.columns.iter().find(|c| c.name == "id").expect("id column");
     let v_col = r.columns.iter().find(|c| c.name == "v").expect("v column");
     let mut found = false;
@@ -233,6 +234,62 @@ fn temporal_query_as_of_through_engine() {
         }
     }
     assert!(found, "temporal query must include id=1");
+}
+
+/// Wave 56d: CREATE TABLE ... WITH (SYSTEM_VERSIONING = ON) registers the
+/// table as a TemporalTable. Subsequent INSERT / UPDATE / DELETE sync to
+/// the temporal sidecar. FOR SYSTEM_TIME AS OF returns historical state.
+#[test]
+fn temporal_table_created_via_ddl() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let mut e = QueryEngine::new();
+
+    // Create a temporal table via DDL.
+    e.execute("CREATE TABLE t_hist (id INT, v INT) WITH (SYSTEM_VERSIONING = ON)").unwrap();
+    // The table must be registered in self.temporals.
+    assert!(e.temporals.contains_key("t_hist"), "CREATE TABLE WITH SYSTEM_VERSIONING must register the temporal table");
+
+    // Insert two rows.
+    e.execute("INSERT INTO t_hist (id, v) VALUES (1, 100)").unwrap();
+    e.execute("INSERT INTO t_hist (id, v) VALUES (2, 200)").unwrap();
+
+    // Capture the timestamp BEFORE the update.
+    let ts_before_update = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    // Sleep briefly so the update's timestamp is strictly greater.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    // Update row 1 to v=150.
+    e.execute("UPDATE t_hist SET v = 150 WHERE id = 1").unwrap();
+
+    // Query as of ts_before_update — should see the OLD value (v=100 for id=1).
+    let r = e.execute(&format!("SELECT * FROM t_hist FOR SYSTEM_TIME AS OF {}", ts_before_update)).unwrap();
+    assert!(r.row_count >= 1, "temporal AS OF query must return rows");
+    let id_col = r.columns.iter().find(|c| c.name == "id").expect("id column");
+    let v_col = r.columns.iter().find(|c| c.name == "v").expect("v column");
+    let mut found_old = false;
+    for i in 0..r.row_count {
+        if id_col.values[i] == 1 {
+            assert_eq!(v_col.values[i], 100, "AS OF before update must see old value v=100");
+            found_old = true;
+        }
+    }
+    assert!(found_old, "AS OF before update must include id=1");
+
+    // Query as of far-future timestamp — should see the NEW value (v=150 for id=1).
+    let r = e.execute("SELECT * FROM t_hist FOR SYSTEM_TIME AS OF 18446744073709551615").unwrap();
+    let id_col = r.columns.iter().find(|c| c.name == "id").expect("id column");
+    let v_col = r.columns.iter().find(|c| c.name == "v").expect("v column");
+    let mut found_new = false;
+    for i in 0..r.row_count {
+        if id_col.values[i] == 1 {
+            assert_eq!(v_col.values[i], 150, "AS OF after update must see new value v=150");
+            found_new = true;
+        }
+    }
+    assert!(found_new, "AS OF after update must include id=1");
 }
 
 // -----------------------------------------------------------------------
