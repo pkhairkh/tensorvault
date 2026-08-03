@@ -1,5 +1,6 @@
 pub mod flat_hash_table;
 pub mod arena;
+pub mod expr_eval;
 pub mod hash_column;
 pub mod join;
 pub mod string_ops;

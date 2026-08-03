@@ -379,21 +379,37 @@ impl Parser {
         Err(format!("expected select item, got {:?}", self.peek()))
     }
 
-    /// Parse the argument of an aggregate function: `*`, a column name, or
-    /// (for completeness) an integer literal.
+    /// Parse the argument of an aggregate function: `*`, a column name,
+    /// an integer literal, or an arithmetic expression like `col1 * (1 - col2)`.
+    ///
+    /// The expression is captured as a raw string for the executor to evaluate.
+    /// Supported operators: + - * / and parentheses.
     fn parse_agg_arg(&mut self) -> Result<String, String> {
         if self.match_op("*") {
             return Ok("*".to_string());
         }
-        if let Token::Ident(name) = self.peek().clone() {
-            self.next();
-            return Ok(name);
+        // Parse an arithmetic expression by collecting tokens until ).
+        let mut parts: Vec<String> = Vec::new();
+        let mut paren_depth = 0i32;
+        loop {
+            match self.peek().clone() {
+                Token::RParen if paren_depth == 0 => break,
+                Token::RParen => { paren_depth -= 1; parts.push(")".into()); self.next(); }
+                Token::LParen => { paren_depth += 1; parts.push("(".into()); self.next(); }
+                Token::Comma | Token::Semicolon | Token::EOF => break,
+                Token::Keyword(k) if k == "FROM" || k == "WHERE" || k == "GROUP" || k == "ORDER" || k == "HAVING" || k == "LIMIT" => break,
+                Token::Ident(name) => { parts.push(name); self.next(); }
+                Token::Int(i) => { parts.push(i.to_string()); self.next(); }
+                Token::Float(f) => { parts.push(f.to_string()); self.next(); }
+                Token::Op(op) => { parts.push(op); self.next(); }
+                Token::Keyword(k) => { parts.push(k); self.next(); }
+                _ => break,
+            }
         }
-        if let Token::Int(i) = self.peek().clone() {
-            self.next();
-            return Ok(i.to_string());
+        if parts.is_empty() {
+            return Err(format!("expected aggregate argument, got {:?}", self.peek()));
         }
-        Err(format!("expected aggregate argument, got {:?}", self.peek()))
+        Ok(parts.join(" "))
     }
 
     /// Parse an optional `AS ident` alias. Implicit aliases (without `AS`)
