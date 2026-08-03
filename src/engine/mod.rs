@@ -393,6 +393,7 @@ impl QueryEngine {
 
         // Try DDL first (CREATE TABLE, DROP TABLE, CREATE SCHEMA).
         if let Some(ddl) = crate::sql::parse_ddl(sql).map_err(Error::Parse)? {
+            self.wal_append(sql);
             let mut result = self.execute_ddl(ddl)?;
             result.elapsed_us = start.elapsed().as_micros() as u64;
             return Ok(result);
@@ -400,6 +401,9 @@ impl QueryEngine {
 
         // Try DML (INSERT, UPDATE, DELETE).
         if let Some(dml) = crate::sql::parse_dml(sql).map_err(Error::Parse)? {
+            // Append to WAL before executing (Wave 37). Store the raw SQL
+            // so it can be replayed on restart.
+            self.wal_append(sql);
             let mut result = self.execute_dml(dml)?;
             result.elapsed_us = start.elapsed().as_micros() as u64;
             return Ok(result);
@@ -501,9 +505,6 @@ impl QueryEngine {
 
     /// Execute a DML statement (INSERT, UPDATE, DELETE).
     fn execute_dml(&mut self, dml: crate::sql::DmlStatement) -> Result<QueryResult> {
-        // Append to WAL before executing (Wave 37).
-        let sql_repr = format!("{:?}", dml);
-        self.wal_append(&sql_repr);
         match dml {
             crate::sql::DmlStatement::Insert(ins) => self.execute_insert(ins),
             crate::sql::DmlStatement::Update(upd) => self.execute_update(upd),
