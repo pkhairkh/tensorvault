@@ -506,11 +506,37 @@ impl QueryEngine {
         for row_vals in &ins.values {
             for (i, &col_idx) in col_indices.iter().enumerate() {
                 let val_str = &row_vals[i];
+                let is_null = val_str.trim().eq_ignore_ascii_case("null");
                 let cell = parse_value_cell(val_str);
                 // COW: Arc::make_mut gives us a mutable Vec if we're the
                 // sole owner, or clones if shared.
                 let col = std::sync::Arc::make_mut(&mut table.columns[col_idx]);
                 col.push(cell);
+
+                // Update the NULL bitmap (Wave 32): mark the cell as NULL
+                // if the value was explicitly NULL.
+                if is_null {
+                    // Ensure a bitmap exists for this column.
+                    if col_idx >= table.null_bitmaps.len() {
+                        table.null_bitmaps.resize(table.columns.len(), None);
+                    }
+                    if table.null_bitmaps[col_idx].is_none() {
+                        // Initialize bitmap: all existing rows are non-NULL.
+                        let mut bm = crate::types::null_bitmap::NullBitmap::new(table.row_count);
+                        // The new row (at index table.row_count) is NULL.
+                        bm.push_null();
+                        table.null_bitmaps[col_idx] = Some(bm);
+                    } else {
+                        table.null_bitmaps[col_idx].as_mut().unwrap().push_null();
+                    }
+                } else {
+                    // Non-NULL value: ensure bitmap exists and push non-null.
+                    if col_idx < table.null_bitmaps.len() {
+                        if let Some(ref mut bm) = table.null_bitmaps[col_idx] {
+                            bm.push_non_null();
+                        }
+                    }
+                }
             }
         }
         table.row_count += n_new_rows;
