@@ -63,6 +63,7 @@ pub mod server;
 pub mod sketch;
 pub mod sql;
 pub mod storage;
+pub mod txn;
 pub mod types;
 
 pub use error::{Error, Result};

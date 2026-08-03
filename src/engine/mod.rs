@@ -86,6 +86,8 @@ pub struct QueryEngine {
     /// struct so a future wave that wires in the `PlanLowerer` doesn't
     /// have to change every call site.
     cost_model: CostModel,
+    /// Transaction manager for BEGIN/COMMIT/ROLLBACK (Wave 5).
+    txn_manager: crate::txn::TxnManager,
 }
 
 impl QueryEngine {
@@ -98,6 +100,7 @@ impl QueryEngine {
             catalog: Catalog::new(),
             kernel_table: Arc::new(KernelTable::new()),
             cost_model: CostModel::default(),
+            txn_manager: crate::txn::TxnManager::new(),
         }
     }
 
@@ -106,7 +109,7 @@ impl QueryEngine {
     /// [`CostModel::with_learned`]). The kernel table is still the
     /// default.
     pub fn with_cost_model(cost_model: CostModel) -> Self {
-        Self { catalog: Catalog::new(), kernel_table: Arc::new(KernelTable::new()), cost_model }
+        Self { catalog: Catalog::new(), kernel_table: Arc::new(KernelTable::new()), cost_model, txn_manager: crate::txn::TxnManager::new() }
     }
 
     /// Borrow the catalog. Read-only access for callers that want to
@@ -202,6 +205,56 @@ impl QueryEngine {
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult> {
         let start = Instant::now();
 
+        // Transaction control: BEGIN/COMMIT/ROLLBACK.
+        let trimmed = sql.trim();
+        let lower = trimmed.to_lowercase();
+        if lower.starts_with("begin") || lower.starts_with("start transaction") {
+            let _id = self
+                .txn_manager
+                .begin(&self.catalog)
+                .map_err(Error::Other)?;
+            return Ok(QueryResult::empty());
+        }
+        if lower.starts_with("commit") {
+            let committed = self
+                .txn_manager
+                .commit()
+                .map_err(Error::Other)?;
+            self.catalog = committed;
+            return Ok(QueryResult::empty());
+        }
+        if lower.starts_with("rollback") {
+            self.txn_manager
+                .rollback()
+                .map_err(Error::Other)?;
+            return Ok(QueryResult::empty());
+        }
+
+        // If a transaction is active, route all DML/DDL/SELECT to the
+        // snapshot catalog. Otherwise, use the main catalog.
+        // We do this by swapping the snapshot into self.catalog for the
+        // duration of the statement, then swapping back.
+        let txn_active = self.txn_manager.is_active();
+        if txn_active {
+            // Take the snapshot out of the txn manager temporarily.
+            let mut txn = self.txn_manager.active.take().expect("txn active");
+            std::mem::swap(&mut self.catalog, &mut txn.snapshot);
+            let result = self.execute_inner(sql, &start);
+            // Swap back: self.catalog goes back to being the main catalog
+            // (unchanged), txn.snapshot becomes the (possibly modified)
+            // transaction state.
+            std::mem::swap(&mut self.catalog, &mut txn.snapshot);
+            self.txn_manager.active = Some(txn);
+            return result;
+        }
+
+        self.execute_inner(sql, &start)
+    }
+
+    /// Inner execution: dispatches DDL, DML, and SELECT without
+    /// transaction awareness. Called by `execute` either with the main
+    /// catalog or with the txn snapshot swapped in.
+    fn execute_inner(&mut self, sql: &str, start: &Instant) -> Result<QueryResult> {
         // Try DDL first (CREATE TABLE, DROP TABLE, CREATE SCHEMA).
         if let Some(ddl) = crate::sql::parse_ddl(sql).map_err(Error::Parse)? {
             let mut result = self.execute_ddl(ddl)?;
@@ -214,16 +267,6 @@ impl QueryEngine {
             let mut result = self.execute_dml(dml)?;
             result.elapsed_us = start.elapsed().as_micros() as u64;
             return Ok(result);
-        }
-
-        // Try transaction control.
-        let trimmed = sql.trim();
-        let lower = trimmed.to_lowercase();
-        if lower.starts_with("begin") || lower.starts_with("start transaction") {
-            return Ok(QueryResult::empty());
-        }
-        if lower.starts_with("commit") || lower.starts_with("rollback") {
-            return Ok(QueryResult::empty());
         }
 
         // Parse as SELECT.
