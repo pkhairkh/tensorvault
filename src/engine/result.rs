@@ -25,33 +25,65 @@
 /// matches the select-list item that produced it (for `*`, the column's
 /// original name from the catalog; for aggregates, the function name
 /// lowercased — e.g. `"count"`, `"sum"`).
+///
+/// ## String columns (Wave 21)
+///
+/// For columns that originated from a string-typed source column, the
+/// `string_values` field is `Some` and contains the original (non-hashed)
+/// string values. The `values` field still contains the xxh3 hashes for
+/// backward compatibility. Callers that want to display results should
+/// check `string_values` first.
 #[derive(Debug, Clone)]
 pub struct ResultColumn {
     /// Column name.
     pub name: String,
     /// Cell values, parallel to every other column in the result.
     pub values: Vec<u64>,
+    /// Original string values, if this column originated from a string
+    /// column in the source table. `None` for numeric/aggregate columns.
+    /// When `Some`, `string_values.len() == values.len()`.
+    pub string_values: Option<Vec<String>>,
 }
 
 impl ResultColumn {
     /// Construct a single-cell column from a `u64` value.
-    ///
-    /// Used by aggregate paths (`SELECT count(*) FROM t`) that produce
-    /// exactly one row.
     pub fn scalar_u64(name: impl Into<String>, value: u64) -> Self {
-        Self { name: name.into(), values: vec![value] }
+        Self { name: name.into(), values: vec![value], string_values: None }
     }
 
     /// Construct a single-cell column from an `f64` value, bit-reinterpreted
     /// as `u64` (matching the engine's universal cell format for Float64
     /// columns — see [`crate::datasource`]).
     pub fn scalar_f64(name: impl Into<String>, value: f64) -> Self {
-        Self { name: name.into(), values: vec![value.to_bits()] }
+        Self { name: name.into(), values: vec![value.to_bits()], string_values: None }
+    }
+
+    /// Construct a column from u64 values (no string data).
+    pub fn from_u64(name: impl Into<String>, values: Vec<u64>) -> Self {
+        Self { name: name.into(), values, string_values: None }
+    }
+
+    /// Construct a column from string values. The u64 `values` are
+    /// computed as xxh3_64 hashes of the strings for backward compatibility.
+    pub fn from_strings(name: impl Into<String>, strings: Vec<String>) -> Self {
+        use xxhash_rust::xxh3;
+        let values: Vec<u64> = strings.iter().map(|s| xxh3::xxh3_64(s.as_bytes())).collect();
+        Self { name: name.into(), values, string_values: Some(strings) }
     }
 
     /// The column's cell values as a slice.
     pub fn as_slice(&self) -> &[u64] {
         &self.values
+    }
+
+    /// Returns the string value at `row_idx` if this is a string column.
+    pub fn get_string(&self, row_idx: usize) -> Option<&str> {
+        self.string_values.as_ref().and_then(|sv| sv.get(row_idx).map(|s| s.as_str()))
+    }
+
+    /// Returns true if this column has string data.
+    pub fn has_strings(&self) -> bool {
+        self.string_values.is_some()
     }
 }
 
@@ -256,9 +288,9 @@ mod tests {
     #[test]
     fn push_column_sets_row_count() {
         let mut r = QueryResult::empty();
-        r.push_column(ResultColumn { name: "x".into(), values: vec![1, 2, 3] }).expect("push");
+        r.push_column(ResultColumn { name: "x".into(), values: vec![1, 2, 3] , string_values: None }).expect("push");
         assert_eq!(r.row_count, 3);
-        r.push_column(ResultColumn { name: "y".into(), values: vec![10, 20, 30] }).expect("push");
+        r.push_column(ResultColumn { name: "y".into(), values: vec![10, 20, 30] , string_values: None }).expect("push");
         assert_eq!(r.row_count, 3);
         assert_eq!(r.column_count(), 2);
     }
@@ -266,17 +298,17 @@ mod tests {
     #[test]
     fn push_column_rejects_length_mismatch() {
         let mut r = QueryResult::empty();
-        r.push_column(ResultColumn { name: "x".into(), values: vec![1, 2, 3] }).expect("push");
+        r.push_column(ResultColumn { name: "x".into(), values: vec![1, 2, 3] , string_values: None }).expect("push");
         let err =
-            r.push_column(ResultColumn { name: "y".into(), values: vec![10, 20] }).unwrap_err();
+            r.push_column(ResultColumn { name: "y".into(), values: vec![10, 20] , string_values: None }).unwrap_err();
         assert!(err.contains("row_count"), "got: {err}");
     }
 
     #[test]
     fn column_lookup_by_name() {
         let mut r = QueryResult::empty();
-        r.push_column(ResultColumn { name: "id".into(), values: vec![1, 2, 3] }).expect("push");
-        r.push_column(ResultColumn { name: "v".into(), values: vec![10, 20, 30] }).expect("push");
+        r.push_column(ResultColumn { name: "id".into(), values: vec![1, 2, 3] , string_values: None }).expect("push");
+        r.push_column(ResultColumn { name: "v".into(), values: vec![10, 20, 30] , string_values: None }).expect("push");
         assert_eq!(r.column("id"), Some(&[1u64, 2, 3][..]));
         assert_eq!(r.column("v"), Some(&[10u64, 20, 30][..]));
         assert_eq!(r.column("missing"), None);
@@ -292,8 +324,8 @@ mod tests {
     #[test]
     fn print_does_not_panic_on_multi_column() {
         let mut r = QueryResult::empty();
-        r.push_column(ResultColumn { name: "id".into(), values: vec![1, 2, 3] }).expect("push");
-        r.push_column(ResultColumn { name: "v".into(), values: vec![10, 20, 30] }).expect("push");
+        r.push_column(ResultColumn { name: "id".into(), values: vec![1, 2, 3] , string_values: None }).expect("push");
+        r.push_column(ResultColumn { name: "v".into(), values: vec![10, 20, 30] , string_values: None }).expect("push");
         r.print();
         // No assertion — the test just verifies print doesn't panic.
     }
