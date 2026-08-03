@@ -5,7 +5,7 @@
 //! have the same format (except startup, which has no type byte).
 
 use super::session::{Session, TxnStatus};
-use crate::engine::{QueryEngine, QueryResult};
+use crate::engine::{QueryEngine, QueryResult, ResultColumn};
 use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
@@ -29,6 +29,35 @@ struct Portal {
     stmt_name: String,
     params: Vec<String>,
     result_formats: Vec<i16>,
+    /// Cached query result for cursor-style Execute (Wave 52 fix).
+    /// Populated on the first Execute call when `max_rows > 0`; subsequent
+    /// Execute calls drain rows from here instead of re-running the query.
+    /// `None` for portals that have not yet been executed or that
+    /// completed in a single Execute (max_rows = 0 / unlimited).
+    cached_result: Option<CachedResult>,
+    /// Offset into `cached_result` for the next Execute call.
+    cached_offset: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CachedResult {
+    /// The full result (all rows) of the query, retained so subsequent
+    /// Execute calls can drain more rows.
+    result: QueryResult,
+    /// The command tag to send when the cursor is exhausted.
+    tag: String,
+}
+
+impl Portal {
+    fn new(stmt_name: String, params: Vec<String>, result_formats: Vec<i16>) -> Self {
+        Self {
+            stmt_name,
+            params,
+            result_formats,
+            cached_result: None,
+            cached_offset: 0,
+        }
+    }
 }
 
 pub struct PgConn {
@@ -311,7 +340,7 @@ impl PgConn {
             let _ = self.send_error("26000", &format!("prepared statement \"{stmt_name}\" does not exist")).await;
             return Ok(());
         }
-        self.portals.insert(portal_name, Portal { stmt_name, params, result_formats: rfmts });
+        self.portals.insert(portal_name, Portal::new(stmt_name, params, rfmts));
         self.send_byte(b'2', &[]).await // BindComplete
     }
 
@@ -342,25 +371,19 @@ impl PgConn {
                     let _ = self.send_error("26000", &format!("statement \"{}\" not found", portal.stmt_name)).await;
                     return Ok(());
                 }};
-                let sql = substitute_params(&stmt.sql, &portal.params);
-                let result = {
-                    let readonly = engine.read().expect("engine");
-                    match readonly.try_readonly_select(&sql) {
-                        Ok(r) => Ok(r),
-                        Err(_) => {
-                            drop(readonly);
-                            let mut guard = engine.write().expect("engine");
-                            guard.execute(&sql)
-                        }
-                    }
-                };
-                match result {
-                    Ok(r) => {
-                        if r.columns.is_empty() { self.send_byte(b'n', &[]).await?; }
-                        else { self.send_row_description(&r).await?; }
-                    }
-                    Err(_) => { self.send_byte(b'n', &[]).await?; }
-                }
+                // Wave 52 fix (Bug 12): Describe must NOT execute the query.
+                // The previous implementation called `try_readonly_select`
+                // to learn the result shape, which executed the query as a
+                // side effect (including side effects for DML disguised as
+                // SELECT). psql tolerates a NoData response, so we send
+                // that and avoid execution entirely.
+                //
+                // A proper fix would parse the SQL and infer the schema
+                // from the catalog without executing. That's a larger
+                // change reserved for a future wave.
+                let _ = stmt; // suppress unused-variable warning
+                let _ = &portal.params;
+                self.send_byte(b'n', &[]).await?; // NoData
             }
             _ => { let _ = self.send_error("08P01", "unknown describe kind").await; }
         }
@@ -371,12 +394,48 @@ impl PgConn {
         let mut c = 0;
         let portal_name = read_cstring(buf, &mut c)?;
         if c + 4 > buf.len() { return Err(io::Error::new(io::ErrorKind::InvalidData, "Execute truncated")); }
-        let _max_rows = i32::from_be_bytes([buf[c],buf[c+1],buf[c+2],buf[c+3]]);
-        let portal = match self.portals.get(&portal_name) { Some(p) => p.clone(), None => {
+        // Wave 52 fix (Bug 13): respect max_rows. The previous implementation
+        // read this field into `_max_rows` and discarded it. Now:
+        // - max_rows = 0: send all rows + CommandComplete.
+        // - max_rows > 0: send at most max_rows rows. If more rows remain,
+        //   send PortalSuspended ('s') instead of CommandComplete; the
+        //   client can call Execute again to drain more rows.
+        let max_rows = i32::from_be_bytes([buf[c],buf[c+1],buf[c+2],buf[c+3]]);
+
+        // Fast path: if the portal already has a cached result (from a
+        // previous Execute with max_rows > 0), drain more rows from it
+        // without re-executing the query.
+        let cached = self.portals.get(&portal_name).and_then(|p| {
+            p.cached_result.as_ref().map(|cr| (cr.clone(), p.cached_offset))
+        });
+        if let Some((cr, offset)) = cached {
+            // Drain the next batch from the cached result.
+            let limit = if max_rows > 0 { max_rows as usize } else { cr.result.row_count };
+            let end = (offset + limit).min(cr.result.row_count);
+            let batch = slice_result(&cr.result, offset, end);
+            self.send_data_rows(&batch).await?;
+            if end >= cr.result.row_count {
+                // Cursor exhausted.
+                self.send_command_complete(&cr.tag, cr.result.row_count).await?;
+                if let Some(p) = self.portals.get_mut(&portal_name) {
+                    p.cached_result = None;
+                    p.cached_offset = 0;
+                }
+            } else {
+                // More rows remain — send PortalSuspended.
+                self.send_byte(b's', &[]).await?;
+                if let Some(p) = self.portals.get_mut(&portal_name) {
+                    p.cached_offset = end;
+                }
+            }
+            return Ok(());
+        }
+
+        let portal = match self.portals.get(&portal_name).cloned() { Some(p) => p, None => {
             let _ = self.send_error("34000", &format!("portal \"{portal_name}\" not found")).await;
             return Ok(());
         }};
-        let stmt = match self.statements.get(&portal.stmt_name) { Some(s) => s.clone(), None => {
+        let stmt = match self.statements.get(&portal.stmt_name).cloned() { Some(s) => s, None => {
             let _ = self.send_error("26000", &format!("statement \"{}\" not found", portal.stmt_name)).await;
             return Ok(());
         }};
@@ -394,8 +453,23 @@ impl PgConn {
         };
         match result {
             Ok(r) => {
-                self.send_data_rows(&r).await?;
-                self.send_command_complete(&command_tag(&r, &sql), r.row_count).await?;
+                let tag = command_tag(&r, &sql);
+                if max_rows > 0 && r.row_count > (max_rows as usize) {
+                    // Send only the first max_rows rows, cache the rest.
+                    let end = (max_rows as usize).min(r.row_count);
+                    let batch = slice_result(&r, 0, end);
+                    self.send_data_rows(&batch).await?;
+                    // PortalSuspended signals the client can call Execute again.
+                    self.send_byte(b's', &[]).await?;
+                    if let Some(p) = self.portals.get_mut(&portal_name) {
+                        p.cached_result = Some(CachedResult { result: r, tag });
+                        p.cached_offset = end;
+                    }
+                } else {
+                    // max_rows = 0 or result fits in one batch.
+                    self.send_data_rows(&r).await?;
+                    self.send_command_complete(&tag, r.row_count).await?;
+                }
             }
             Err(e) => { let _ = self.send_error("42000", &format!("{e}")).await; }
         }
@@ -457,10 +531,24 @@ impl PgConn {
     }
 
     async fn send_data_rows(&mut self, r: &QueryResult) -> io::Result<()> {
+        // Wave 52 fix (Bug 11): for each cell, check the column's `null_mask`.
+        // If the cell is NULL, send `-1i32` as the length (no payload) per
+        // the Postgres wire protocol. Previously NULL cells were sent as
+        // the string "0", which clients interpreted as a non-NULL zero.
         for row_idx in 0..r.row_count {
             let mut body = Vec::new();
             body.extend_from_slice(&(r.columns.len() as u16).to_be_bytes());
             for col in &r.columns {
+                // Check NULL mask first.
+                let is_null = col.null_mask.as_ref()
+                    .and_then(|m| m.get(row_idx).copied())
+                    .unwrap_or(false);
+                if is_null {
+                    // Postgres wire protocol: NULL is encoded as a -1 i32
+                    // length with no payload bytes.
+                    body.extend_from_slice(&(-1i32).to_be_bytes());
+                    continue;
+                }
                 // If the column has string_values, send the original string.
                 // Otherwise, send the u64 cell as a decimal string. (Wave 34)
                 let s = if let Some(sv) = &col.string_values {
@@ -616,6 +704,34 @@ fn command_tag(r: &QueryResult, sql: &str) -> String {
     if lower.starts_with("commit") { return "COMMIT".into(); }
     if lower.starts_with("rollback") { return "ROLLBACK".into(); }
     "OK".into()
+}
+
+/// Slice a QueryResult to rows `[start, end)` (Wave 52 fix).
+///
+/// Used by `handle_execute` to honor `max_rows`: the first Execute sends
+/// rows `[0, max_rows)`, subsequent Execute calls drain the rest from the
+/// portal's `cached_result`.
+fn slice_result(r: &QueryResult, start: usize, end: usize) -> QueryResult {
+    let start = start.min(r.row_count);
+    let end = end.min(r.row_count);
+    let row_count = end.saturating_sub(start);
+    let columns: Vec<ResultColumn> = r.columns.iter().map(|c| {
+        let values: Vec<u64> = c.values[start..end].to_vec();
+        let string_values = c.string_values.as_ref().map(|sv| sv[start..end].to_vec());
+        let null_mask = c.null_mask.as_ref().map(|m| m[start..end].to_vec());
+        ResultColumn {
+            name: c.name.clone(),
+            values,
+            string_values,
+            type_oid: c.type_oid,
+            null_mask,
+        }
+    }).collect();
+    QueryResult {
+        columns,
+        row_count,
+        elapsed_us: r.elapsed_us,
+    }
 }
 
 fn substitute_params(sql: &str, params: &[String]) -> String {

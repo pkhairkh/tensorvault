@@ -119,6 +119,7 @@ fn type_oid_in_result_column() {
         values: vec![19.99f64.to_bits()],
         string_values: None,
         type_oid: 701, // FLOAT8
+        null_mask: None,
     };
     assert_eq!(col.type_oid, 701);
 }

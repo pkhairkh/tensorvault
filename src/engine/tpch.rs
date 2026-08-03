@@ -4270,7 +4270,7 @@ impl<'a> TpchExec<'a> {
             let mut cols: Vec<ResultColumn> = Vec::with_capacity(query.select.len());
             for item in &query.select {
                 let name = item.alias.clone().unwrap_or_else(|| self.expr_name(&item.expr));
-                cols.push(ResultColumn { name, values: Vec::new(), string_values: None, type_oid: 0 });
+                cols.push(ResultColumn { name, values: Vec::new(), string_values: None, type_oid: 0, null_mask: None });
             }
             return Ok(Some(QueryResult { columns: cols, row_count: 0, elapsed_us: 0 }));
         }
@@ -4343,7 +4343,7 @@ impl<'a> TpchExec<'a> {
                     finalized.iter().map(|(_, _, _, _, maxs)| maxs[agg_idx].to_bits()).collect()
                 }
             };
-            cols.push(ResultColumn { name, values, string_values: None, type_oid: 0 });
+            cols.push(ResultColumn { name, values, string_values: None, type_oid: 0, null_mask: None });
         }
 
         let mut result = QueryResult { columns: cols, row_count: finalized.len(), elapsed_us: 0 };
@@ -4473,7 +4473,7 @@ impl<'a> TpchExec<'a> {
                     self.eval_agg_expr(&item.expr, t, gidxs).unwrap_or(Value2::Null).to_u64()
                 }).collect()
             };
-            cols.push(ResultColumn { name, values, string_values: None, type_oid: 0 });
+            cols.push(ResultColumn { name, values, string_values: None, type_oid: 0, null_mask: None });
         }
 
         let mut result = QueryResult { columns: cols, row_count: filtered.len(), elapsed_us: 0 };
@@ -4717,7 +4717,7 @@ impl<'a> TpchExec<'a> {
         for item in &query.select {
             let name = item.alias.clone().unwrap_or_else(|| self.expr_name(&item.expr));
             let v = self.eval_agg_expr(&item.expr, t, indices)?;
-            cols.push(ResultColumn { name, values: vec![v.to_u64()], string_values: None, type_oid: 0 });
+            cols.push(ResultColumn { name, values: vec![v.to_u64()], string_values: None, type_oid: 0, null_mask: None });
         }
         Ok(QueryResult { columns: cols, row_count: 1, elapsed_us: 0 })
     }
@@ -4857,7 +4857,7 @@ impl<'a> TpchExec<'a> {
             let values: Vec<u64> = indices.iter().map(|&i| {
                 self.eval(&item.expr, t, i).unwrap_or(Value2::Null).to_u64()
             }).collect();
-            cols.push(ResultColumn { name, values, string_values: None, type_oid: 0 });
+            cols.push(ResultColumn { name, values, string_values: None, type_oid: 0, null_mask: None });
         }
         Ok(QueryResult { columns: cols, row_count: indices.len(), elapsed_us: 0 })
     }
@@ -4893,7 +4893,7 @@ impl<'a> TpchExec<'a> {
         });
         let new_cols: Vec<ResultColumn> = result.columns.iter().map(|c| {
             let values: Vec<u64> = order.iter().map(|&i| c.values[i]).collect();
-            ResultColumn { name: c.name.clone(), values, string_values: None, type_oid: 0 }
+            ResultColumn { name: c.name.clone(), values, string_values: None, type_oid: 0, null_mask: None }
         }).collect();
         Ok(QueryResult { columns: new_cols, row_count: result.row_count, elapsed_us: 0 })
     }
@@ -4923,7 +4923,7 @@ impl<'a> TpchExec<'a> {
         });
         let new_cols: Vec<ResultColumn> = result.columns.iter().map(|c| {
             let values: Vec<u64> = order.iter().map(|&i| c.values[i]).collect();
-            ResultColumn { name: c.name.clone(), values, string_values: None, type_oid: 0 }
+            ResultColumn { name: c.name.clone(), values, string_values: None, type_oid: 0, null_mask: None }
         }).collect();
         Ok(QueryResult { columns: new_cols, row_count: result.row_count, elapsed_us: 0 })
     }
@@ -5616,8 +5616,8 @@ fn execute_q21_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
     if !found {
         return Ok(QueryResult {
             columns: vec![
-                ResultColumn { name: "s_name".to_string(), values: vec![] , string_values: None, type_oid: 0 },
-                ResultColumn { name: "numwait".to_string(), values: vec![] , string_values: None, type_oid: 0 },
+                ResultColumn { name: "s_name".to_string(), values: vec![] , string_values: None, type_oid: 0, null_mask: None },
+                ResultColumn { name: "numwait".to_string(), values: vec![] , string_values: None, type_oid: 0, null_mask: None },
             ],
             row_count: 0,
             elapsed_us: 0,
@@ -5769,8 +5769,8 @@ fn execute_q21_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
 
     Ok(QueryResult {
         columns: vec![
-            ResultColumn { name: "s_name".to_string(), values: s_name_values , string_values: None, type_oid: 0 },
-            ResultColumn { name: "numwait".to_string(), values: numwait_values , string_values: None, type_oid: 0 },
+            ResultColumn { name: "s_name".to_string(), values: s_name_values , string_values: None, type_oid: 0, null_mask: None },
+            ResultColumn { name: "numwait".to_string(), values: numwait_values , string_values: None, type_oid: 0, null_mask: None },
         ],
         row_count: n_results,
         elapsed_us: 0,
@@ -6368,11 +6368,11 @@ fn execute_q4_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
             ResultColumn {
                 name: "o_orderpriority".to_string(),
                 values: priority_values,
-                string_values: None, type_oid: 0 },
+                string_values: None, type_oid: 0, null_mask: None },
             ResultColumn {
                 name: "order_count".to_string(),
                 values: count_values,
-                string_values: None, type_oid: 0 },
+                string_values: None, type_oid: 0, null_mask: None },
         ],
         row_count: n_results,
         elapsed_us: 0,
@@ -6635,11 +6635,11 @@ fn execute_q13_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
             ResultColumn {
                 name: "c_count".to_string(),
                 values: c_count_values,
-                string_values: None, type_oid: 0 },
+                string_values: None, type_oid: 0, null_mask: None },
             ResultColumn {
                 name: "custdist".to_string(),
                 values: custdist_values,
-                string_values: None, type_oid: 0 },
+                string_values: None, type_oid: 0, null_mask: None },
         ],
         row_count: n_results,
         elapsed_us: 0,
@@ -6797,7 +6797,7 @@ fn execute_q17_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
         columns: vec![ResultColumn {
             name: "avg_yearly".to_string(),
             values: vec![avg_yearly.to_bits()],
-            string_values: None, type_oid: 0 }],
+            string_values: None, type_oid: 0, null_mask: None }],
         row_count: 1,
         elapsed_us: 0,
     })
@@ -7096,19 +7096,19 @@ fn execute_q3_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
             ResultColumn {
                 name: "l_orderkey".to_string(),
                 values: orderkey_values,
-                string_values: None, type_oid: 0 },
+                string_values: None, type_oid: 0, null_mask: None },
             ResultColumn {
                 name: "revenue".to_string(),
                 values: revenue_values,
-                string_values: None, type_oid: 0 },
+                string_values: None, type_oid: 0, null_mask: None },
             ResultColumn {
                 name: "o_orderdate".to_string(),
                 values: orderdate_values,
-                string_values: None, type_oid: 0 },
+                string_values: None, type_oid: 0, null_mask: None },
             ResultColumn {
                 name: "o_shippriority".to_string(),
                 values: shippriority_values,
-                string_values: None, type_oid: 0 },
+                string_values: None, type_oid: 0, null_mask: None },
         ],
         row_count: n_results,
         elapsed_us: 0,
@@ -7276,15 +7276,15 @@ fn execute_q12_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
             ResultColumn {
                 name: "l_shipmode".to_string(),
                 values: vec![mail_hash, ship_hash],
-                string_values: None, type_oid: 0 },
+                string_values: None, type_oid: 0, null_mask: None },
             ResultColumn {
                 name: "high_line_count".to_string(),
                 values: high_values,
-                string_values: None, type_oid: 0 },
+                string_values: None, type_oid: 0, null_mask: None },
             ResultColumn {
                 name: "low_line_count".to_string(),
                 values: low_values,
-                string_values: None, type_oid: 0 },
+                string_values: None, type_oid: 0, null_mask: None },
         ],
         row_count: 2,
         elapsed_us: 0,
@@ -7479,27 +7479,27 @@ fn execute_q18_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
             ResultColumn {
                 name: "c_name".to_string(),
                 values: c_name_values,
-                string_values: None, type_oid: 0 },
+                string_values: None, type_oid: 0, null_mask: None },
             ResultColumn {
                 name: "c_custkey".to_string(),
                 values: c_custkey_values,
-                string_values: None, type_oid: 0 },
+                string_values: None, type_oid: 0, null_mask: None },
             ResultColumn {
                 name: "o_orderkey".to_string(),
                 values: o_orderkey_values,
-                string_values: None, type_oid: 0 },
+                string_values: None, type_oid: 0, null_mask: None },
             ResultColumn {
                 name: "o_orderdate".to_string(),
                 values: o_orderdate_values,
-                string_values: None, type_oid: 0 },
+                string_values: None, type_oid: 0, null_mask: None },
             ResultColumn {
                 name: "o_totalprice".to_string(),
                 values: o_totalprice_values,
-                string_values: None, type_oid: 0 },
+                string_values: None, type_oid: 0, null_mask: None },
             ResultColumn {
                 name: "sum".to_string(),
                 values: sum_qty_values,
-                string_values: None, type_oid: 0 },
+                string_values: None, type_oid: 0, null_mask: None },
         ],
         row_count: n_results,
         elapsed_us: 0,
@@ -7841,15 +7841,15 @@ fn execute_q9_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
             ResultColumn {
                 name: "nation".to_string(),
                 values: nation_values,
-                string_values: None, type_oid: 0 },
+                string_values: None, type_oid: 0, null_mask: None },
             ResultColumn {
                 name: "o_year".to_string(),
                 values: oyear_values,
-                string_values: None, type_oid: 0 },
+                string_values: None, type_oid: 0, null_mask: None },
             ResultColumn {
                 name: "sum_profit".to_string(),
                 values: sum_profit_values,
-                string_values: None, type_oid: 0 },
+                string_values: None, type_oid: 0, null_mask: None },
         ],
         row_count: n_results,
         elapsed_us: 0,
@@ -8118,35 +8118,35 @@ fn execute_q10_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
             ResultColumn {
                 name: "c_custkey".to_string(),
                 values: custkey_values,
-                string_values: None, type_oid: 0 },
+                string_values: None, type_oid: 0, null_mask: None },
             ResultColumn {
                 name: "c_name".to_string(),
                 values: name_values,
-                string_values: None, type_oid: 0 },
+                string_values: None, type_oid: 0, null_mask: None },
             ResultColumn {
                 name: "revenue".to_string(),
                 values: revenue_values,
-                string_values: None, type_oid: 0 },
+                string_values: None, type_oid: 0, null_mask: None },
             ResultColumn {
                 name: "c_acctbal".to_string(),
                 values: acctbal_values,
-                string_values: None, type_oid: 0 },
+                string_values: None, type_oid: 0, null_mask: None },
             ResultColumn {
                 name: "n_name".to_string(),
                 values: nname_values,
-                string_values: None, type_oid: 0 },
+                string_values: None, type_oid: 0, null_mask: None },
             ResultColumn {
                 name: "c_address".to_string(),
                 values: address_values,
-                string_values: None, type_oid: 0 },
+                string_values: None, type_oid: 0, null_mask: None },
             ResultColumn {
                 name: "c_phone".to_string(),
                 values: phone_values,
-                string_values: None, type_oid: 0 },
+                string_values: None, type_oid: 0, null_mask: None },
             ResultColumn {
                 name: "c_comment".to_string(),
                 values: comment_values,
-                string_values: None, type_oid: 0 },
+                string_values: None, type_oid: 0, null_mask: None },
         ],
         row_count: n_results,
         elapsed_us: 0,
@@ -8523,19 +8523,19 @@ fn execute_q7_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
             ResultColumn {
                 name: "supp_nation".to_string(),
                 values: supp_values,
-                string_values: None, type_oid: 0 },
+                string_values: None, type_oid: 0, null_mask: None },
             ResultColumn {
                 name: "cust_nation".to_string(),
                 values: cust_values,
-                string_values: None, type_oid: 0 },
+                string_values: None, type_oid: 0, null_mask: None },
             ResultColumn {
                 name: "l_year".to_string(),
                 values: year_values,
-                string_values: None, type_oid: 0 },
+                string_values: None, type_oid: 0, null_mask: None },
             ResultColumn {
                 name: "revenue".to_string(),
                 values: revenue_values,
-                string_values: None, type_oid: 0 },
+                string_values: None, type_oid: 0, null_mask: None },
         ],
         row_count: n_results,
         elapsed_us: 0,
@@ -8935,11 +8935,11 @@ fn execute_q5_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
             ResultColumn {
                 name: "n_name".to_string(),
                 values: name_values,
-                string_values: None, type_oid: 0 },
+                string_values: None, type_oid: 0, null_mask: None },
             ResultColumn {
                 name: "revenue".to_string(),
                 values: revenue_values,
-                string_values: None, type_oid: 0 },
+                string_values: None, type_oid: 0, null_mask: None },
         ],
         row_count: n_results,
         elapsed_us: 0,
@@ -9126,7 +9126,7 @@ fn execute_q14_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
         columns: vec![ResultColumn {
             name: "promo_revenue".to_string(),
             values: vec![promo_revenue.to_bits()],
-                string_values: None, type_oid: 0 }],
+                string_values: None, type_oid: 0, null_mask: None }],
         row_count: 1,
         elapsed_us: 0,
     })
@@ -9663,14 +9663,14 @@ fn execute_q2_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
 
     Ok(QueryResult {
         columns: vec![
-            ResultColumn { name: "s_acctbal".to_string(), values: c0 , string_values: None, type_oid: 0 },
-            ResultColumn { name: "s_name".to_string(), values: c1 , string_values: None, type_oid: 0 },
-            ResultColumn { name: "n_name".to_string(), values: c2 , string_values: None, type_oid: 0 },
-            ResultColumn { name: "p_partkey".to_string(), values: c3 , string_values: None, type_oid: 0 },
-            ResultColumn { name: "p_mfgr".to_string(), values: c4 , string_values: None, type_oid: 0 },
-            ResultColumn { name: "s_address".to_string(), values: c5 , string_values: None, type_oid: 0 },
-            ResultColumn { name: "s_phone".to_string(), values: c6 , string_values: None, type_oid: 0 },
-            ResultColumn { name: "s_comment".to_string(), values: c7 , string_values: None, type_oid: 0 },
+            ResultColumn { name: "s_acctbal".to_string(), values: c0 , string_values: None, type_oid: 0, null_mask: None },
+            ResultColumn { name: "s_name".to_string(), values: c1 , string_values: None, type_oid: 0, null_mask: None },
+            ResultColumn { name: "n_name".to_string(), values: c2 , string_values: None, type_oid: 0, null_mask: None },
+            ResultColumn { name: "p_partkey".to_string(), values: c3 , string_values: None, type_oid: 0, null_mask: None },
+            ResultColumn { name: "p_mfgr".to_string(), values: c4 , string_values: None, type_oid: 0, null_mask: None },
+            ResultColumn { name: "s_address".to_string(), values: c5 , string_values: None, type_oid: 0, null_mask: None },
+            ResultColumn { name: "s_phone".to_string(), values: c6 , string_values: None, type_oid: 0, null_mask: None },
+            ResultColumn { name: "s_comment".to_string(), values: c7 , string_values: None, type_oid: 0, null_mask: None },
         ],
         row_count,
         elapsed_us: 0,
@@ -9995,11 +9995,11 @@ fn execute_q20_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
             ResultColumn {
                 name: "s_name".to_string(),
                 values: c_name,
-                string_values: None, type_oid: 0 },
+                string_values: None, type_oid: 0, null_mask: None },
             ResultColumn {
                 name: "s_address".to_string(),
                 values: c_addr,
-                string_values: None, type_oid: 0 },
+                string_values: None, type_oid: 0, null_mask: None },
         ],
         row_count,
         elapsed_us: 0,
@@ -10415,11 +10415,11 @@ fn execute_q8_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
             ResultColumn {
                 name: "o_year".to_string(),
                 values: year_values,
-                string_values: None, type_oid: 0 },
+                string_values: None, type_oid: 0, null_mask: None },
             ResultColumn {
                 name: "mkt_share".to_string(),
                 values: mkt_values,
-                string_values: None, type_oid: 0 },
+                string_values: None, type_oid: 0, null_mask: None },
         ],
         row_count: 2,
         elapsed_us: 0,
@@ -10604,9 +10604,9 @@ fn execute_q22_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
         // codes). Return 3 empty columns to match the SQL semantics.
         return Ok(QueryResult {
             columns: vec![
-                ResultColumn { name: "cntrycode".to_string(), values: vec![] , string_values: None, type_oid: 0 },
-                ResultColumn { name: "numcust".to_string(), values: vec![] , string_values: None, type_oid: 0 },
-                ResultColumn { name: "totacctbal".to_string(), values: vec![] , string_values: None, type_oid: 0 },
+                ResultColumn { name: "cntrycode".to_string(), values: vec![] , string_values: None, type_oid: 0, null_mask: None },
+                ResultColumn { name: "numcust".to_string(), values: vec![] , string_values: None, type_oid: 0, null_mask: None },
+                ResultColumn { name: "totacctbal".to_string(), values: vec![] , string_values: None, type_oid: 0, null_mask: None },
             ],
             row_count: 0,
             elapsed_us: 0,
@@ -10697,9 +10697,9 @@ fn execute_q22_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
 
     Ok(QueryResult {
         columns: vec![
-            ResultColumn { name: "cntrycode".to_string(), values: cntrycode_values , string_values: None, type_oid: 0 },
-            ResultColumn { name: "numcust".to_string(), values: numcust_values , string_values: None, type_oid: 0 },
-            ResultColumn { name: "totacctbal".to_string(), values: totacctbal_values , string_values: None, type_oid: 0 },
+            ResultColumn { name: "cntrycode".to_string(), values: cntrycode_values , string_values: None, type_oid: 0, null_mask: None },
+            ResultColumn { name: "numcust".to_string(), values: numcust_values , string_values: None, type_oid: 0, null_mask: None },
+            ResultColumn { name: "totacctbal".to_string(), values: totacctbal_values , string_values: None, type_oid: 0, null_mask: None },
         ],
         row_count,
         elapsed_us: 0,
@@ -10965,10 +10965,10 @@ fn execute_q16_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
 
     Ok(QueryResult {
         columns: vec![
-            ResultColumn { name: "p_brand".to_string(), values: brand_values , string_values: None, type_oid: 0 },
-            ResultColumn { name: "p_type".to_string(), values: type_values , string_values: None, type_oid: 0 },
-            ResultColumn { name: "p_size".to_string(), values: size_values , string_values: None, type_oid: 0 },
-            ResultColumn { name: "supplier_cnt".to_string(), values: cnt_values , string_values: None, type_oid: 0 },
+            ResultColumn { name: "p_brand".to_string(), values: brand_values , string_values: None, type_oid: 0, null_mask: None },
+            ResultColumn { name: "p_type".to_string(), values: type_values , string_values: None, type_oid: 0, null_mask: None },
+            ResultColumn { name: "p_size".to_string(), values: size_values , string_values: None, type_oid: 0, null_mask: None },
+            ResultColumn { name: "supplier_cnt".to_string(), values: cnt_values , string_values: None, type_oid: 0, null_mask: None },
         ],
         row_count: n_results,
         elapsed_us: 0,
@@ -11145,11 +11145,11 @@ fn execute_q15_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
     if max_revenue == f64::NEG_INFINITY {
         return Ok(QueryResult {
             columns: vec![
-                ResultColumn { name: "s_suppkey".to_string(), values: vec![] , string_values: None, type_oid: 0 },
-                ResultColumn { name: "s_name".to_string(), values: vec![] , string_values: None, type_oid: 0 },
-                ResultColumn { name: "s_address".to_string(), values: vec![] , string_values: None, type_oid: 0 },
-                ResultColumn { name: "s_phone".to_string(), values: vec![] , string_values: None, type_oid: 0 },
-                ResultColumn { name: "total_revenue".to_string(), values: vec![] , string_values: None, type_oid: 0 },
+                ResultColumn { name: "s_suppkey".to_string(), values: vec![] , string_values: None, type_oid: 0, null_mask: None },
+                ResultColumn { name: "s_name".to_string(), values: vec![] , string_values: None, type_oid: 0, null_mask: None },
+                ResultColumn { name: "s_address".to_string(), values: vec![] , string_values: None, type_oid: 0, null_mask: None },
+                ResultColumn { name: "s_phone".to_string(), values: vec![] , string_values: None, type_oid: 0, null_mask: None },
+                ResultColumn { name: "total_revenue".to_string(), values: vec![] , string_values: None, type_oid: 0, null_mask: None },
             ],
             row_count: 0,
             elapsed_us: 0,
@@ -11191,11 +11191,11 @@ fn execute_q15_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
 
     Ok(QueryResult {
         columns: vec![
-            ResultColumn { name: "s_suppkey".to_string(), values: suppkey_values , string_values: None, type_oid: 0 },
-            ResultColumn { name: "s_name".to_string(), values: name_values , string_values: None, type_oid: 0 },
-            ResultColumn { name: "s_address".to_string(), values: address_values , string_values: None, type_oid: 0 },
-            ResultColumn { name: "s_phone".to_string(), values: phone_values , string_values: None, type_oid: 0 },
-            ResultColumn { name: "total_revenue".to_string(), values: revenue_values , string_values: None, type_oid: 0 },
+            ResultColumn { name: "s_suppkey".to_string(), values: suppkey_values , string_values: None, type_oid: 0, null_mask: None },
+            ResultColumn { name: "s_name".to_string(), values: name_values , string_values: None, type_oid: 0, null_mask: None },
+            ResultColumn { name: "s_address".to_string(), values: address_values , string_values: None, type_oid: 0, null_mask: None },
+            ResultColumn { name: "s_phone".to_string(), values: phone_values , string_values: None, type_oid: 0, null_mask: None },
+            ResultColumn { name: "total_revenue".to_string(), values: revenue_values , string_values: None, type_oid: 0, null_mask: None },
         ],
         row_count: n_results,
         elapsed_us: 0,
@@ -11399,8 +11399,8 @@ fn execute_q11_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
 
     Ok(QueryResult {
         columns: vec![
-            ResultColumn { name: "ps_partkey".to_string(), values: partkey_values , string_values: None, type_oid: 0 },
-            ResultColumn { name: "value".to_string(), values: value_values , string_values: None, type_oid: 0 },
+            ResultColumn { name: "ps_partkey".to_string(), values: partkey_values , string_values: None, type_oid: 0, null_mask: None },
+            ResultColumn { name: "value".to_string(), values: value_values , string_values: None, type_oid: 0, null_mask: None },
         ],
         row_count: n_results,
         elapsed_us: 0,
@@ -11581,7 +11581,7 @@ fn execute_q6_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
         columns: vec![ResultColumn {
             name: "revenue".to_string(),
             values: vec![total.to_bits()],
-                string_values: None, type_oid: 0 }],
+                string_values: None, type_oid: 0, null_mask: None }],
         row_count: 1,
         elapsed_us: 0,
     })

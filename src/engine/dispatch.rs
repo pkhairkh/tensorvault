@@ -212,7 +212,14 @@ fn execute_shape(shape: QueryShape, query: &SelectQuery, table: &Table) -> Resul
             let indices: Vec<usize> = (0..table.row_count).filter(|&i| mask[i]).take(limit).collect();
             let cols: Vec<ResultColumn> = table.column_names.iter().enumerate().map(|(i, name)| {
                 let values: Vec<u64> = indices.iter().map(|&idx| table.columns[i][idx]).collect();
-                ResultColumn { name: name.clone(), values, string_values: None, type_oid: 0 }
+                // Wave 52 fix: propagate NULL bitmap.
+                let null_mask = if i < table.null_bitmaps.len() {
+                    if let Some(ref bm) = table.null_bitmaps[i] {
+                        let m: Vec<bool> = indices.iter().map(|&idx| bm.is_null(idx)).collect();
+                        if m.iter().any(|&x| x) { Some(m) } else { None }
+                    } else { None }
+                } else { None };
+                ResultColumn { name: name.clone(), values, string_values: None, type_oid: 0, null_mask }
             }).collect();
             Ok(QueryResult { columns: cols, row_count: indices.len(), elapsed_us: 0 })
         }
@@ -265,7 +272,17 @@ fn execute_shape(shape: QueryShape, query: &SelectQuery, table: &Table) -> Resul
                 } else { None }
             } else { None };
 
-            Ok(QueryResult { columns: vec![ResultColumn { name, values: values.clone(), string_values, type_oid: 0 }], row_count: values.len(), elapsed_us: 0 })
+            // Wave 52 fix: propagate the NULL bitmap so pgwire can emit
+            // NULL (length = -1) instead of "0" for NULL cells.
+            let null_mask = if col_idx < table.null_bitmaps.len() {
+                if let Some(ref bm) = table.null_bitmaps[col_idx] {
+                    let mask: Vec<bool> = indices.iter().map(|&i| bm.is_null(i)).collect();
+                    // Only carry the mask if at least one cell is NULL.
+                    if mask.iter().any(|&m| m) { Some(mask) } else { None }
+                } else { None }
+            } else { None };
+
+            Ok(QueryResult { columns: vec![ResultColumn { name, values: values.clone(), string_values, type_oid: 0, null_mask }], row_count: values.len(), elapsed_us: 0 })
         }
         QueryShape::SelectMulti => {
             let mask = build_filter_mask(query, table)?;
@@ -312,11 +329,24 @@ fn execute_shape(shape: QueryShape, query: &SelectQuery, table: &Table) -> Resul
                             Some(strings)
                         } else { None }
                     } else { None };
-                    cols.push(ResultColumn { name: name.clone(), values, string_values, type_oid: 0 });
+                    // Wave 52 fix: propagate NULL bitmap.
+                    let null_mask = if col_idx < table.null_bitmaps.len() {
+                        if let Some(ref bm) = table.null_bitmaps[col_idx] {
+                            let m: Vec<bool> = indices.iter().map(|&i| bm.is_null(i)).collect();
+                            if m.iter().any(|&x| x) { Some(m) } else { None }
+                        } else { None }
+                    } else { None };
+                    cols.push(ResultColumn { name: name.clone(), values, string_values, type_oid: 0, null_mask });
                 } else if let SelectItem::Star = item {
                     for (col_idx, name) in table.column_names.iter().enumerate() {
                         let values: Vec<u64> = indices.iter().map(|&row_idx| table.columns[col_idx][row_idx]).collect();
-                        cols.push(ResultColumn { name: name.clone(), values, string_values: None, type_oid: 0 });
+                        let null_mask = if col_idx < table.null_bitmaps.len() {
+                            if let Some(ref bm) = table.null_bitmaps[col_idx] {
+                                let m: Vec<bool> = indices.iter().map(|&row_idx| bm.is_null(row_idx)).collect();
+                                if m.iter().any(|&x| x) { Some(m) } else { None }
+                            } else { None }
+                        } else { None };
+                        cols.push(ResultColumn { name: name.clone(), values, string_values: None, type_oid: 0, null_mask });
                     }
                 }
             }
@@ -590,7 +620,7 @@ fn resolve_col_name(name: &str, table: &Table) -> Result<usize> {
 
 fn single_value(name: &str, value: u64) -> QueryResult {
     QueryResult {
-        columns: vec![ResultColumn { name: name.to_string(), values: vec![value] , string_values: None, type_oid: 0 }],
+        columns: vec![ResultColumn { name: name.to_string(), values: vec![value] , string_values: None, type_oid: 0, null_mask: None }],
         row_count: 1,
         elapsed_us: 0,
     }
@@ -681,6 +711,7 @@ fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
                             values: group_keys_in_order.clone(),
                             string_values: None,
                             type_oid: 0,
+                            null_mask: None,
                         });
                     } else {
                         // Non-grouped column: emit the value from the first
@@ -698,6 +729,7 @@ fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
                             values,
                             string_values: None,
                             type_oid: 0,
+                            null_mask: None,
                         });
                     }
                 }
@@ -707,6 +739,7 @@ fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
                         values: vec![*v; group_keys_in_order.len()],
                         string_values: None,
                         type_oid: 0,
+                        null_mask: None,
                     });
                 }
                 SelectItem::Star => {
@@ -774,7 +807,7 @@ fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
                             _ => 0,
                         }
                     }).collect();
-                    result_cols.push(ResultColumn { name: name.to_string(), values, string_values: None, type_oid: 0 });
+                    result_cols.push(ResultColumn { name: name.to_string(), values, string_values: None, type_oid: 0, null_mask: None });
                 }
                 SelectItem::Window { .. } => {
                     return Err(Error::Other(
@@ -805,7 +838,7 @@ fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
             });
             let new_cols: Vec<ResultColumn> = result.columns.iter().map(|c| {
                 let values: Vec<u64> = idx.iter().map(|&i| c.values[i]).collect();
-                ResultColumn { name: c.name.clone(), values, string_values: None, type_oid: 0 }
+                ResultColumn { name: c.name.clone(), values, string_values: None, type_oid: 0, null_mask: None }
             }).collect();
             result = QueryResult { columns: new_cols, row_count: result.row_count, elapsed_us: result.elapsed_us };
         }
@@ -841,7 +874,7 @@ fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
             }
             0
         }).collect();
-        result_cols.push(ResultColumn { name: col_name.clone(), values, string_values: None, type_oid: 0 });
+        result_cols.push(ResultColumn { name: col_name.clone(), values, string_values: None, type_oid: 0, null_mask: None });
     }
 
     for item in &query.select {
@@ -886,7 +919,7 @@ fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
                     _ => 0,
                 }
             }).collect();
-            result_cols.push(ResultColumn { name: name.to_string(), values, string_values: None, type_oid: 0 });
+            result_cols.push(ResultColumn { name: name.to_string(), values, string_values: None, type_oid: 0, null_mask: None });
         }
     }
 
@@ -905,7 +938,7 @@ fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
         });
         let new_cols: Vec<ResultColumn> = result.columns.iter().map(|c| {
             let values: Vec<u64> = idx.iter().map(|&i| c.values[i]).collect();
-            ResultColumn { name: c.name.clone(), values, string_values: None, type_oid: 0 }
+            ResultColumn { name: c.name.clone(), values, string_values: None, type_oid: 0, null_mask: None }
         }).collect();
         result = QueryResult { columns: new_cols, row_count: result.row_count, elapsed_us: result.elapsed_us };
     }
@@ -1006,7 +1039,7 @@ fn execute_string_group_by(
                 result_cols.push(ResultColumn {
                     name: v.to_string(),
                     values: vec![*v; row_count],
-                    string_values: None, type_oid: 0 });
+                    string_values: None, type_oid: 0, null_mask: None });
             }
             SelectItem::Column(name) => {
                 // The GROUP BY column — emit the per-group hash. (We
@@ -1015,7 +1048,7 @@ fn execute_string_group_by(
                 result_cols.push(ResultColumn {
                     name: name.clone(),
                     values: pairs.iter().map(|(h, _)| *h).collect(),
-                    string_values: None, type_oid: 0 });
+                    string_values: None, type_oid: 0, null_mask: None });
             }
             SelectItem::Aggregate { func, arg: _, alias } => {
                 let func_upper = func.to_uppercase();
@@ -1028,7 +1061,7 @@ fn execute_string_group_by(
                 result_cols.push(ResultColumn {
                     name,
                     values: pairs.iter().map(|(_, c)| *c).collect(),
-                    string_values: None, type_oid: 0 });
+                    string_values: None, type_oid: 0, null_mask: None });
             }
             SelectItem::Star => {
                 // `SELECT *` with GROUP BY is not meaningful; skip.

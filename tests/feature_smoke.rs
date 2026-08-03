@@ -137,7 +137,7 @@ fn smoke_window_functions() {
     use turbogp::engine::{QueryResult, ResultColumn};
     let r = {
         let mut r = QueryResult::empty();
-        r.push_column(ResultColumn { name: "v".into(), values: vec![30, 10, 20], string_values: None, type_oid: 0 }).unwrap();
+        r.push_column(ResultColumn { name: "v".into(), values: vec![30, 10, 20], string_values: None, type_oid: 0, null_mask: None }).unwrap();
         r
     };
     let spec = window::WindowSpec {
@@ -163,9 +163,9 @@ fn smoke_pivot_unpivot() {
     use turbogp::engine::{QueryResult, ResultColumn};
     let r = {
         let mut r = QueryResult::empty();
-        r.push_column(ResultColumn { name: "dept".into(), values: vec![1, 1, 2], string_values: None, type_oid: 0 }).unwrap();
-        r.push_column(ResultColumn { name: "qtr".into(), values: vec![1, 2, 1], string_values: None, type_oid: 0 }).unwrap();
-        r.push_column(ResultColumn { name: "amt".into(), values: vec![100, 200, 150], string_values: None, type_oid: 0 }).unwrap();
+        r.push_column(ResultColumn { name: "dept".into(), values: vec![1, 1, 2], string_values: None, type_oid: 0, null_mask: None }).unwrap();
+        r.push_column(ResultColumn { name: "qtr".into(), values: vec![1, 2, 1], string_values: None, type_oid: 0, null_mask: None }).unwrap();
+        r.push_column(ResultColumn { name: "amt".into(), values: vec![100, 200, 150], string_values: None, type_oid: 0, null_mask: None }).unwrap();
         r
     };
     let p = pivot::pivot(&r, "dept", "qtr", "amt", &["1".into(), "2".into()], "SUM");
