@@ -110,6 +110,12 @@ pub const KEYWORDS: &[&str] = &[
     "SCHEMA",
     "ALTER",
     "ROLLBACK",
+
+    // DML keywords (Wave 4)
+    "VALUES",
+    "SET",
+    "INTO",
+    "OUTPUT",
 ];
 
 /// A single SQL token.

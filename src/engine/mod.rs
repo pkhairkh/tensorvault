@@ -186,6 +186,8 @@ impl QueryEngine {
     /// - `SELECT` → the existing read-only execution path.
     /// - `CREATE TABLE` / `DROP TABLE` / `CREATE SCHEMA` → DDL path
     ///   (Wave 3) that mutates the catalog.
+    /// - `INSERT` / `UPDATE` / `DELETE` → DML path (Wave 4) that mutates
+    ///   table data.
     /// - `BEGIN` / `COMMIT` / `ROLLBACK` → transaction control (Wave 5,
     ///   currently a no-op stub that returns an empty result).
     ///
@@ -203,6 +205,13 @@ impl QueryEngine {
         // Try DDL first (CREATE TABLE, DROP TABLE, CREATE SCHEMA).
         if let Some(ddl) = crate::sql::parse_ddl(sql).map_err(Error::Parse)? {
             let mut result = self.execute_ddl(ddl)?;
+            result.elapsed_us = start.elapsed().as_micros() as u64;
+            return Ok(result);
+        }
+
+        // Try DML (INSERT, UPDATE, DELETE).
+        if let Some(dml) = crate::sql::parse_dml(sql).map_err(Error::Parse)? {
+            let mut result = self.execute_dml(dml)?;
             result.elapsed_us = start.elapsed().as_micros() as u64;
             return Ok(result);
         }
@@ -288,13 +297,157 @@ impl QueryEngine {
         }
     }
 
+    /// Execute a DML statement (INSERT, UPDATE, DELETE).
+    fn execute_dml(&mut self, dml: crate::sql::DmlStatement) -> Result<QueryResult> {
+        match dml {
+            crate::sql::DmlStatement::Insert(ins) => self.execute_insert(ins),
+            crate::sql::DmlStatement::Update(upd) => self.execute_update(upd),
+            crate::sql::DmlStatement::Delete(del) => self.execute_delete(del),
+        }
+    }
+
+    /// Execute an INSERT statement.
+    fn execute_insert(&mut self, ins: crate::sql::Insert) -> Result<QueryResult> {
+        let table = self
+            .catalog
+            .get_mut(&ins.table)
+            .ok_or_else(|| Error::NotFound(format!("table \"{}\"", ins.table)))?;
+
+        // Determine column indices.
+        let col_indices: Vec<usize> = match &ins.columns {
+            Some(cols) => {
+                let mut idxs = Vec::with_capacity(cols.len());
+                for col_name in cols {
+                    let idx = table
+                        .column_idx(col_name)
+                        .ok_or_else(|| Error::NotFound(format!("column \"{col_name}\"")))?;
+                    idxs.push(idx);
+                }
+                idxs
+            }
+            None => (0..table.columns.len()).collect(),
+        };
+
+        if col_indices.len() != ins.values.first().map(|r| r.len()).unwrap_or(0) {
+            return Err(Error::Other(format!(
+                "column count ({}) doesn't match value count ({})",
+                col_indices.len(),
+                ins.values.first().map(|r| r.len()).unwrap_or(0)
+            )));
+        }
+
+        let n_new_rows = ins.values.len();
+
+        // Extend each column with the new values.
+        for row_vals in &ins.values {
+            for (i, &col_idx) in col_indices.iter().enumerate() {
+                let val_str = &row_vals[i];
+                let cell = parse_value_cell(val_str);
+                // COW: Arc::make_mut gives us a mutable Vec if we're the
+                // sole owner, or clones if shared.
+                let col = std::sync::Arc::make_mut(&mut table.columns[col_idx]);
+                col.push(cell);
+            }
+        }
+        table.row_count += n_new_rows;
+
+        // Return a result with the number of rows inserted.
+        let mut result = QueryResult::empty();
+        result.row_count = n_new_rows;
+        Ok(result)
+    }
+
+    /// Execute an UPDATE statement. Supports simple `col = value` assignments
+    /// and a WHERE clause with `col = value` equality (AND/OR supported
+    /// via the existing expression evaluator in a future wave).
+    fn execute_update(&mut self, upd: crate::sql::Update) -> Result<QueryResult> {
+        let table = self
+            .catalog
+            .get_mut(&upd.table)
+            .ok_or_else(|| Error::NotFound(format!("table \"{}\"", upd.table)))?;
+
+        // Parse assignments into (col_idx, new_value_cell) pairs.
+        let mut assigns: Vec<(usize, u64)> = Vec::with_capacity(upd.assignments.len());
+        for (col_name, expr) in &upd.assignments {
+            let idx = table
+                .column_idx(col_name)
+                .ok_or_else(|| Error::NotFound(format!("column \"{col_name}\"")))?;
+            // For now, the expression must be a simple literal.
+            let cell = parse_value_cell(expr);
+            assigns.push((idx, cell));
+        }
+
+        // Determine which rows match the WHERE clause.
+        let n = table.row_count;
+        let mut updated = 0usize;
+        let match_mask: Vec<bool> = if let Some(where_str) = &upd.where_clause {
+            eval_simple_where(table, where_str)?
+        } else {
+            vec![true; n]
+        };
+
+        for (row_idx, &matches) in match_mask.iter().enumerate() {
+            if !matches {
+                continue;
+            }
+            for &(col_idx, val) in &assigns {
+                let col = std::sync::Arc::make_mut(&mut table.columns[col_idx]);
+                col[row_idx] = val;
+            }
+            updated += 1;
+        }
+
+        let mut result = QueryResult::empty();
+        result.row_count = updated;
+        Ok(result)
+    }
+
+    /// Execute a DELETE statement.
+    fn execute_delete(&mut self, del: crate::sql::Delete) -> Result<QueryResult> {
+        let table = self
+            .catalog
+            .get_mut(&del.table)
+            .ok_or_else(|| Error::NotFound(format!("table \"{}\"", del.table)))?;
+
+        let n = table.row_count;
+        let delete_mask: Vec<bool> = if let Some(where_str) = &del.where_clause {
+            eval_simple_where(table, where_str)?
+        } else {
+            vec![true; n]
+        };
+
+        let deleted = delete_mask.iter().filter(|&&b| b).count();
+        if deleted == 0 {
+            let mut result = QueryResult::empty();
+            result.row_count = 0;
+            return Ok(result);
+        }
+
+        // Rebuild each column keeping only non-deleted rows.
+        let keep_mask: Vec<bool> = delete_mask.iter().map(|&d| !d).collect();
+        for col in &mut table.columns {
+            let col_ref = std::sync::Arc::make_mut(col);
+            let mut new_vals = Vec::with_capacity(n - deleted);
+            for (i, &keep) in keep_mask.iter().enumerate() {
+                if keep {
+                    new_vals.push(col_ref[i]);
+                }
+            }
+            *col_ref = new_vals;
+        }
+        table.row_count -= deleted;
+
+        let mut result = QueryResult::empty();
+        result.row_count = deleted;
+        Ok(result)
+    }
+
     /// Execute a TPC-H SQL query using the dedicated TPC-H interpreter.
     ///
-    /// This path uses [] which
-    /// has a richer parser (arithmetic in aggregates, CASE WHEN, EXTRACT,
-    /// BETWEEN, IN, subqueries, derived tables, multi-table implicit
-    /// joins, HAVING, LEFT JOIN) and a type-aware row-based evaluator
-    /// (correctly interprets Float64 columns stored as f64::to_bits).
+    /// This path uses `src/engine/tpch.rs` which has a richer parser
+    /// (arithmetic in aggregates, CASE WHEN, EXTRACT, BETWEEN, IN,
+    /// subqueries, derived tables, multi-table implicit joins, HAVING,
+    /// LEFT JOIN) and a type-aware row-based evaluator.
     pub fn execute_tpch(&self, sql: &str) -> Result<QueryResult> {
         let start = Instant::now();
         let mut result = crate::engine::tpch::parse_and_execute(sql, &self.catalog)?;
@@ -307,6 +460,150 @@ impl Default for QueryEngine {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// -----------------------------------------------------------------------
+// DML helper functions (Wave 4)
+// -----------------------------------------------------------------------
+
+/// Parse a value string from the DML parser into a u64 cell.
+///
+/// Supported formats:
+/// - `"42"` → integer 42
+/// - `"3.14"` → f64::to_bits(3.14)
+/// - `"'hello'"` → xxh3 hash of "hello" (string columns are hashed)
+/// - `"NULL"` → 0 (NULL is stored as 0; a proper null bitmap arrives in a later wave)
+/// - `"x'0123'"` → first 8 bytes as u64
+fn parse_value_cell(s: &str) -> u64 {
+    use xxhash_rust::xxh3;
+    let trimmed = s.trim();
+    if trimmed == "NULL" {
+        return 0;
+    }
+    // String literal: '...'
+    if trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2 {
+        let inner = &trimmed[1..trimmed.len() - 1];
+        return xxh3::xxh3_64(inner.as_bytes());
+    }
+    // Hex literal: x'...'
+    if trimmed.starts_with("x'") && trimmed.ends_with('\'') && trimmed.len() >= 3 {
+        let hex = &trimmed[2..trimmed.len() - 1];
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .filter_map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+            .collect();
+        let mut buf = [0u8; 8];
+        for (i, &b) in bytes.iter().take(8).enumerate() {
+            buf[i] = b;
+        }
+        return u64::from_le_bytes(buf);
+    }
+    // Float
+    if trimmed.contains('.') || trimmed.contains('e') || trimmed.contains('E') {
+        if let Ok(f) = trimmed.parse::<f64>() {
+            return f.to_bits();
+        }
+    }
+    // Integer
+    if let Ok(n) = trimmed.parse::<i64>() {
+        return n as u64;
+    }
+    if let Ok(n) = trimmed.parse::<u64>() {
+        return n;
+    }
+    // Fallback: hash the string
+    xxh3::xxh3_64(trimmed.as_bytes())
+}
+
+/// Evaluate a simple WHERE clause against a table, returning a row mask.
+///
+/// Currently supports: `col = value` and `col = value AND col2 = value2`
+/// and `col = value OR col2 = value2`. More complex expressions will be
+/// supported when the expression evaluator is wired in.
+fn eval_simple_where(table: &Table, where_str: &str) -> Result<Vec<bool>> {
+    let n = table.row_count;
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let trimmed = where_str.trim();
+    // Split on AND / OR (case-insensitive)
+    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+    if parts.is_empty() {
+        return Ok(vec![true; n]);
+    }
+
+    // Parse into a list of (col_name, value) predicates joined by AND/OR.
+    // Simple approach: tokenize and walk.
+    let mut predicates: Vec<(String, u64)> = Vec::new();
+    let mut operators: Vec<bool> = Vec::new(); // true = AND, false = OR
+    let mut i = 0;
+    while i < parts.len() {
+        let part = parts[i];
+        if part.eq_ignore_ascii_case("AND") {
+            operators.push(true);
+            i += 1;
+            continue;
+        }
+        if part.eq_ignore_ascii_case("OR") {
+            operators.push(false);
+            i += 1;
+            continue;
+        }
+        // Expect: col = value
+        if i + 2 >= parts.len() {
+            return Err(Error::Other(format!("incomplete WHERE clause near '{part}'")));
+        }
+        let col_name = part.to_string();
+        let op = parts[i + 1];
+        if op != "=" {
+            return Err(Error::Other(format!(
+                "unsupported WHERE operator '{op}' (only = is supported in DML WHERE)"
+            )));
+        }
+        let val_str = parts[i + 2];
+        let cell = parse_value_cell(val_str);
+        predicates.push((col_name, cell));
+        i += 3;
+    }
+
+    if predicates.is_empty() {
+        return Ok(vec![true; n]);
+    }
+
+    // Find column indices.
+    let mut col_indices: Vec<usize> = Vec::with_capacity(predicates.len());
+    for (col_name, _) in &predicates {
+        let idx = table
+            .column_idx(col_name)
+            .ok_or_else(|| Error::NotFound(format!("column \"{col_name}\"")))?;
+        col_indices.push(idx);
+    }
+
+    // Evaluate each predicate per row.
+    let mut per_pred_masks: Vec<Vec<bool>> = Vec::with_capacity(predicates.len());
+    for (pred_idx, &(_, val)) in predicates.iter().enumerate() {
+        let col_idx = col_indices[pred_idx];
+        let col = &table.columns[col_idx];
+        let mask: Vec<bool> = col.iter().map(|&c| c == val).collect();
+        per_pred_masks.push(mask);
+    }
+
+    // Combine: start with first predicate, then AND/OR.
+    let mut result = per_pred_masks[0].clone();
+    for (i, mask) in per_pred_masks[1..].iter().enumerate() {
+        let is_and = operators.get(i).copied().unwrap_or(true);
+        if is_and {
+            for j in 0..n {
+                result[j] = result[j] && mask[j];
+            }
+        } else {
+            for j in 0..n {
+                result[j] = result[j] || mask[j];
+            }
+        }
+    }
+
+    Ok(result)
 }
 
 #[cfg(test)]
