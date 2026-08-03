@@ -79,8 +79,16 @@ pub fn execute_select(
     if plan.strategy == crate::planner::optimizer::ExecStrategy::KernelDirect
         || plan.strategy == crate::planner::optimizer::ExecStrategy::Vectorized
     {
-        if let Some(result) = dispatch::execute_dispatched(query, table) {
-            return result;
+        match dispatch::execute_dispatched(query, table) {
+            Some(Ok(result)) => return Ok(result),
+            Some(Err(_)) => {
+                // Dispatch failed (e.g. arithmetic expression in SUM arg).
+                // Fall through to the basic executor which can handle expressions
+                // via eval_expr. Do NOT return the error.
+            }
+            None => {
+                // Dispatch didn't recognize the query shape. Fall through.
+            }
         }
     }
 
@@ -383,15 +391,25 @@ fn compute_aggregate(func: &str, arg: &str, indices: &[usize], table: &Table) ->
             // Check if arg is a simple column or an arithmetic expression (Wave 40).
             if crate::exec::expr_eval::is_arithmetic_expr(arg) {
                 // Evaluate the expression per row and sum.
-                let sum: u64 = indices.iter()
-                    .filter(|&&i| {
-                        // For expressions, check NULL on the first column referenced.
-                        // This is a simplification — a proper impl would check all columns.
-                        true
+                // If any operand is a float, the result should be a float sum.
+                let sum_f64: f64 = indices.iter()
+                    .map(|&i| {
+                        let val = crate::exec::expr_eval::eval_expr(arg, table, i);
+                        // Convert to f64 — eval_expr returns u64 which may be
+                        // int or f64 bits. We sum as f64 to handle both.
+                        // Check if it looks like an f64 bit pattern.
+                        if val > (1u64 << 62) && f64::from_bits(val).is_finite() {
+                            f64::from_bits(val)
+                        } else if val > (1u64 << 60) {
+                            // Could be a large int or a float — try float first.
+                            let f = f64::from_bits(val);
+                            if f.is_finite() && f.abs() < 1e15 { f } else { val as f64 }
+                        } else {
+                            val as f64
+                        }
                     })
-                    .map(|&i| crate::exec::expr_eval::eval_expr(arg, table, i))
                     .sum();
-                sum
+                sum_f64.to_bits()
             } else {
                 let idx = table.column_idx(arg).unwrap_or(0);
                 indices.iter()

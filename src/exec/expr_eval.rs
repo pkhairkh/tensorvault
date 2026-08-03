@@ -60,26 +60,72 @@ pub fn is_arithmetic_expr(expr: &str) -> bool {
     })
 }
 
-/// Evaluate a binary operation. The operands are f64 (bit-reinterpreted from u64).
-fn eval_binop(op: &str, left: u64, right: u64) -> u64 {
-    // Determine if both operands are "small integers" (not f64 bit patterns).
-    // If both are < 2^60, treat as integers. Otherwise, treat as f64.
-    let left_is_int = left < (1u64 << 60);
-    let right_is_int = right < (1u64 << 60);
+/// A typed value: either an integer or a float (stored as bits).
+#[derive(Debug, Clone, Copy)]
+enum TypedVal {
+    Int(u64),
+    Float(u64), // f64::to_bits()
+}
 
-    if left_is_int && right_is_int {
-        // Integer arithmetic.
-        match op {
-            "+" => left.wrapping_add(right),
-            "-" => left.wrapping_sub(right),
-            "*" => left.wrapping_mul(right),
-            "/" => if right == 0 { 0 } else { left / right },
-            _ => 0,
+impl TypedVal {
+    fn as_f64(self) -> f64 {
+        match self {
+            TypedVal::Int(n) => n as f64,
+            TypedVal::Float(bits) => f64::from_bits(bits),
         }
+    }
+
+    fn as_u64(self) -> u64 {
+        match self {
+            TypedVal::Int(n) => n,
+            TypedVal::Float(bits) => bits,
+        }
+    }
+}
+
+/// Evaluate a token to a typed value.
+fn eval_token_typed(token: &str, table: &Table, row_idx: usize) -> TypedVal {
+    // Try integer literal.
+    if let Ok(n) = token.parse::<i64>() {
+        return TypedVal::Int(n as u64);
+    }
+    if let Ok(n) = token.parse::<u64>() {
+        return TypedVal::Int(n);
+    }
+    // Try float literal — has a '.' or 'e'.
+    if token.contains('.') || token.contains('e') || token.contains('E') {
+        if let Ok(f) = token.parse::<f64>() {
+            return TypedVal::Float(f.to_bits());
+        }
+    }
+    // Column reference — check schema for type.
+    if let Some(idx) = table.column_idx(token) {
+        let val = table.columns[idx].get(row_idx).copied().unwrap_or(0);
+        // If the table has a schema, check if this column is a float type.
+        if let Some(ref schema) = table.schema {
+            if schema.is_float(idx) {
+                return TypedVal::Float(val);
+            }
+        }
+        // Heuristic: if the value looks like an f64 bit pattern (> 2^60 and not a
+        // small negative i64), treat as float. This is a fallback for loaded tables
+        // that don't have a schema.
+        if val > (1u64 << 62) && f64::from_bits(val).is_finite() && f64::from_bits(val).abs() < 1e15 {
+            return TypedVal::Float(val);
+        }
+        TypedVal::Int(val)
     } else {
-        // Float arithmetic.
-        let l = f64::from_bits(left);
-        let r = f64::from_bits(right);
+        TypedVal::Int(0)
+    }
+}
+
+/// Evaluate a binary operation with proper type tracking.
+fn eval_binop_typed(op: &str, left: TypedVal, right: TypedVal) -> TypedVal {
+    // If either operand is a float, do float arithmetic.
+    let is_float = matches!(left, TypedVal::Float(_)) || matches!(right, TypedVal::Float(_));
+    if is_float {
+        let l = left.as_f64();
+        let r = right.as_f64();
         let result = match op {
             "+" => l + r,
             "-" => l - r,
@@ -87,7 +133,19 @@ fn eval_binop(op: &str, left: u64, right: u64) -> u64 {
             "/" => if r == 0.0 { 0.0 } else { l / r },
             _ => 0.0,
         };
-        result.to_bits()
+        TypedVal::Float(result.to_bits())
+    } else {
+        // Both are integers.
+        let l = left.as_u64();
+        let r = right.as_u64();
+        let result = match op {
+            "+" => l.wrapping_add(r),
+            "-" => l.wrapping_sub(r),
+            "*" => l.wrapping_mul(r),
+            "/" => if r == 0 { 0 } else { l / r },
+            _ => 0,
+        };
+        TypedVal::Int(result)
     }
 }
 
@@ -99,10 +157,10 @@ struct ExprParser<'a> {
 
 impl<'a> ExprParser<'a> {
     fn parse_expr(&mut self, table: &Table, row_idx: usize) -> u64 {
-        self.parse_additive(table, row_idx)
+        self.parse_additive(table, row_idx).as_u64()
     }
 
-    fn parse_additive(&mut self, table: &Table, row_idx: usize) -> u64 {
+    fn parse_additive(&mut self, table: &Table, row_idx: usize) -> TypedVal {
         let mut left = self.parse_multiplicative(table, row_idx);
         loop {
             if self.pos >= self.tokens.len() {
@@ -114,12 +172,12 @@ impl<'a> ExprParser<'a> {
             }
             self.pos += 1;
             let right = self.parse_multiplicative(table, row_idx);
-            left = eval_binop(op, left, right);
+            left = eval_binop_typed(op, left, right);
         }
         left
     }
 
-    fn parse_multiplicative(&mut self, table: &Table, row_idx: usize) -> u64 {
+    fn parse_multiplicative(&mut self, table: &Table, row_idx: usize) -> TypedVal {
         let mut left = self.parse_primary(table, row_idx);
         loop {
             if self.pos >= self.tokens.len() {
@@ -131,26 +189,26 @@ impl<'a> ExprParser<'a> {
             }
             self.pos += 1;
             let right = self.parse_primary(table, row_idx);
-            left = eval_binop(op, left, right);
+            left = eval_binop_typed(op, left, right);
         }
         left
     }
 
-    fn parse_primary(&mut self, table: &Table, row_idx: usize) -> u64 {
+    fn parse_primary(&mut self, table: &Table, row_idx: usize) -> TypedVal {
         if self.pos >= self.tokens.len() {
-            return 0;
+            return TypedVal::Int(0);
         }
         let token = self.tokens[self.pos];
         if token == "(" {
             self.pos += 1; // consume (
-            let val = self.parse_expr(table, row_idx);
+            let val = self.parse_additive(table, row_idx);
             if self.pos < self.tokens.len() && self.tokens[self.pos] == ")" {
                 self.pos += 1; // consume )
             }
             return val;
         }
         self.pos += 1;
-        eval_token(token, table, row_idx)
+        eval_token_typed(token, table, row_idx)
     }
 }
 
