@@ -220,8 +220,41 @@ fn execute_shape(shape: QueryShape, query: &SelectQuery, table: &Table) -> Resul
             let mask = build_filter_mask(query, table)?;
             let name = if let SelectItem::Column(n) = &query.select[0] { n.clone() } else { return Err(Error::Other("expected column".into())); };
             let col_idx = resolve_col_name(&name, table)?;
-            let limit = query.limit.unwrap_or(mask.iter().filter(|&&b| b).count());
-            let indices: Vec<usize> = (0..table.row_count).filter(|&i| mask[i]).take(limit).collect();
+
+            // Get matching indices.
+            let mut indices: Vec<usize> = (0..table.row_count).filter(|&i| mask[i]).collect();
+
+            // Apply ORDER BY if present (Wave 45).
+            if !query.order_by.is_empty() {
+                let (order_col, ascending) = &query.order_by[0];
+                // Try to find the ORDER BY column — could be the same column or a different one.
+                let order_col_idx = if order_col == &name {
+                    col_idx
+                } else {
+                    resolve_col_name(order_col, table).unwrap_or(col_idx)
+                };
+                // Check if the ORDER BY column has string values.
+                let has_string_sidecar = order_col_idx < table.string_columns.len()
+                    && table.string_columns[order_col_idx].is_some();
+                if has_string_sidecar {
+                    let sc = table.string_columns[order_col_idx].as_ref().unwrap();
+                    indices.sort_by(|&a, &b| {
+                        let sa = sc.get(a);
+                        let sb = sc.get(b);
+                        if *ascending { sa.cmp(sb) } else { sb.cmp(sa) }
+                    });
+                } else {
+                    let col = &table.columns[order_col_idx];
+                    indices.sort_by(|&a, &b| {
+                        let va = col.get(a).copied().unwrap_or(0);
+                        let vb = col.get(b).copied().unwrap_or(0);
+                        if *ascending { va.cmp(&vb) } else { vb.cmp(&va) }
+                    });
+                }
+            }
+
+            let limit = query.limit.unwrap_or(indices.len());
+            let indices: Vec<usize> = indices.into_iter().take(limit).collect();
             let values: Vec<u64> = indices.iter().map(|&i| table.columns[col_idx][i]).collect();
 
             // If the column has a string sidecar, return the original strings (Wave 21).

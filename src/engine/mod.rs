@@ -118,12 +118,6 @@ impl QueryEngine {
             return Err(Error::Other("not a readonly query".into()));
         }
 
-        // Try CTE first.
-        if let Some(with_result) = crate::sql::parse_with(sql) {
-            // CTEs may execute DDL internally, so we can't guarantee readonly.
-            return Err(Error::Other("CTE requires write lock".into()));
-        }
-
         // Try DDL/DML — these are NOT readonly.
         if crate::sql::parse_ddl(sql).map_err(Error::Parse)?.is_some() {
             return Err(Error::Other("DDL requires write lock".into()));
@@ -132,17 +126,36 @@ impl QueryEngine {
             return Err(Error::Other("DML requires write lock".into()));
         }
 
+        // Try CTE.
+        if let Some(with_result) = crate::sql::parse_with(sql) {
+            return Err(Error::Other("CTE requires write lock".into()));
+        }
+
         // Parse as SELECT and execute against the current catalog.
-        let (query, extensions) = crate::sql::parse_with_extensions(sql).map_err(Error::Parse)?;
-        let mut result = execute_select(
+        let (query, extensions) = match crate::sql::parse_with_extensions(sql) {
+            Ok(qe) => qe,
+            Err(_parse_err) => {
+                // Basic parser failed — need tpch fallback, which requires &mut self.
+                return Err(Error::Other("query needs tpch fallback — requires write lock".into()));
+            }
+        };
+
+        match execute_select(
             &query,
             &extensions,
             &self.catalog,
             &self.kernel_table,
             &self.cost_model,
-        )?;
-        result.elapsed_us = start.elapsed().as_micros() as u64;
-        Ok(result)
+        ) {
+            Ok(mut result) => {
+                result.elapsed_us = start.elapsed().as_micros() as u64;
+                Ok(result)
+            }
+            Err(_exec_err) => {
+                // execute_select failed — need tpch fallback.
+                Err(Error::Other("query failed in execute_select — needs tpch fallback".into()))
+            }
+        }
     }
 
     /// Construct an empty engine with the default kernel table and cost
