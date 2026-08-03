@@ -31,11 +31,13 @@
 //! the surface area auditable; it also lets the parser grow the seven
 //! turboGP-specific extensions natively rather than via visitor patterns.
 
+pub mod ddl;
 pub mod extensions;
 pub mod lexer;
 pub mod parser;
 pub mod plan;
 
+pub use ddl::{parse_ddl, ColumnDef, ColumnType, CreateTable, DdlStatement, DropTable};
 pub use extensions::{parse_extensions, parse_extensions_and_strip, QueryExtensions};
 pub use lexer::{tokenize, Token, KEYWORDS};
 pub use parser::{parse, Expr, SelectItem, SelectQuery, Value};

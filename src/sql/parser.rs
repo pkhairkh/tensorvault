@@ -361,11 +361,36 @@ impl Parser {
     }
 
     fn parse_table_name(&mut self) -> Result<String, String> {
-        if let Token::Ident(name) = self.peek().clone() {
-            self.next();
-            return Ok(name);
+        // Reserved keywords that cannot be used as table names.
+        const RESERVED: &[&str] = &[
+            "WHERE", "GROUP", "ORDER", "HAVING", "LIMIT", "JOIN", "ON",
+            "LEFT", "RIGHT", "INNER", "OUTER", "UNION", "EXCEPT", "INTERSECT",
+        ];
+        let first = match self.peek().clone() {
+            Token::Ident(name) => name,
+            Token::Keyword(k) => {
+                if RESERVED.contains(&k.as_str()) {
+                    return Err(format!("expected table name, got keyword '{k}'"));
+                }
+                k
+            }
+            other => return Err(format!("expected table name, got {other:?}")),
+        };
+        self.next();
+        // Check for schema.table
+        if let Token::Op(op) = self.peek() {
+            if op == "." {
+                self.next(); // consume .
+                let second = match self.peek().clone() {
+                    Token::Ident(name) => name,
+                    Token::Keyword(k) => k,
+                    other => return Err(format!("expected name after '.', got {other:?}")),
+                };
+                self.next();
+                return Ok(format!("{first}.{second}"));
+            }
         }
-        Err(format!("expected table name, got {:?}", self.peek()))
+        Ok(first)
     }
 
     fn parse_column_list(&mut self) -> Result<Vec<String>, String> {

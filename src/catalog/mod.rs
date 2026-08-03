@@ -49,6 +49,16 @@ impl Catalog {
         self.tables.get(name)
     }
 
+    /// Look up a table by name, mutably.
+    pub fn get_mut(&mut self, name: &str) -> Option<&mut Table> {
+        self.tables.get_mut(name)
+    }
+
+    /// Drop a table by name. Returns true if the table existed.
+    pub fn drop(&mut self, name: &str) -> bool {
+        self.tables.remove(name).is_some()
+    }
+
     /// Look up a column by `(table, column)` pair.
     ///
     /// Convenience wrapper around [`Catalog::get`] +

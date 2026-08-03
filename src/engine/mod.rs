@@ -180,28 +180,44 @@ impl QueryEngine {
         Ok(row_count)
     }
 
-    /// Execute a SQL query and return the result.
+    /// Execute a SQL statement and return the result.
     ///
-    /// The pipeline is:
+    /// This method dispatches on the SQL verb:
+    /// - `SELECT` → the existing read-only execution path.
+    /// - `CREATE TABLE` / `DROP TABLE` / `CREATE SCHEMA` → DDL path
+    ///   (Wave 3) that mutates the catalog.
+    /// - `BEGIN` / `COMMIT` / `ROLLBACK` → transaction control (Wave 5,
+    ///   currently a no-op stub that returns an empty result).
     ///
-    /// 1. Parse the SQL via [`crate::sql::parse_with_extensions`],
-    ///    producing a `SelectQuery` and its turboGP extensions.
-    /// 2. Execute via [`execute_select`], which looks up the source
-    ///    table in the catalog, picks a kernel, runs it, and packages
-    ///    the result.
-    /// 3. Capture the wall-clock time and stamp it on the result.
+    /// Takes `&mut self` because DDL/DML mutate the catalog.
     ///
     /// # Errors
     ///
     /// - [`Error::Parse`] if the SQL is malformed.
     /// - [`Error::NotFound`] if the source table or a referenced column
     ///   does not exist in the catalog.
-    /// - [`Error::Other`] for unsupported SQL features (multi-column
-    ///   SELECT, range WHERE, etc.).
-    pub fn execute(&self, sql: &str) -> Result<QueryResult> {
+    /// - [`Error::Other`] for unsupported SQL features.
+    pub fn execute(&mut self, sql: &str) -> Result<QueryResult> {
         let start = Instant::now();
 
-        // Parse the SQL.
+        // Try DDL first (CREATE TABLE, DROP TABLE, CREATE SCHEMA).
+        if let Some(ddl) = crate::sql::parse_ddl(sql).map_err(Error::Parse)? {
+            let mut result = self.execute_ddl(ddl)?;
+            result.elapsed_us = start.elapsed().as_micros() as u64;
+            return Ok(result);
+        }
+
+        // Try transaction control.
+        let trimmed = sql.trim();
+        let lower = trimmed.to_lowercase();
+        if lower.starts_with("begin") || lower.starts_with("start transaction") {
+            return Ok(QueryResult::empty());
+        }
+        if lower.starts_with("commit") || lower.starts_with("rollback") {
+            return Ok(QueryResult::empty());
+        }
+
+        // Parse as SELECT.
         let (query, extensions) = crate::sql::parse_with_extensions(sql).map_err(Error::Parse)?;
 
         // Execute the parsed query.
@@ -216,6 +232,60 @@ impl QueryEngine {
         // Stamp the elapsed time.
         result.elapsed_us = start.elapsed().as_micros() as u64;
         Ok(result)
+    }
+
+    /// Execute a DDL statement (CREATE TABLE, DROP TABLE, CREATE SCHEMA).
+    fn execute_ddl(&mut self, ddl: crate::sql::DdlStatement) -> Result<QueryResult> {
+        match ddl {
+            crate::sql::DdlStatement::Create(ct) => {
+                let full_name = if ct.schema == "dbo" {
+                    ct.name.clone()
+                } else {
+                    format!("{}.{}", ct.schema, ct.name)
+                };
+                if self.catalog.get(&full_name).is_some() {
+                    if ct.if_not_exists {
+                        return Ok(QueryResult::empty());
+                    }
+                    return Err(Error::Other(format!("table \"{full_name}\" already exists")));
+                }
+                // Build an empty Table with the right column names.
+                let column_names: Vec<String> = ct.columns.iter().map(|c| c.name.clone()).collect();
+                let columns: Vec<std::sync::Arc<Vec<u64>>> = ct
+                    .columns
+                    .iter()
+                    .map(|_| std::sync::Arc::new(Vec::new()))
+                    .collect();
+                let table = Table {
+                    name: full_name.clone(),
+                    columns,
+                    column_names,
+                    row_count: 0,
+                    string_columns: vec![None; ct.columns.len()],
+                };
+                self.catalog.register(table);
+                Ok(QueryResult::empty())
+            }
+            crate::sql::DdlStatement::Drop(dt) => {
+                let full_name = if dt.schema == "dbo" {
+                    dt.name.clone()
+                } else {
+                    format!("{}.{}", dt.schema, dt.name)
+                };
+                if self.catalog.get(&full_name).is_none() {
+                    if dt.if_exists {
+                        return Ok(QueryResult::empty());
+                    }
+                    return Err(Error::NotFound(format!("table \"{full_name}\"")));
+                }
+                self.catalog.drop(&full_name);
+                Ok(QueryResult::empty())
+            }
+            crate::sql::DdlStatement::CreateSchema(_) => {
+                // Schemas are implicit — CREATE SCHEMA is a no-op.
+                Ok(QueryResult::empty())
+            }
+        }
     }
 
     /// Execute a TPC-H SQL query using the dedicated TPC-H interpreter.
@@ -359,7 +429,7 @@ mod tests {
     /// DoD 7: Invalid SQL returns `Error::Parse`.
     #[test]
     fn dod_invalid_sql_returns_parse_error() {
-        let engine = QueryEngine::new();
+        let mut engine = QueryEngine::new();
         let r = engine.execute("SELECT FROM WHERE");
         assert!(matches!(r, Err(Error::Parse(_))), "got {r:?}");
     }
@@ -367,7 +437,7 @@ mod tests {
     /// DoD 8: Non-existent table returns `Error::NotFound`.
     #[test]
     fn dod_non_existent_table_returns_not_found() {
-        let engine = QueryEngine::new();
+        let mut engine = QueryEngine::new();
         let r = engine.execute("SELECT count(*) FROM missing");
         assert!(matches!(r, Err(Error::NotFound(_))), "got {r:?}");
     }
@@ -463,7 +533,7 @@ mod tests {
     #[test]
     fn with_cost_model_constructs_engine() {
         let cm = CostModel { cpu_freq_hz: 4.0e9, simd_lanes: 16, ..CostModel::default() };
-        let engine = QueryEngine::with_cost_model(cm);
+        let mut engine = QueryEngine::with_cost_model(cm);
         assert_eq!(engine.cost_model().cpu_freq_hz, 4.0e9);
         assert_eq!(engine.cost_model().simd_lanes, 16);
     }
@@ -471,14 +541,14 @@ mod tests {
     /// `QueryEngine::default()` is equivalent to `new()`.
     #[test]
     fn default_is_empty() {
-        let engine = QueryEngine::default();
+        let mut engine = QueryEngine::default();
         assert!(engine.catalog().is_empty());
     }
 
     /// Accessors return the right types.
     #[test]
     fn accessors_work() {
-        let engine = QueryEngine::new();
+        let mut engine = QueryEngine::new();
         let _cat: &Catalog = engine.catalog();
         let _kt: &KernelTable = engine.kernel_table();
         let _cm: &CostModel = engine.cost_model();
