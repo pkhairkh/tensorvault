@@ -82,6 +82,10 @@ pub fn execute_select(
                     elapsed_us: 0,
                 }
             }
+            // Window functions are handled by the tpch fallback.
+            SelectItem::Window { .. } => {
+                return Err(Error::Other("window function in execute_select — should use tpch fallback".into()));
+            }
         }
     } else if query.select.len() > 1 {
         // Multi-column select (could be columns or column+aggregate without GROUP BY)
@@ -407,6 +411,9 @@ fn execute_aggregate_no_group(
             }
             SelectItem::Literal(v) => {
                 cols.push(ResultColumn { name: v.to_string(), values: vec![*v] });
+            }
+            SelectItem::Window { .. } => {
+                return Err(Error::Other("window function in multi-aggregate — should use tpch fallback".into()));
             }
         }
     }
@@ -824,6 +831,9 @@ fn execute_with_join(
                     row_count: 1,
                     elapsed_us: 0,
                 })
+            }
+            crate::sql::parser::SelectItem::Window { .. } => {
+                Err(Error::Other("window function in join context — use tpch fallback".into()))
             }
         }
     } else {

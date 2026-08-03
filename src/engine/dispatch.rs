@@ -102,6 +102,8 @@ pub fn classify_query(query: &SelectQuery) -> QueryShape {
             // A bare literal in a single-item SELECT (e.g. `SELECT 1`)
             // is not a shape we dispatch — let the fallback handle it.
             SelectItem::Literal(_) => QueryShape::Complex,
+            // Window functions go through the tpch fallback.
+            SelectItem::Window { .. } => QueryShape::Complex,
         }
     } else if query.select.len() > 1 {
         let has_agg = query.select.iter().any(|s| matches!(s, SelectItem::Aggregate { .. }));
@@ -793,6 +795,9 @@ fn execute_string_group_by(
             }
             SelectItem::Star => {
                 // `SELECT *` with GROUP BY is not meaningful; skip.
+            }
+            SelectItem::Window { .. } => {
+                return Err(Error::Other("window function in string GROUP BY — use tpch fallback".into()));
             }
         }
     }

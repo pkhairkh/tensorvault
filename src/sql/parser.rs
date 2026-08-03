@@ -75,6 +75,17 @@ pub enum SelectItem {
     /// this to emit a constant column alongside the URL and count.
     /// Negative literals are rejected at parse time.
     Literal(u64),
+    /// A window function call: `func(args) OVER (spec) [AS alias]`.
+    Window {
+        /// The function name, uppercased (e.g. `ROW_NUMBER`, `RANK`, `SUM`).
+        func: String,
+        /// The function argument (column name, or empty for ROW_NUMBER).
+        arg: String,
+        /// The window specification string (content of OVER (...)).
+        over_spec: String,
+        /// Optional output alias.
+        alias: Option<String>,
+    },
 }
 
 /// A literal value extracted from a [`Token`].
@@ -327,6 +338,38 @@ impl Parser {
                     return Err(format!("expected ) after aggregate arg, got {:?}", self.peek()));
                 }
                 self.next(); // consume )
+
+                // Check for OVER (...) — window function.
+                if self.match_keyword("OVER") {
+                    if !matches!(self.peek(), Token::LParen) {
+                        return Err("expected ( after OVER".into());
+                    }
+                    self.next(); // consume (
+                    // Collect everything until matching ).
+                    let mut depth = 1i32;
+                    let mut spec_parts: Vec<String> = Vec::new();
+                    while depth > 0 {
+                        match self.peek().clone() {
+                            Token::LParen => { depth += 1; spec_parts.push("(".into()); self.next(); }
+                            Token::RParen => {
+                                depth -= 1;
+                                if depth > 0 { spec_parts.push(")".into()); }
+                                self.next();
+                            }
+                            Token::EOF => return Err("unterminated OVER (...)".into()),
+                            other => {
+                                let s = format!("{other:?}");
+                                let trimmed = s.trim_matches('"').trim_matches('\'');
+                                spec_parts.push(trimmed.to_string());
+                                self.next();
+                            }
+                        }
+                    }
+                    let over_spec = spec_parts.join(" ");
+                    let alias = self.parse_optional_alias()?;
+                    return Ok(SelectItem::Window { func, arg, over_spec, alias });
+                }
+
                 let alias = self.parse_optional_alias()?;
                 return Ok(SelectItem::Aggregate { func, arg, alias });
             }
