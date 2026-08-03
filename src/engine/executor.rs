@@ -544,8 +544,18 @@ fn execute_count(arg: &str, name: &str, where_clause: &WhereClause, table: &Tabl
 fn execute_sum(arg: &str, name: &str, where_clause: &WhereClause, table: &Table) -> Result<QueryResult> {
     let idx = table.column_idx(arg)
         .ok_or_else(|| Error::NotFound(format!("column '{}'", arg)))?;
-    let indices = filter_indices(where_clause, table);
-    let sum: u64 = indices.iter().map(|&i| table.columns[idx][i]).sum();
+
+    // For large tables with no WHERE, use parallel execution (Wave 29).
+    let sum: u64 = if let WhereClause::None = where_clause {
+        if table.row_count > 10_000 {
+            crate::exec::parallel::parallel_sum(&table.columns[idx])
+        } else {
+            table.columns[idx].iter().sum()
+        }
+    } else {
+        let indices = filter_indices(where_clause, table);
+        indices.iter().map(|&i| table.columns[idx][i]).sum()
+    };
     // Return as f64 bits so scalar_f64() interprets correctly
     Ok(QueryResult {
         columns: vec![ResultColumn { name: name.into(), values: vec![(sum as f64).to_bits()] , string_values: None }],
@@ -577,8 +587,16 @@ fn execute_avg(arg: &str, name: &str, where_clause: &WhereClause, table: &Table)
 fn execute_min(arg: &str, name: &str, where_clause: &WhereClause, table: &Table) -> Result<QueryResult> {
     let idx = table.column_idx(arg)
         .ok_or_else(|| Error::NotFound(format!("column '{}'", arg)))?;
-    let indices = filter_indices(where_clause, table);
-    let min = indices.iter().map(|&i| table.columns[idx][i]).min().unwrap_or(0);
+    let min = if let WhereClause::None = where_clause {
+        if table.row_count > 10_000 {
+            crate::exec::parallel::parallel_min(&table.columns[idx])
+        } else {
+            table.columns[idx].iter().min().copied().unwrap_or(0)
+        }
+    } else {
+        let indices = filter_indices(where_clause, table);
+        indices.iter().map(|&i| table.columns[idx][i]).min().unwrap_or(0)
+    };
     Ok(QueryResult {
         columns: vec![ResultColumn { name: name.into(), values: vec![min] , string_values: None }],
         row_count: 1,
@@ -589,8 +607,16 @@ fn execute_min(arg: &str, name: &str, where_clause: &WhereClause, table: &Table)
 fn execute_max(arg: &str, name: &str, where_clause: &WhereClause, table: &Table) -> Result<QueryResult> {
     let idx = table.column_idx(arg)
         .ok_or_else(|| Error::NotFound(format!("column '{}'", arg)))?;
-    let indices = filter_indices(where_clause, table);
-    let max = indices.iter().map(|&i| table.columns[idx][i]).max().unwrap_or(0);
+    let max = if let WhereClause::None = where_clause {
+        if table.row_count > 10_000 {
+            crate::exec::parallel::parallel_max(&table.columns[idx])
+        } else {
+            table.columns[idx].iter().max().copied().unwrap_or(0)
+        }
+    } else {
+        let indices = filter_indices(where_clause, table);
+        indices.iter().map(|&i| table.columns[idx][i]).max().unwrap_or(0)
+    };
     Ok(QueryResult {
         columns: vec![ResultColumn { name: name.into(), values: vec![max] , string_values: None }],
         row_count: 1,
