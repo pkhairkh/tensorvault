@@ -624,6 +624,29 @@ fn execute_count(arg: &str, name: &str, where_clause: &WhereClause, table: &Tabl
 }
 
 fn execute_sum(arg: &str, name: &str, where_clause: &WhereClause, table: &Table) -> Result<QueryResult> {
+    // Check if arg is an arithmetic expression (Wave 44 fix).
+    if crate::exec::expr_eval::is_arithmetic_expr(arg) {
+        let indices = filter_indices(where_clause, table);
+        let sum_f64: f64 = indices.iter()
+            .map(|&i| {
+                let val = crate::exec::expr_eval::eval_expr(arg, table, i);
+                if val > (1u64 << 62) && f64::from_bits(val).is_finite() {
+                    f64::from_bits(val)
+                } else if val > (1u64 << 60) {
+                    let f = f64::from_bits(val);
+                    if f.is_finite() && f.abs() < 1e15 { f } else { val as f64 }
+                } else {
+                    val as f64
+                }
+            })
+            .sum();
+        return Ok(QueryResult {
+            columns: vec![ResultColumn { name: name.into(), values: vec![sum_f64.to_bits()], string_values: None, type_oid: 0 }],
+            row_count: 1,
+            elapsed_us: 0,
+        });
+    }
+
     let idx = table.column_idx(arg)
         .ok_or_else(|| Error::NotFound(format!("column '{}'", arg)))?;
 
