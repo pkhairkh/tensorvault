@@ -110,6 +110,11 @@ pub const KEYWORDS: &[&str] = &[
     "SCHEMA",
     "ALTER",
     "ROLLBACK",
+    // Wave 66: ALTER TABLE / CREATE INDEX keywords.
+    "ADD",
+    "COLUMN",
+    "TYPE",
+    "INDEX",
 
     // DML keywords (Wave 4)
     "VALUES",

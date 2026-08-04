@@ -4885,9 +4885,22 @@ impl<'a> TpchExec<'a> {
         let mut cols = Vec::new();
         for item in select {
             let name = item.alias.clone().unwrap_or_else(|| self.expr_name(&item.expr));
-            let values: Vec<u64> = indices.iter().map(|&i| {
-                self.eval(&item.expr, t, i).unwrap_or(Value2::Null).to_u64()
-            }).collect();
+            // Wave 66 fix: propagate NotFound errors from eval (e.g. when
+            // a SELECT references a column that was dropped via ALTER
+            // TABLE DROP COLUMN). Previously `unwrap_or(Value2::Null)`
+            // silently swallowed ALL errors and returned 0, masking the
+            // "column not found" condition. We now propagate NotFound
+            // specifically; other eval errors still degrade to Null to
+            // preserve the existing behavior for non-NotFound cases
+            // (CASE WHEN returning Null, divide-by-zero, etc.).
+            let mut values: Vec<u64> = Vec::with_capacity(indices.len());
+            for &i in indices {
+                match self.eval(&item.expr, t, i) {
+                    Ok(v) => values.push(v.to_u64()),
+                    Err(Error::NotFound(msg)) => return Err(Error::NotFound(msg)),
+                    Err(_) => values.push(Value2::Null.to_u64()),
+                }
+            }
             cols.push(ResultColumn { name, values, string_values: None, type_oid: 0, null_mask: None });
         }
         Ok(QueryResult { columns: cols, row_count: indices.len(), elapsed_us: 0 })

@@ -116,6 +116,61 @@ pub enum DdlStatement {
     Drop(DropTable),
     /// CREATE SCHEMA — accepted but a no-op (schemas are implicit).
     CreateSchema(String),
+    /// ALTER TABLE — Wave 66. Adds, drops, or retypes a column.
+    AlterTable(AlterTable),
+    /// CREATE INDEX — Wave 66.
+    CreateIndex(CreateIndex),
+    /// DROP INDEX — Wave 66.
+    DropIndex(DropIndex),
+}
+
+/// ALTER TABLE action (Wave 66).
+#[derive(Debug, Clone)]
+pub enum AlterAction {
+    /// `ADD COLUMN col TYPE [DEFAULT x]`
+    AddColumn(ColumnDef),
+    /// `DROP COLUMN col`
+    DropColumn(String),
+    /// `ALTER COLUMN col TYPE new_type`
+    AlterColumnType {
+        /// Column name.
+        column: String,
+        /// New type.
+        new_type: ColumnType,
+    },
+}
+
+/// A parsed ALTER TABLE statement (Wave 66).
+#[derive(Debug, Clone)]
+pub struct AlterTable {
+    /// Schema (defaults to "dbo").
+    pub schema: String,
+    /// Table name.
+    pub name: String,
+    /// The action to perform.
+    pub action: AlterAction,
+}
+
+/// A parsed CREATE INDEX statement (Wave 66).
+#[derive(Debug, Clone)]
+pub struct CreateIndex {
+    /// Index name.
+    pub index_name: String,
+    /// Table to index.
+    pub table: String,
+    /// Column to index.
+    pub column: String,
+    /// True if `IF NOT EXISTS` was specified.
+    pub if_not_exists: bool,
+}
+
+/// A parsed DROP INDEX statement (Wave 66).
+#[derive(Debug, Clone)]
+pub struct DropIndex {
+    /// Index name.
+    pub index_name: String,
+    /// True if `IF EXISTS` was specified.
+    pub if_exists: bool,
 }
 
 /// Parse a DDL string. Returns None if the string is not a DDL statement
@@ -132,13 +187,14 @@ pub fn parse_ddl(sql: &str) -> Result<Option<DdlStatement>, String> {
     match first {
         "CREATE" => parse_create(&tokens[1..]).map(Some),
         "DROP" => parse_drop(&tokens[1..]).map(Some),
+        "ALTER" => parse_alter(&tokens[1..]).map(Some),
         _ => Ok(None),
     }
 }
 
 fn parse_create(tokens: &[Token]) -> Result<DdlStatement, String> {
     if tokens.is_empty() {
-        return Err("expected TABLE or SCHEMA after CREATE".into());
+        return Err("expected TABLE, SCHEMA, or INDEX after CREATE".into());
     }
     match &tokens[0] {
         Token::Keyword(k) if k == "TABLE" => {
@@ -156,18 +212,186 @@ fn parse_create(tokens: &[Token]) -> Result<DdlStatement, String> {
             };
             Ok(DdlStatement::CreateSchema(name))
         }
-        other => Err(format!("expected TABLE or SCHEMA after CREATE, got {other:?}")),
+        Token::Keyword(k) if k == "INDEX" => {
+            let ci = parse_create_index(&tokens[1..])?;
+            Ok(DdlStatement::CreateIndex(ci))
+        }
+        other => Err(format!("expected TABLE, SCHEMA, or INDEX after CREATE, got {other:?}")),
     }
 }
 
 fn parse_drop(tokens: &[Token]) -> Result<DdlStatement, String> {
     if tokens.is_empty() {
-        return Err("expected TABLE after DROP".into());
+        return Err("expected TABLE or INDEX after DROP".into());
     }
     match &tokens[0] {
         Token::Keyword(k) if k == "TABLE" => parse_drop_table(&tokens[1..]).map(DdlStatement::Drop),
-        other => Err(format!("expected TABLE after DROP, got {other:?}")),
+        Token::Keyword(k) if k == "INDEX" => parse_drop_index(&tokens[1..]).map(DdlStatement::DropIndex),
+        other => Err(format!("expected TABLE or INDEX after DROP, got {other:?}")),
     }
+}
+
+fn parse_alter(tokens: &[Token]) -> Result<DdlStatement, String> {
+    // Expect TABLE
+    if tokens.is_empty() {
+        return Err("expected TABLE after ALTER".into());
+    }
+    match &tokens[0] {
+        Token::Keyword(k) if k == "TABLE" => {
+            let at = parse_alter_table(&tokens[1..])?;
+            Ok(DdlStatement::AlterTable(at))
+        }
+        other => Err(format!("expected TABLE after ALTER, got {other:?}")),
+    }
+}
+
+fn parse_alter_table(tokens: &[Token]) -> Result<AlterTable, String> {
+    let mut pos = 0;
+    let (schema, name) = parse_qualified_name(tokens, &mut pos)?;
+    if pos >= tokens.len() {
+        return Err("expected ADD / DROP / ALTER after table name".into());
+    }
+    let action = match &tokens[pos] {
+        Token::Keyword(k) if k == "ADD" => {
+            pos += 1;
+            // Optional COLUMN keyword
+            if pos < tokens.len() {
+                if let Token::Keyword(k) = &tokens[pos] {
+                    if k == "COLUMN" { pos += 1; }
+                }
+            }
+            // Parse a single column definition.
+            let col = parse_column_def(tokens, &mut pos)?;
+            AlterAction::AddColumn(col)
+        }
+        Token::Keyword(k) if k == "DROP" => {
+            pos += 1;
+            if pos < tokens.len() {
+                if let Token::Keyword(k) = &tokens[pos] {
+                    if k == "COLUMN" { pos += 1; }
+                }
+            }
+            if pos >= tokens.len() {
+                return Err("expected column name after DROP COLUMN".into());
+            }
+            let col_name = match &tokens[pos] {
+                Token::Ident(s) => s.clone(),
+                other => return Err(format!("expected column name, got {other:?}")),
+            };
+            AlterAction::DropColumn(col_name)
+        }
+        Token::Keyword(k) if k == "ALTER" => {
+            pos += 1;
+            if pos < tokens.len() {
+                if let Token::Keyword(k) = &tokens[pos] {
+                    if k == "COLUMN" { pos += 1; }
+                }
+            }
+            if pos >= tokens.len() {
+                return Err("expected column name after ALTER COLUMN".into());
+            }
+            let col_name = match &tokens[pos] {
+                Token::Ident(s) => s.clone(),
+                other => return Err(format!("expected column name, got {other:?}")),
+            };
+            pos += 1;
+            // Expect TYPE
+            if pos >= tokens.len() {
+                return Err("expected TYPE after column name".into());
+            }
+            match &tokens[pos] {
+                Token::Keyword(k) if k == "TYPE" => pos += 1,
+                other => return Err(format!("expected TYPE, got {other:?}")),
+            }
+            let new_type = parse_type(tokens, &mut pos)?;
+            AlterAction::AlterColumnType { column: col_name, new_type }
+        }
+        other => return Err(format!("expected ADD / DROP / ALTER, got {other:?}")),
+    };
+    Ok(AlterTable { schema, name, action })
+}
+
+fn parse_create_index(tokens: &[Token]) -> Result<CreateIndex, String> {
+    let mut pos = 0;
+    // Optional IF NOT EXISTS
+    let mut if_not_exists = false;
+    if pos < tokens.len() {
+        if let Token::Keyword(k) = &tokens[pos] {
+            if k == "IF" {
+                pos += 1;
+                if pos >= tokens.len() { return Err("expected NOT after IF".into()); }
+                match &tokens[pos] {
+                    Token::Keyword(k) if k == "NOT" => pos += 1,
+                    other => return Err(format!("expected NOT, got {other:?}")),
+                }
+                if pos >= tokens.len() { return Err("expected EXISTS after NOT".into()); }
+                match &tokens[pos] {
+                    Token::Keyword(k) if k == "EXISTS" => pos += 1,
+                    other => return Err(format!("expected EXISTS, got {other:?}")),
+                }
+                if_not_exists = true;
+            }
+        }
+    }
+    // Index name
+    if pos >= tokens.len() { return Err("expected index name after CREATE INDEX".into()); }
+    let index_name = match &tokens[pos] {
+        Token::Ident(s) => s.clone(),
+        other => return Err(format!("expected index name, got {other:?}")),
+    };
+    pos += 1;
+    // Expect ON
+    if pos >= tokens.len() { return Err("expected ON after index name".into()); }
+    match &tokens[pos] {
+        Token::Keyword(k) if k == "ON" => pos += 1,
+        other => return Err(format!("expected ON, got {other:?}")),
+    }
+    // Table name
+    let (_table_schema, table) = parse_qualified_name(tokens, &mut pos)?;
+    // Expect ( column )
+    if pos >= tokens.len() { return Err("expected ( after table name".into()); }
+    match &tokens[pos] {
+        Token::LParen => pos += 1,
+        other => return Err(format!("expected (, got {other:?}")),
+    }
+    if pos >= tokens.len() { return Err("expected column name".into()); }
+    let column = match &tokens[pos] {
+        Token::Ident(s) => s.clone(),
+        other => return Err(format!("expected column name, got {other:?}")),
+    };
+    pos += 1;
+    if pos >= tokens.len() { return Err("expected ) after column name".into()); }
+    match &tokens[pos] {
+        Token::RParen => pos += 1,
+        other => return Err(format!("expected ), got {other:?}")),
+    }
+    // Trailing tokens (e.g. USING btree, method_opt) are ignored.
+    Ok(CreateIndex { index_name, table, column, if_not_exists })
+}
+
+fn parse_drop_index(tokens: &[Token]) -> Result<DropIndex, String> {
+    let mut pos = 0;
+    let mut if_exists = false;
+    if pos < tokens.len() {
+        if let Token::Keyword(k) = &tokens[pos] {
+            if k == "IF" {
+                pos += 1;
+                if pos >= tokens.len() { return Err("expected EXISTS after IF".into()); }
+                match &tokens[pos] {
+                    Token::Keyword(k) if k == "EXISTS" => pos += 1,
+                    other => return Err(format!("expected EXISTS, got {other:?}")),
+                }
+                if_exists = true;
+            }
+        }
+    }
+    if pos >= tokens.len() { return Err("expected index name after DROP INDEX".into()); }
+    let index_name = match &tokens[pos] {
+        Token::Ident(s) => s.clone(),
+        Token::Keyword(k) => k.clone(),
+        other => return Err(format!("expected index name, got {other:?}")),
+    };
+    Ok(DropIndex { index_name, if_exists })
 }
 
 fn parse_drop_table(tokens: &[Token]) -> Result<DropTable, String> {

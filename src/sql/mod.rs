@@ -40,7 +40,10 @@ pub mod parser;
 pub mod plan;
 
 pub use cte::{parse_with, CteDef, WithClause};
-pub use ddl::{parse_ddl, ColumnDef, ColumnType, CreateTable, DdlStatement, DropTable};
+pub use ddl::{
+    parse_ddl, AlterAction, AlterTable, ColumnDef, ColumnType, CreateIndex, CreateTable,
+    DropIndex, DdlStatement, DropTable,
+};
 pub use dml::{parse_dml, Delete, DmlStatement, Insert, Update};
 pub use extensions::{parse_extensions, parse_extensions_and_strip, QueryExtensions};
 pub use lexer::{tokenize, Token, KEYWORDS};

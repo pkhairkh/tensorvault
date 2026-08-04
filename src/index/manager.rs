@@ -1,9 +1,15 @@
-//! # Index manager (Wave 26).
+//! # Index manager (Wave 26, extended Wave 66).
 //!
 //! Wires the existing BSI (Bit-Sliced Index) and LSH (Locality-Sensitive
 //! Hash) index implementations into the query planning layer. The index
 //! manager tracks which columns have indexes and provides lookup for
 //! the optimizer to decide when to use an index vs a full scan.
+//!
+//! Wave 66 extension: indexes now have names (for `CREATE INDEX name ON
+//! ...` / `DROP INDEX name`) and the manager holds an in-memory hash
+//! index data structure for equality lookups. The executor consults
+//! [`IndexManager::lookup`] when a query has `WHERE col = value` on an
+//! indexed column, skipping the full scan.
 
 use std::collections::HashMap;
 
@@ -26,6 +32,9 @@ pub struct IndexEntry {
     pub index_type: IndexType,
     /// Estimated number of unique values (cardinality).
     pub cardinality: u64,
+    /// Optional index name (Wave 66). `None` for indexes created via the
+    /// low-level `create` API (pre-Wave-66 callers).
+    pub name: Option<String>,
 }
 
 /// The index manager: tracks all indexes across all tables.
@@ -33,28 +42,92 @@ pub struct IndexEntry {
 pub struct IndexManager {
     /// Maps (table_name, column_name) → IndexEntry.
     indexes: HashMap<(String, String), IndexEntry>,
+    /// Maps index_name → (table, column). Used by `DROP INDEX name`.
+    by_name: HashMap<String, (String, String)>,
+    /// In-memory hash index data: (table, column) → (value → row indices).
+    /// Populated by `build_hash_index` (called from `CREATE INDEX`).
+    /// Used by `lookup` for fast equality lookups.
+    hash_data: HashMap<(String, String), HashMap<u64, Vec<usize>>>,
 }
 
 impl IndexManager {
     /// Create an empty index manager.
     pub fn new() -> Self {
-        Self { indexes: HashMap::new() }
+        Self {
+            indexes: HashMap::new(),
+            by_name: HashMap::new(),
+            hash_data: HashMap::new(),
+        }
     }
 
-    /// Register an index on a column.
+    /// Register an index on a column (pre-Wave-66 API, no name).
     pub fn create(&mut self, table: &str, column: &str, index_type: IndexType, cardinality: u64) {
         let entry = IndexEntry {
             table_name: table.to_string(),
             column_name: column.to_string(),
             index_type,
             cardinality,
+            name: None,
         };
         self.indexes.insert((table.to_string(), column.to_string()), entry);
     }
 
-    /// Drop an index.
+    /// Register a named index (Wave 66). Used by `CREATE INDEX name ON
+    /// table (column)`. If an index with the same name already exists,
+    /// it's replaced.
+    pub fn create_named(
+        &mut self,
+        name: &str,
+        table: &str,
+        column: &str,
+        index_type: IndexType,
+        cardinality: u64,
+    ) {
+        let entry = IndexEntry {
+            table_name: table.to_string(),
+            column_name: column.to_string(),
+            index_type,
+            cardinality,
+            name: Some(name.to_string()),
+        };
+        self.indexes.insert((table.to_string(), column.to_string()), entry);
+        self.by_name.insert(name.to_string(), (table.to_string(), column.to_string()));
+    }
+
+    /// Build (or rebuild) the in-memory hash index for a (table, column)
+    /// pair from the column's current cell values. Used by `CREATE INDEX`
+    /// to populate the index data structure that `lookup` consults.
+    pub fn build_hash_index(&mut self, table: &str, column: &str, values: &[u64]) {
+        let mut map: HashMap<u64, Vec<usize>> = HashMap::new();
+        for (i, &v) in values.iter().enumerate() {
+            map.entry(v).or_default().push(i);
+        }
+        self.hash_data.insert((table.to_string(), column.to_string()), map);
+    }
+
+    /// Drop an index by (table, column). Returns true if it existed.
     pub fn drop(&mut self, table: &str, column: &str) -> bool {
-        self.indexes.remove(&(table.to_string(), column.to_string())).is_some()
+        if let Some(entry) = self.indexes.remove(&(table.to_string(), column.to_string())) {
+            if let Some(name) = entry.name {
+                self.by_name.remove(&name);
+            }
+            self.hash_data.remove(&(table.to_string(), column.to_string()));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Drop an index by name (Wave 66). Returns true if it existed.
+    pub fn drop_by_name(&mut self, name: &str) -> bool {
+        if let Some((table, column)) = self.by_name.remove(name) {
+            self.indexes.remove(&(table.clone(), column.clone()));
+            self.hash_data.remove(&(table, column));
+            true
+        } else {
+            // Also check unnamed indexes (pre-Wave-66 path).
+            false
+        }
     }
 
     /// Look up an index for a (table, column) pair.
@@ -62,9 +135,23 @@ impl IndexManager {
         self.indexes.get(&(table.to_string(), column.to_string()))
     }
 
+    /// Look up an index by name (Wave 66).
+    pub fn get_by_name(&self, name: &str) -> Option<(&String, &String)> {
+        self.by_name.get(name).map(|(t, c)| (t, c))
+    }
+
     /// Check if an index exists for a column.
     pub fn has_index(&self, table: &str, column: &str) -> bool {
         self.indexes.contains_key(&(table.to_string(), column.to_string()))
+    }
+
+    /// Fast equality lookup: returns the row indices where `column` equals
+    /// `value`, using the in-memory hash index built by `build_hash_index`.
+    /// Returns `None` if no hash index exists for this (table, column).
+    pub fn lookup(&self, table: &str, column: &str, value: u64) -> Option<&Vec<usize>> {
+        self.hash_data
+            .get(&(table.to_string(), column.to_string()))
+            .and_then(|m| m.get(&value))
     }
 
     /// Decide whether to use an index for a predicate.
