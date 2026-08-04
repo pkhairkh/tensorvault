@@ -38,10 +38,16 @@ pub struct SelectQuery {
     pub where_clause: Option<Expr>,
     /// GROUP BY column list (empty if no GROUP BY).
     pub group_by: Vec<String>,
+    /// Optional HAVING predicate (Wave 60b). Filters groups after aggregation.
+    /// The expression can reference aggregates (e.g. `count(*) > 2`).
+    pub having: Option<Expr>,
     /// ORDER BY column list with ascending flag (`true` = ASC).
     pub order_by: Vec<(String, bool)>,
     /// Optional LIMIT row count.
     pub limit: Option<usize>,
+    /// Whether SELECT DISTINCT was specified (Wave 60d). When true, the
+    /// executor deduplicates the result rows.
+    pub distinct: bool,
 }
 
 /// A parsed JOIN clause.
@@ -92,6 +98,15 @@ pub enum SelectItem {
         /// Optional output alias.
         alias: Option<String>,
     },
+    /// A general expression (Wave 60a): `CASE WHEN ... THEN ... END`,
+    /// arithmetic, etc. Carries the parsed Expr and an optional alias.
+    /// The executor evaluates the expression per row.
+    Expression {
+        /// The parsed expression.
+        expr: Expr,
+        /// Optional output alias.
+        alias: Option<String>,
+    },
 }
 
 /// A literal value extracted from a [`Token`].
@@ -123,6 +138,15 @@ pub enum Expr {
         op: String,
         /// Right operand.
         right: Box<Expr>,
+    },
+    /// A CASE WHEN expression (Wave 60a).
+    /// Evaluates WHEN clauses in order; returns the first matching THEN
+    /// value, or the ELSE value if no WHEN matches.
+    Case {
+        /// List of (condition, result) pairs.
+        when_clauses: Vec<(Expr, Expr)>,
+        /// Optional ELSE clause (defaults to NULL/0).
+        else_clause: Option<Box<Expr>>,
     },
 }
 
@@ -224,6 +248,9 @@ impl Parser {
 
     fn parse_select(&mut self) -> Result<SelectQuery, String> {
         self.expect_keyword("SELECT")?;
+        // Wave 60d: SELECT DISTINCT — consume the DISTINCT keyword and set
+        // the distinct flag. The executor deduplicates the result rows.
+        let distinct = self.match_keyword("DISTINCT");
         let select = self.parse_select_list()?;
         // FROM is optional — allows `SELECT 1` and `SELECT count(*)`.
         let from = if self.match_keyword("FROM") {
@@ -247,6 +274,13 @@ impl Parser {
             Vec::new()
         };
 
+        // Wave 60b: HAVING clause — parsed after GROUP BY.
+        let having = if self.match_keyword("HAVING") {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
         let order_by = if self.match_keyword("ORDER") {
             self.expect_keyword("BY")?;
             self.parse_order_list()?
@@ -256,7 +290,7 @@ impl Parser {
 
         let limit = if self.match_ident("LIMIT") { Some(self.parse_usize()?) } else { None };
 
-        Ok(SelectQuery { select, from, joins, where_clause, group_by, order_by, limit })
+        Ok(SelectQuery { select, from, joins, where_clause, group_by, having, order_by, limit, distinct })
     }
 
     /// Parse zero or more JOIN clauses.
@@ -332,6 +366,14 @@ impl Parser {
         // `*` → Star.
         if self.match_op("*") {
             return Ok(SelectItem::Star);
+        }
+        // Wave 60a: CASE WHEN expression in the SELECT list.
+        if let Token::Keyword(kw) = self.peek() {
+            if kw == "CASE" {
+                let expr = self.parse_expr()?;
+                let alias = self.parse_optional_alias()?;
+                return Ok(SelectItem::Expression { expr, alias });
+            }
         }
         // Non-negative integer literal → `Literal(u64)`
         // (e.g. `SELECT 1, URL, count(*) ...` in ClickBench Q15-Q42).
@@ -807,6 +849,10 @@ impl Parser {
                     }
                     return Ok(Expr::Column(kw));
                 }
+                // Wave 60a: CASE WHEN expression.
+                if kw_upper == "CASE" {
+                    return self.parse_case();
+                }
                 // Other keywords treated as identifiers
                 self.next();
                 Ok(Expr::Column(kw))
@@ -826,6 +872,29 @@ impl Parser {
             }
             other => Err(format!("expected expression, got {other:?}")),
         }
+    }
+
+    /// Parse a CASE WHEN expression (Wave 60a).
+    /// Syntax: `CASE WHEN <cond> THEN <result> [WHEN ... THEN ...] [ELSE <result>] END`
+    fn parse_case(&mut self) -> Result<Expr, String> {
+        self.expect_keyword("CASE")?;
+        let mut when_clauses: Vec<(Expr, Expr)> = Vec::new();
+        while self.match_keyword("WHEN") {
+            let cond = self.parse_expr()?;
+            self.expect_keyword("THEN")?;
+            let result = self.parse_expr()?;
+            when_clauses.push((cond, result));
+        }
+        if when_clauses.is_empty() {
+            return Err("CASE expression must have at least one WHEN clause".into());
+        }
+        let else_clause = if self.match_keyword("ELSE") {
+            Some(Box::new(self.parse_expr()?))
+        } else {
+            None
+        };
+        self.expect_keyword("END")?;
+        Ok(Expr::Case { when_clauses, else_clause })
     }
 }
 

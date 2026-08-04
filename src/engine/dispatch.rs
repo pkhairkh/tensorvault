@@ -104,11 +104,16 @@ pub fn classify_query(query: &SelectQuery) -> QueryShape {
             SelectItem::Literal(_) => QueryShape::Complex,
             // Window functions go through the tpch fallback.
             SelectItem::Window { .. } => QueryShape::Complex,
+            // Wave 60a: CASE WHEN / general expressions go through the
+            // tpch fallback (which evaluates them correctly). A future
+            // wave can add a fast dispatch path for Expression items.
+            SelectItem::Expression { .. } => QueryShape::Complex,
         }
     } else if query.select.len() > 1 {
         let has_agg = query.select.iter().any(|s| matches!(s, SelectItem::Aggregate { .. }));
-        if has_agg {
-            QueryShape::Complex // mixed column+agg without GROUP BY
+        let has_expr = query.select.iter().any(|s| matches!(s, SelectItem::Expression { .. }));
+        if has_agg || has_expr {
+            QueryShape::Complex // mixed column+agg/expr without GROUP BY
         } else {
             QueryShape::SelectMulti
         }
@@ -127,7 +132,32 @@ pub fn execute_dispatched(
     if shape == QueryShape::Complex {
         return None;
     }
+    // Wave 60a: if the WHERE clause contains a CASE WHEN expression, the
+    // dispatch path can't evaluate it (build_filter_mask / vectorized::filter_rows
+    // don't handle Expr::Case). Return None so the query falls through to
+    // the tpch interpreter, which evaluates CASE WHEN correctly.
+    if let Some(ref where_expr) = query.where_clause {
+        if expr_contains_case(where_expr) {
+            return None;
+        }
+    }
+    // Wave 60b: if the HAVING clause is present, the dispatch path can't
+    // evaluate it (the basic parser's Expr doesn't represent aggregates in
+    // HAVING). Return None so the query falls to tpch.
+    if query.having.is_some() {
+        return None;
+    }
     Some(execute_shape(shape, query, table))
+}
+
+/// Check whether an Expr contains a CASE WHEN expression (recursively).
+/// Used by execute_dispatched to route CASE WHEN queries to the tpch fallback.
+fn expr_contains_case(expr: &Expr) -> bool {
+    match expr {
+        Expr::Case { .. } => true,
+        Expr::Binary { left, right, .. } => expr_contains_case(left) || expr_contains_case(right),
+        Expr::Column(_) | Expr::Literal(_) => false,
+    }
 }
 
 fn execute_shape(shape: QueryShape, query: &SelectQuery, table: &Table) -> Result<QueryResult> {
@@ -817,6 +847,12 @@ fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
                         "window function in single-key GROUP BY — use tpch fallback".into(),
                     ));
                 }
+                // Wave 60a: general expressions go through the tpch fallback.
+                SelectItem::Expression { .. } => {
+                    return Err(Error::Other(
+                        "expression in single-key GROUP BY — use tpch fallback".into(),
+                    ));
+                }
             }
         }
 
@@ -1066,6 +1102,10 @@ fn execute_string_group_by(
             }
             SelectItem::Window { .. } => {
                 return Err(Error::Other("window function in string GROUP BY — use tpch fallback".into()));
+            }
+            // Wave 60a: general expressions go through the tpch fallback.
+            SelectItem::Expression { .. } => {
+                return Err(Error::Other("expression in string GROUP BY — use tpch fallback".into()));
             }
         }
     }

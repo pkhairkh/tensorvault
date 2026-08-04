@@ -144,6 +144,10 @@ pub fn execute_select(
             SelectItem::Window { .. } => {
                 return Err(Error::Other("internal: window item not stripped".into()));
             }
+            // Wave 60a: general expressions go through the tpch fallback.
+            SelectItem::Expression { .. } => {
+                return Err(Error::Other("expression in SELECT — use tpch fallback".into()));
+            }
         }
     } else if query_ref.select.len() > 1 {
         // Multi-column select (could be columns or column+aggregate without GROUP BY)
@@ -546,6 +550,10 @@ fn execute_aggregate_no_group(
             }
             SelectItem::Window { .. } => {
                 return Err(Error::Other("window function in multi-aggregate — should use tpch fallback".into()));
+            }
+            // Wave 60a: general expressions go through the tpch fallback.
+            SelectItem::Expression { .. } => {
+                return Err(Error::Other("expression in multi-aggregate — use tpch fallback".into()));
             }
         }
     }
@@ -1048,6 +1056,10 @@ fn execute_with_join(
             }
             crate::sql::parser::SelectItem::Window { .. } => {
                 Err(Error::Other("window function in join context — use tpch fallback".into()))
+            }
+            // Wave 60a: general expressions go through the tpch fallback.
+            crate::sql::parser::SelectItem::Expression { .. } => {
+                Err(Error::Other("expression in join context — use tpch fallback".into()))
             }
         }
     } else {

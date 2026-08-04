@@ -563,6 +563,14 @@ impl QueryEngine {
             return self.execute_merge_stmt(merge, start);
         }
 
+        // Wave 60c: UNION ALL. Detect `UNION ALL` in the SQL, split into
+        // two SELECT statements, execute both, and concatenate the results.
+        if let Some((left_sql, right_sql)) = split_union_all(sql) {
+            let left_result = self.execute_inner(&left_sql, start, txn_id)?;
+            let right_result = self.execute_inner(&right_sql, start, txn_id)?;
+            return Ok(concatenate_results(left_result, right_result, start));
+        }
+
         // Wave 56b: PIVOT clause. Detect `PIVOT (` in the SQL and route to
         // the pivot module. We parse the PIVOT spec, strip the PIVOT clause
         // from the SQL, execute the remaining SELECT to get the input rows,
@@ -681,6 +689,10 @@ impl QueryEngine {
                 if let Some(pivot_spec) = extensions_pivot(&extensions) {
                     result = apply_pivot(&result, &pivot_spec);
                 }
+                // Wave 60d: apply DISTINCT deduplication if requested.
+                if query.distinct {
+                    result = deduplicate_rows(result);
+                }
                 result.elapsed_us = start.elapsed().as_micros() as u64;
                 Ok(result)
             }
@@ -691,6 +703,12 @@ impl QueryEngine {
                 // CASE WHEN, subqueries, etc.).
                 let mut tpch_result = crate::engine::tpch::parse_and_execute(&expanded_sql, &self.catalog)
                     .map_err(|_| exec_err)?;
+                // Wave 60d: apply DISTINCT deduplication even on the tpch
+                // fallback path (the tpch parser skips DISTINCT but doesn't
+                // deduplicate).
+                if query.distinct {
+                    tpch_result = deduplicate_rows(tpch_result);
+                }
                 tpch_result.elapsed_us = start.elapsed().as_micros() as u64;
                 Ok(tpch_result)
             }
@@ -2704,6 +2722,126 @@ fn apply_pivot(result: &QueryResult, spec: &PivotSpec) -> QueryResult {
 fn contains_json_value_call(sql: &str) -> bool {
     let lower = sql.to_lowercase();
     lower.contains("json_value(") || lower.contains("json_query(")
+}
+
+// -----------------------------------------------------------------------
+// Wave 60c: UNION ALL wiring.
+// -----------------------------------------------------------------------
+
+/// Split a SQL string at the first top-level `UNION ALL` keyword
+/// (case-insensitive). Returns (left_sql, right_sql) if found, else None.
+///
+/// "Top-level" means the UNION ALL is not inside parentheses (e.g. not in a
+/// subquery). This is a simple heuristic — it doesn't handle UNION (without
+/// ALL) or INTERSECT/EXCEPT.
+fn split_union_all(sql: &str) -> Option<(String, String)> {
+    let lower = sql.to_lowercase();
+    let mut search_from = 0;
+    loop {
+        let pos = lower[search_from..].find("union all")?;
+        let abs_pos = search_from + pos;
+        // Check that this is a top-level UNION ALL (not inside parens).
+        let before = &sql[..abs_pos];
+        let depth = before.chars().fold(0i32, |acc, c| match c {
+            '(' => acc + 1,
+            ')' => acc - 1,
+            _ => acc,
+        });
+        if depth == 0 {
+            let left = sql[..abs_pos].trim().to_string();
+            let right = sql[abs_pos + "union all".len()..].trim().to_string();
+            if !left.is_empty() && !right.is_empty() {
+                return Some((left, right));
+            }
+        }
+        search_from = abs_pos + "union all".len();
+    }
+}
+
+/// Concatenate two QueryResults into one (UNION ALL). The result has the
+/// columns from the left result; the right result's values are appended.
+/// Column names are taken from the left result.
+fn concatenate_results(left: QueryResult, right: QueryResult, start: &Instant) -> QueryResult {
+    let total_rows = left.row_count + right.row_count;
+    let n_cols = left.columns.len();
+    let mut columns: Vec<ResultColumn> = left.columns.into_iter().enumerate().map(|(i, mut c)| {
+        // Append the right result's values for this column.
+        if i < right.columns.len() {
+            c.values.extend(right.columns[i].values.iter().copied());
+            // Merge string_values if both have them.
+            if let Some(ref mut left_sv) = c.string_values {
+                if let Some(ref right_sv) = right.columns[i].string_values {
+                    left_sv.extend(right_sv.iter().cloned());
+                } else {
+                    // Right has no strings — pad with empty strings.
+                    left_sv.extend(std::iter::repeat(String::new()).take(right.row_count));
+                }
+            }
+        }
+        c
+    }).collect();
+    // If right has more columns than left (shouldn't happen for a valid UNION),
+    // pad with empty columns.
+    while columns.len() < n_cols {
+        columns.push(ResultColumn {
+            name: format!("col_{}", columns.len()),
+            values: vec![0; total_rows],
+            string_values: None,
+            type_oid: 0,
+            null_mask: None,
+        });
+    }
+    QueryResult {
+        columns,
+        row_count: total_rows,
+        elapsed_us: start.elapsed().as_micros() as u64,
+    }
+}
+
+// -----------------------------------------------------------------------
+// Wave 60d: SELECT DISTINCT wiring.
+// -----------------------------------------------------------------------
+
+/// Deduplicate the rows of a QueryResult. Two rows are considered duplicates
+/// if they have the same u64 values in every column. The first occurrence is
+/// kept; subsequent duplicates are dropped.
+fn deduplicate_rows(result: QueryResult) -> QueryResult {
+    if result.row_count <= 1 {
+        return result;
+    }
+    use std::collections::HashSet;
+    let mut seen: HashSet<Vec<u64>> = HashSet::new();
+    let mut keep_indices: Vec<usize> = Vec::with_capacity(result.row_count);
+    for row in 0..result.row_count {
+        let key: Vec<u64> = result.columns.iter()
+            .map(|c| c.values.get(row).copied().unwrap_or(0))
+            .collect();
+        if seen.insert(key) {
+            keep_indices.push(row);
+        }
+    }
+    if keep_indices.len() == result.row_count {
+        return result; // no duplicates
+    }
+    let new_row_count = keep_indices.len();
+    let columns: Vec<ResultColumn> = result.columns.into_iter().map(|mut c| {
+        let new_values: Vec<u64> = keep_indices.iter().map(|&i| c.values.get(i).copied().unwrap_or(0)).collect();
+        c.values = new_values;
+        if let Some(ref mut sv) = c.string_values {
+            let new_sv: Vec<String> = keep_indices.iter().map(|&i| sv.get(i).cloned().unwrap_or_default()).collect();
+            *sv = new_sv;
+        }
+        if let Some(ref mut bm) = c.null_mask {
+            let new_bm: Vec<bool> = keep_indices.iter().map(|&i| bm.get(i).copied().unwrap_or(false)).collect();
+            *bm = new_bm;
+        }
+        c
+    }).collect();
+    QueryResult {
+        columns,
+        row_count: new_row_count,
+        elapsed_us: result.elapsed_us,
+    }
 }
 
 /// A parsed JSON_VALUE / JSON_QUERY call extracted from a SQL string.
