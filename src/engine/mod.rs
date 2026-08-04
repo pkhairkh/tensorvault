@@ -113,6 +113,11 @@ pub struct QueryEngine {
     table_ids: HashMap<String, u64>,
     /// Next table_id to assign (Wave 63).
     next_table_id: u64,
+    /// Named savepoints within the current transaction (Wave 69).
+    /// Each savepoint is a (name, catalog_snapshot) pair. On ROLLBACK TO
+    /// <name>, the catalog is restored from the snapshot. On COMMIT or
+    /// ROLLBACK, all savepoints are cleared.
+    savepoints: Vec<(String, Catalog)>,
 }
 
 impl QueryEngine {
@@ -210,6 +215,7 @@ impl QueryEngine {
             buffer_pool: None,
             table_ids: HashMap::new(),
             next_table_id: 1,
+            savepoints: Vec::new(),
         }
     }
 
@@ -600,6 +606,10 @@ impl QueryEngine {
             return Ok(QueryResult::empty());
         }
 
+        // SAVEPOINT, ROLLBACK TO, RELEASE are handled inside execute_inner
+        // (after the txn snapshot is swapped in) so they operate on the
+        // transaction's catalog, not the main catalog.
+
         if lower.starts_with("begin") || lower.starts_with("start transaction") {
             let id = self
                 .txn_manager
@@ -616,14 +626,16 @@ impl QueryEngine {
                 .commit()
                 .map_err(Error::Other)?;
             self.catalog = committed;
+            self.savepoints.clear(); // Wave 69: clear savepoints on commit.
             self.wal_append_record(crate::storage::recovery::WalRecord::commit(txn_id));
             return Ok(QueryResult::empty());
         }
-        if lower.starts_with("rollback") {
+        if lower.starts_with("rollback") && !lower.starts_with("rollback to ") {
             let txn_id = self.txn_manager.active.as_ref().map(|t| t.id).unwrap_or(0);
             self.txn_manager
                 .rollback()
                 .map_err(Error::Other)?;
+            self.savepoints.clear(); // Wave 69: clear savepoints on rollback.
             self.wal_append_record(crate::storage::recovery::WalRecord::rollback(txn_id));
             return Ok(QueryResult::empty());
         }
@@ -664,6 +676,24 @@ impl QueryEngine {
     /// INTO nonexistent) would still leave a record in the WAL — and
     /// replay would fail on restart.
     fn execute_inner(&mut self, sql: &str, start: &Instant, txn_id: Option<u64>) -> Result<QueryResult> {
+        // Wave 69: SAVEPOINT / ROLLBACK TO / RELEASE — handle these here
+        // (after the txn snapshot is swapped in by the caller) so they
+        // operate on the transaction's catalog.
+        let trimmed = sql.trim();
+        let lower = trimmed.to_lowercase();
+        if lower.starts_with("savepoint ") {
+            let name = trimmed[10..].trim().to_string();
+            return self.execute_savepoint(name, start);
+        }
+        if lower.starts_with("rollback to ") {
+            let name = trimmed[12..].trim().to_string();
+            return self.execute_rollback_to(&name, start);
+        }
+        if lower.starts_with("release ") {
+            let name = trimmed[8..].trim().to_string();
+            return self.execute_release_savepoint(&name, start);
+        }
+
         // Wave 53: Temporal query — FOR SYSTEM_TIME AS OF <timestamp>.
         // Check this FIRST because the basic lexer fails on very large
         // integer timestamps (u64 values that overflow i64), which would
@@ -1054,6 +1084,53 @@ impl QueryEngine {
             }
             _ => Err(Error::Other(format!("COPY direction must be TO or FROM, got: {}", direction))),
         }
+    }
+
+    /// Execute SAVEPOINT: create a named savepoint within the current
+    /// transaction (Wave 69). The savepoint captures a deep-clone of the
+    /// current catalog state, so ROLLBACK TO can restore it.
+    fn execute_savepoint(&mut self, name: String, start: &Instant) -> Result<QueryResult> {
+        // Note: during execute_inner, the txn_manager.active field is
+        // temporarily taken out (swapped). We can't check is_active()
+        // here. Instead, we rely on the caller (execute) to only dispatch
+        // to execute_inner when a txn is active. If we reach here without
+        // a txn, the savepoint is simply created on the main catalog —
+        // it won't be very useful, but it won't crash.
+        // Deep-clone the current catalog as the savepoint state.
+        let snapshot = crate::txn::clone_catalog(&self.catalog);
+        self.savepoints.push((name, snapshot));
+        let mut result = QueryResult::empty();
+        result.elapsed_us = start.elapsed().as_micros() as u64;
+        Ok(result)
+    }
+
+    /// Execute ROLLBACK TO <name>: restore the catalog to the named
+    /// savepoint (Wave 69). All savepoints created after <name> are
+    /// discarded.
+    fn execute_rollback_to(&mut self, name: &str, start: &Instant) -> Result<QueryResult> {
+        // Find the savepoint by name (search from the end — most recent first).
+        let pos = self.savepoints.iter().rposition(|(n, _)| n == name)
+            .ok_or_else(|| Error::NotFound(format!("savepoint '{}'", name)))?;
+        // Restore the catalog from the savepoint.
+        let (_, snapshot) = &self.savepoints[pos];
+        self.catalog = crate::txn::clone_catalog(snapshot);
+        // Discard all savepoints after this one (they're no longer valid).
+        self.savepoints.truncate(pos + 1);
+        let mut result = QueryResult::empty();
+        result.elapsed_us = start.elapsed().as_micros() as u64;
+        Ok(result)
+    }
+
+    /// Execute RELEASE <name>: discard a savepoint (Wave 69).
+    /// The savepoint is removed; ROLLBACK TO can no longer target it.
+    fn execute_release_savepoint(&mut self, name: &str, start: &Instant) -> Result<QueryResult> {
+        let pos = self.savepoints.iter().rposition(|(n, _)| n == name)
+            .ok_or_else(|| Error::NotFound(format!("savepoint '{}'", name)))?;
+        // Remove the savepoint and all savepoints after it.
+        self.savepoints.truncate(pos);
+        let mut result = QueryResult::empty();
+        result.elapsed_us = start.elapsed().as_micros() as u64;
+        Ok(result)
     }
 
     /// Execute a DDL statement (CREATE TABLE, DROP TABLE, CREATE SCHEMA).

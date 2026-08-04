@@ -95,7 +95,7 @@ impl Default for TxnManager {
 /// Deep-clone a catalog. This clones every table and every column's
 /// `Vec<u64>`. The `Arc<Vec<u64>>` columns are cloned into new `Arc`s
 /// pointing at fresh `Vec`s.
-fn clone_catalog(catalog: &Catalog) -> Catalog {
+pub fn clone_catalog(catalog: &Catalog) -> Catalog {
     let mut new_cat = Catalog::new();
     for name in catalog.table_names() {
         if let Some(table) = catalog.get(name) {
