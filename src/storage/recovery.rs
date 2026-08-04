@@ -30,7 +30,9 @@ use base64::{engine::general_purpose, Engine as _};
 /// PageDelete) that record the actual byte-level changes to pages, not
 /// just the SQL string. This enables page-level crash recovery: on restart,
 /// the WAL is replayed page-by-page rather than re-executing SQL.
-#[derive(Debug, Clone)]
+///
+/// Wave 71: added Serialize/Deserialize for streaming over TCP (replication).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WalRecord {
     /// Transaction ID (0 for autocommit, non-zero for explicit transactions).
     pub txn_id: u64,
