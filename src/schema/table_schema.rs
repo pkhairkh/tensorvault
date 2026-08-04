@@ -47,10 +47,12 @@ impl TableSchema {
         self.columns.get(idx).map(|c| &c.col_type)
     }
 
-    /// Check if a column is a string type (VARCHAR, NVARCHAR, TEXT).
+    /// Check if a column is a string type (VARCHAR, NVARCHAR, TEXT, JSON,
+    /// ARRAY, BYTEA — all stored as string sidecars).
     pub fn is_string(&self, idx: usize) -> bool {
         match self.col_type_at(idx) {
-            Some(ColumnType::Varchar(_)) | Some(ColumnType::Nvarchar(_)) | Some(ColumnType::Text) => true,
+            Some(ColumnType::Varchar(_)) | Some(ColumnType::Nvarchar(_)) | Some(ColumnType::Text)
+            | Some(ColumnType::Json) | Some(ColumnType::Array(_)) | Some(ColumnType::Bytea) => true,
             _ => false,
         }
     }
@@ -88,6 +90,11 @@ impl TableSchema {
             Some(ColumnType::Date) => 1082, // date
             Some(ColumnType::Timestamp) => 1114, // timestamp
             Some(ColumnType::Varchar(_)) | Some(ColumnType::Nvarchar(_)) | Some(ColumnType::Text) => 25, // text
+            Some(ColumnType::Json) => 114, // json
+            Some(ColumnType::Array(_)) => 1007, // _text (text array)
+            Some(ColumnType::Uuid) => 2950, // uuid
+            Some(ColumnType::Bytea) => 17, // bytea
+            Some(ColumnType::Enum(_)) => 3500, // enum
             None => 20, // default: int8
         }
     }

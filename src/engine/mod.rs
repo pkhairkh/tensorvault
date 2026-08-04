@@ -3862,10 +3862,12 @@ fn default_cell_for_type(col_def: &crate::sql::ColumnDef, _row_count: usize) -> 
     match col_def.col_type {
         ColumnType::Int | ColumnType::BigInt | ColumnType::SmallInt
         | ColumnType::TinyInt | ColumnType::Bit | ColumnType::Boolean
-        | ColumnType::Date | ColumnType::Timestamp => 0,
+        | ColumnType::Date | ColumnType::Timestamp | ColumnType::Uuid => 0,
         ColumnType::Float | ColumnType::Real
         | ColumnType::Decimal(_, _) | ColumnType::Numeric(_, _) => 0.0f64.to_bits(),
-        ColumnType::Varchar(_) | ColumnType::Nvarchar(_) | ColumnType::Text => {
+        ColumnType::Varchar(_) | ColumnType::Nvarchar(_) | ColumnType::Text
+        | ColumnType::Json | ColumnType::Array(_) | ColumnType::Bytea
+        | ColumnType::Enum(_) => {
             // Empty string → hash of empty bytes (consistent with INSERT
             // of '' which goes through parse_value_cell).
             xxhash_rust::xxh3::xxh3_64(b"")

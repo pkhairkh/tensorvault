@@ -100,6 +100,11 @@ pub const KEYWORDS: &[&str] = &[
     "NUMERIC",
     "BIT",
     "BOOLEAN",
+    // Native type keywords (Wave 70)
+    "JSON",
+    "UUID",
+    "BYTEA",
+    "ENUM",
     "NULL",
     "DEFAULT",
     "PRIMARY",

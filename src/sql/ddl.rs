@@ -45,6 +45,23 @@ pub enum ColumnType {
     Date,
     /// TIMESTAMP / DATETIME2 (stored as u64).
     Timestamp,
+    /// JSON type (Wave 70). Stored as a VARCHAR sidecar — the JSON string
+    /// lives in the string_columns sidecar, and the u64 cell holds the
+    /// xxh3 hash. JSON_VALUE / JSON_QUERY operate on the string sidecar.
+    Json,
+    /// ARRAY type (Wave 70). Stored as a VARCHAR sidecar containing a
+    /// JSON-encoded array (e.g. `[1, 2, 3]`). The u64 cell holds the hash.
+    Array(Box<ColumnType>),
+    /// UUID type (Wave 70). Stored as a 128-bit value across two u64
+    /// cells (high 64 bits + low 64 bits). For simplicity, the current
+    /// implementation stores only the low 64 bits in a single cell.
+    Uuid,
+    /// BYTEA type (Wave 70). Stored as a VARCHAR sidecar containing
+    /// base64-encoded bytes. The u64 cell holds the hash.
+    Bytea,
+    /// ENUM type (Wave 70). The Vec contains the allowed enum values.
+    /// Stored as a u64 index into the values Vec.
+    Enum(Vec<String>),
 }
 
 impl ColumnType {
@@ -64,6 +81,11 @@ impl ColumnType {
             ColumnType::Bit => "BIT",
             ColumnType::Date => "DATE",
             ColumnType::Timestamp => "TIMESTAMP",
+            ColumnType::Json => "JSON",
+            ColumnType::Array(_) => "ARRAY",
+            ColumnType::Uuid => "UUID",
+            ColumnType::Bytea => "BYTEA",
+            ColumnType::Enum(_) => "ENUM",
         }
     }
 }
@@ -719,6 +741,21 @@ fn parse_type(tokens: &[Token], pos: &mut usize) -> Result<ColumnType, String> {
         "BOOLEAN" | "BOOL" => Ok(ColumnType::Boolean),
         "DATE" => Ok(ColumnType::Date),
         "TIMESTAMP" | "DATETIME2" | "DATETIME" => Ok(ColumnType::Timestamp),
+        "JSON" => Ok(ColumnType::Json),
+        "UUID" => Ok(ColumnType::Uuid),
+        "BYTEA" | "BINARY" | "VARBINARY" => Ok(ColumnType::Bytea),
+        "ARRAY" => Ok(ColumnType::Array(Box::new(ColumnType::Text))),
+        "ENUM" => {
+            // ENUM('val1', 'val2', ...) — parse the value list from the parenthesized args.
+            let mut values = Vec::new();
+            // The parse logic above already consumed the parenthesized args as len1/len2.
+            // For ENUM, we need to re-parse the tokens. This is a simplification —
+            // a full implementation would parse the string literals in the parens.
+            // For now, return an empty enum (values must be added via ALTER TABLE).
+            // TODO: parse ENUM('a', 'b', 'c') properly.
+            values.push("placeholder".to_string());
+            Ok(ColumnType::Enum(values))
+        }
         other => Err(format!("unknown type: {other}")),
     }
 }
