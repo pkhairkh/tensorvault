@@ -575,6 +575,31 @@ impl QueryEngine {
         // — and a `BEGIN; INSERT; ROLLBACK;` would still replay the INSERT.
         let trimmed = sql.trim();
         let lower = trimmed.to_lowercase();
+
+        // EXPLAIN: show the query plan (Wave 68).
+        if lower.starts_with("explain ") {
+            let inner_sql = &trimmed[8..];
+            return self.execute_explain(inner_sql, &start);
+        }
+        // ANALYZE: execute the query and return timing stats (Wave 68).
+        if lower.starts_with("analyze ") {
+            let inner_sql = &trimmed[8..];
+            return self.execute_analyze(inner_sql, &start);
+        }
+        // VACUUM: reclaim space from deleted rows (Wave 68).
+        if lower.starts_with("vacuum") {
+            return self.execute_vacuum(&start);
+        }
+        // COPY table TO 'file' / COPY table FROM 'file' (Wave 68).
+        if lower.starts_with("copy ") {
+            return self.execute_copy(trimmed, &start);
+        }
+        // CHECKPOINT: flush all dirty pages to disk (Wave 63/68).
+        if lower.starts_with("checkpoint") {
+            self.flush()?;
+            return Ok(QueryResult::empty());
+        }
+
         if lower.starts_with("begin") || lower.starts_with("start transaction") {
             let id = self
                 .txn_manager
@@ -866,6 +891,168 @@ impl QueryEngine {
                 tpch_result.elapsed_us = start.elapsed().as_micros() as u64;
                 Ok(tpch_result)
             }
+        }
+    }
+
+    /// Execute EXPLAIN: parse the inner SQL and return the query plan
+    /// as a text result (Wave 68).
+    fn execute_explain(&mut self, sql: &str, start: &Instant) -> Result<QueryResult> {
+        let (query, _extensions) = match crate::sql::parse_with_extensions(sql) {
+            Ok(qe) => qe,
+            Err(e) => return Err(Error::Parse(e)),
+        };
+        // Build a textual plan description.
+        let mut plan_lines = Vec::new();
+        plan_lines.push(format!("Query: {}", sql.trim()));
+        plan_lines.push(format!("Table: {}", query.from));
+        plan_lines.push(format!("Select items: {}", query.select.len()));
+        if !query.joins.is_empty() {
+            plan_lines.push(format!("Joins: {}", query.joins.len()));
+        }
+        if query.where_clause.is_some() {
+            plan_lines.push("Where: present".into());
+        }
+        if !query.group_by.is_empty() {
+            plan_lines.push(format!("Group By: {:?}", query.group_by));
+        }
+        if query.having.is_some() {
+            plan_lines.push("Having: present".into());
+        }
+        if !query.order_by.is_empty() {
+            plan_lines.push(format!("Order By: {} columns", query.order_by.len()));
+        }
+        if let Some(limit) = query.limit {
+            plan_lines.push(format!("Limit: {}", limit));
+        }
+        if query.distinct {
+            plan_lines.push("Distinct: true".into());
+        }
+        let table = self.catalog.get(&query.from);
+        if let Some(t) = table {
+            plan_lines.push(format!("Rows: {}", t.row_count));
+            plan_lines.push(format!("Columns: {}", t.column_names.join(", ")));
+        }
+        // Return as a single-column text result.
+        let plan_text = plan_lines.join("\n");
+        let mut result = QueryResult::empty();
+        result.row_count = 1;
+        result.columns = vec![ResultColumn {
+            name: "QUERY PLAN".into(),
+            values: vec![xxhash_rust::xxh3::xxh3_64(plan_text.as_bytes())],
+            string_values: Some(vec![plan_text]),
+            type_oid: 25,
+            null_mask: None,
+        }];
+        result.elapsed_us = start.elapsed().as_micros() as u64;
+        Ok(result)
+    }
+
+    /// Execute ANALYZE: run the inner query and return timing stats
+    /// (Wave 68). The result includes the query's output plus an
+    /// "execution_time_ms" column.
+    fn execute_analyze(&mut self, sql: &str, start: &Instant) -> Result<QueryResult> {
+        let inner_start = Instant::now();
+        let mut result = self.execute_inner(sql, start, None)?;
+        let elapsed = inner_start.elapsed();
+        // Append a timing column.
+        let timing_ms = elapsed.as_secs_f64() * 1000.0;
+        result.columns.push(ResultColumn {
+            name: "execution_time_ms".into(),
+            values: vec![timing_ms.to_bits()],
+            string_values: Some(vec![format!("{:.3}", timing_ms)]),
+            type_oid: 701,
+            null_mask: None,
+        });
+        result.elapsed_us = start.elapsed().as_micros() as u64;
+        Ok(result)
+    }
+
+    /// Execute VACUUM: reclaim space from deleted rows (Wave 68).
+    /// Currently a no-op placeholder — full vacuum requires page-level
+    /// compaction which depends on the page-level storage (Wave 63).
+    /// This implementation flushes the buffer pool and truncates the WAL.
+    fn execute_vacuum(&mut self, start: &Instant) -> Result<QueryResult> {
+        // Flush dirty pages.
+        self.flush()?;
+        // Truncate the WAL (all committed records are now on disk).
+        if let Some(ref mut wal) = self.wal {
+            wal.truncate().map_err(|e| Error::Other(format!("WAL truncate: {e}")))?;
+        }
+        let mut result = QueryResult::empty();
+        result.row_count = 0;
+        result.elapsed_us = start.elapsed().as_micros() as u64;
+        Ok(result)
+    }
+
+    /// Execute COPY: copy data between a table and a file (Wave 68).
+    /// Syntax: `COPY table TO 'file'` or `COPY table FROM 'file'`.
+    fn execute_copy(&mut self, sql: &str, start: &Instant) -> Result<QueryResult> {
+        let lower = sql.to_lowercase();
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        if parts.len() < 4 {
+            return Err(Error::Other("COPY requires: COPY <table> TO|FROM 'file'".into()));
+        }
+        let table_name = parts[1];
+        let direction = parts[2].to_uppercase();
+        // The file path is the 4th part, possibly quoted.
+        let file_path = parts[3].trim_matches(|c| c == '\'' || c == '"');
+        match direction.as_str() {
+            "TO" => {
+                // Export the table to a CSV file.
+                let table = self.catalog.get(table_name)
+                    .ok_or_else(|| Error::NotFound(format!("table '{}'", table_name)))?
+                    .clone();
+                let mut csv = String::new();
+                // Header row.
+                csv.push_str(&table.column_names.join(","));
+                csv.push('\n');
+                // Data rows.
+                for row in 0..table.row_count {
+                    let vals: Vec<String> = (0..table.columns.len())
+                        .map(|ci| table.columns[ci].get(row).copied().unwrap_or(0).to_string())
+                        .collect();
+                    csv.push_str(&vals.join(","));
+                    csv.push('\n');
+                }
+                std::fs::write(file_path, csv).map_err(|e| Error::Other(format!("write: {e}")))?;
+                let mut result = QueryResult::empty();
+                result.row_count = table.row_count;
+                result.elapsed_us = start.elapsed().as_micros() as u64;
+                Ok(result)
+            }
+            "FROM" => {
+                // Import from a CSV file.
+                let content = std::fs::read_to_string(file_path)
+                    .map_err(|e| Error::Other(format!("read: {e}")))?;
+                let lines: Vec<&str> = content.lines().collect();
+                if lines.is_empty() {
+                    return Err(Error::Other("CSV file is empty".into()));
+                }
+                // First line is the header — skip it (or use it to verify columns).
+                let mut count = 0;
+                for line in &lines[1..] {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let vals: Vec<String> = line.split(',').map(|s| s.trim().to_string()).collect();
+                    let val_strs: Vec<String> = vals.iter().map(|v| {
+                        // If it's a number, use it directly; otherwise quote it.
+                        if v.parse::<i64>().is_ok() || v.parse::<f64>().is_ok() {
+                            v.clone()
+                        } else {
+                            format!("'{}'", v)
+                        }
+                    }).collect();
+                    let insert_sql = format!("INSERT INTO {} VALUES ({})", table_name, val_strs.join(", "));
+                    self.execute_inner(&insert_sql, start, None)?;
+                    count += 1;
+                }
+                let mut result = QueryResult::empty();
+                result.row_count = count;
+                result.elapsed_us = start.elapsed().as_micros() as u64;
+                Ok(result)
+            }
+            _ => Err(Error::Other(format!("COPY direction must be TO or FROM, got: {}", direction))),
         }
     }
 

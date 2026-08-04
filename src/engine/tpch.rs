@@ -104,6 +104,9 @@ pub enum Expr2 {
     Exists { query: Box<SelectQuery2>, negated: bool },
     Case { whens: Vec<(Expr2, Expr2)>, else_: Option<Box<Expr2>> },
     Extract { field: String, expr: Box<Expr2> },
+    /// `CAST(expr AS target_type)` (Wave 67). The target_type is an
+    /// uppercased string ("INT", "FLOAT", "VARCHAR", "BIGINT").
+    Cast { expr: Box<Expr2>, target_type: String },
     Substr { expr: Box<Expr2>, start: Box<Expr2>, len: Box<Expr2> },
     Agg { func: AggFunc, arg: Box<Expr2>, distinct: bool },
     CountStar,
@@ -516,6 +519,7 @@ impl TpchParser {
                     }
                     "CASE" => self.parse_case(),
                     "EXTRACT" => { self.next(); self.parse_extract() },
+                    "CAST" => { self.next(); self.parse_cast() },
                     "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" => { self.next(); self.parse_agg_call(&ku) },
                         // Keyword as column name — check for func call
                     _ => {
@@ -535,6 +539,7 @@ impl TpchParser {
                     match lower.as_str() {
                         "substr" | "substring" => return self.parse_substr(),
                         "extract" => return self.parse_extract(),
+                        "cast" => return self.parse_cast(),
                         "exists" => {
                             self.expect_lp()?;
                             let sub = self.parse_select()?;
@@ -590,6 +595,28 @@ impl TpchParser {
         let expr = self.parse_expr()?;
         self.expect_rp()?;
         Ok(Expr2::Extract { field, expr: Box::new(expr) })
+    }
+
+    /// Parse `CAST(expr AS target_type)` (Wave 67).
+    /// The CAST keyword/ident is already consumed by the caller.
+    fn parse_cast(&mut self) -> Result<Expr2, String> {
+        self.expect_lp()?;
+        let expr = self.parse_expr()?;
+        self.expect_kw("AS")?;
+        // The target type is a keyword or identifier.
+        let target_type = self.parse_ident_name()?.to_uppercase();
+        // Optional (length) for VARCHAR(n) — consume and ignore.
+        if matches!(self.peek(), Token::LParen) {
+            self.next();
+            while !matches!(self.peek(), Token::RParen | Token::EOF) {
+                self.next();
+            }
+            if matches!(self.peek(), Token::RParen) {
+                self.next();
+            }
+        }
+        self.expect_rp()?;
+        Ok(Expr2::Cast { expr: Box::new(expr), target_type })
     }
 
     fn parse_substr(&mut self) -> Result<Expr2, String> {
@@ -3770,6 +3797,10 @@ impl<'a> TpchExec<'a> {
                 let v = self.eval(expr, t, row)?;
                 Ok(self.extract(field, &v))
             }
+            Expr2::Cast { expr, target_type } => {
+                let v = self.eval(expr, t, row)?;
+                Ok(self.cast_value(&v, target_type))
+            }
             Expr2::Substr { expr, start, len } => {
                 let sv = self.eval(expr, t, row)?;
                 let st = self.eval(start, t, row)?;
@@ -4054,6 +4085,59 @@ impl<'a> TpchExec<'a> {
             "month" => m as i64, "day" => d as i64, _ => y as i64,
         };
         Value2::Int(r)
+    }
+
+    /// Cast a Value2 to a target SQL type (Wave 67).
+    ///
+    /// Semantics per the Wave 67 spec:
+    /// - `FLOAT` / `DOUBLE` / `REAL` / `DECIMAL` / `NUMERIC`: reinterpret
+    ///   the u64 cell's bits as f64. (For an INT column with cell = 5,
+    ///   `CAST(col AS FLOAT)` yields `f64::from_bits(5)` ≈ 2.47e-322,
+    ///   NOT 5.0. The u64 cell value is preserved through the round-trip
+    ///   `f64::to_bits(f64::from_bits(5)) == 5`.)
+    /// - `INT` / `BIGINT` / `SMALLINT` / `TINYINT`: truncate to i64.
+    ///   (For a FLOAT column with cell = `f64::to_bits(3.14)`,
+    ///   `CAST(col AS INT)` yields 3.)
+    /// - `VARCHAR` / `NVARCHAR` / `TEXT`: stringify the value.
+    fn cast_value(&self, v: &Value2, target_type: &str) -> Value2 {
+        let upper = target_type.to_uppercase();
+        match upper.as_str() {
+            "FLOAT" | "DOUBLE" | "REAL" | "DECIMAL" | "NUMERIC" => {
+                // Reinterpret bits: take the u64 cell, treat as f64 bits.
+                match v {
+                    Value2::Int(i) => Value2::Float(f64::from_bits(*i as u64)),
+                    Value2::Float(f) => Value2::Float(*f),
+                    Value2::Date(d) => Value2::Float(f64::from_bits(*d as u64)),
+                    Value2::Str(s) => {
+                        // Strings can't be "reinterpreted" — parse as f64.
+                        Value2::Float(s.parse().unwrap_or(0.0))
+                    }
+                    Value2::Null => Value2::Null,
+                }
+            }
+            "INT" | "INTEGER" | "BIGINT" | "SMALLINT" | "TINYINT" => {
+                // Truncate to i64.
+                match v {
+                    Value2::Int(i) => Value2::Int(*i),
+                    Value2::Float(f) => Value2::Int(*f as i64),
+                    Value2::Date(d) => Value2::Int(*d as i64),
+                    Value2::Str(s) => Value2::Int(s.parse().unwrap_or(0)),
+                    Value2::Null => Value2::Null,
+                }
+            }
+            "VARCHAR" | "NVARCHAR" | "TEXT" | "CHAR" => {
+                // Stringify.
+                match v {
+                    Value2::Int(i) => Value2::Str(i.to_string()),
+                    Value2::Float(f) => Value2::Str(f.to_string()),
+                    Value2::Date(d) => Value2::Str(crate::types::Date(*d).to_iso()),
+                    Value2::Str(s) => Value2::Str(s.clone()),
+                    Value2::Null => Value2::Null,
+                }
+            }
+            // Unknown target type — return the value unchanged.
+            _ => v.clone(),
+        }
     }
 
     fn substr(&self, s: &Value2, start: &Value2, len: &Value2) -> Value2 {

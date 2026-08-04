@@ -158,6 +158,24 @@ pub enum Expr {
         /// The function argument as a raw string (e.g. `*`, `col`, `col1 * col2`).
         arg: String,
     },
+    /// `EXTRACT(field FROM expr)` (Wave 67). Extracts a sub-field (YEAR,
+    /// MONTH, DAY, etc.) from a date/timestamp expression. The field is
+    /// stored as an uppercased string; the expr is the date source.
+    Extract {
+        /// The field name, uppercased (e.g. `YEAR`, `MONTH`, `DAY`).
+        field: String,
+        /// The date/timestamp expression to extract from.
+        expr: Box<Expr>,
+    },
+    /// `CAST(expr AS target_type)` (Wave 67). Converts the expr to the
+    /// target type. The target_type is stored as an uppercased string
+    /// (e.g. `INT`, `FLOAT`, `VARCHAR`, `BIGINT`).
+    Cast {
+        /// The expression to convert.
+        expr: Box<Expr>,
+        /// The target type name, uppercased.
+        target_type: String,
+    },
 }
 
 /// Parse a token stream into a [`SelectQuery`].
@@ -378,8 +396,9 @@ impl Parser {
             return Ok(SelectItem::Star);
         }
         // Wave 60a: CASE WHEN expression in the SELECT list.
+        // Wave 67: EXTRACT / CAST also produce SelectItem::Expression.
         if let Token::Keyword(kw) = self.peek() {
-            if kw == "CASE" {
+            if kw == "CASE" || kw == "EXTRACT" || kw == "CAST" {
                 let expr = self.parse_expr()?;
                 let alias = self.parse_optional_alias()?;
                 return Ok(SelectItem::Expression { expr, alias });
@@ -863,6 +882,14 @@ impl Parser {
                 if kw_upper == "CASE" {
                     return self.parse_case();
                 }
+                // Wave 67: EXTRACT(field FROM expr).
+                if kw_upper == "EXTRACT" {
+                    return self.parse_extract();
+                }
+                // Wave 67: CAST(expr AS type).
+                if kw_upper == "CAST" {
+                    return self.parse_cast();
+                }
                 // Other keywords treated as identifiers
                 self.next();
                 Ok(Expr::Column(kw))
@@ -923,6 +950,72 @@ impl Parser {
         };
         self.expect_keyword("END")?;
         Ok(Expr::Case { when_clauses, else_clause })
+    }
+
+    /// Parse `EXTRACT(field FROM expr)` (Wave 67).
+    ///
+    /// Syntax: `EXTRACT ( YEAR FROM date_col )`, `EXTRACT(MONTH FROM col)`, etc.
+    /// The field is an identifier or keyword (YEAR, MONTH, DAY, HOUR, MINUTE,
+    /// SECOND). The expr can be any expression (typically a column reference
+    /// or a DATE literal).
+    fn parse_extract(&mut self) -> Result<Expr, String> {
+        self.expect_keyword("EXTRACT")?;
+        if !matches!(self.peek(), Token::LParen) {
+            return Err(format!("expected ( after EXTRACT, got {:?}", self.peek()));
+        }
+        self.next(); // consume (
+        // The field is a keyword (YEAR, MONTH, DAY, ...) or an identifier.
+        let field = match self.peek().clone() {
+            Token::Keyword(k) => k.to_uppercase(),
+            Token::Ident(s) => s.to_uppercase(),
+            other => return Err(format!("expected field name in EXTRACT, got {other:?}")),
+        };
+        self.next();
+        self.expect_keyword("FROM")?;
+        let expr = self.parse_expr()?;
+        if !matches!(self.peek(), Token::RParen) {
+            return Err(format!("expected ) after EXTRACT expr, got {:?}", self.peek()));
+        }
+        self.next(); // consume )
+        Ok(Expr::Extract { field, expr: Box::new(expr) })
+    }
+
+    /// Parse `CAST(expr AS target_type)` (Wave 67).
+    ///
+    /// Syntax: `CAST ( col AS INT )`, `CAST(col AS FLOAT)`, `CAST(col AS VARCHAR)`,
+    /// `CAST(col AS BIGINT)`. The target_type is a type keyword; the optional
+    /// `(length)` for VARCHAR is consumed but ignored.
+    fn parse_cast(&mut self) -> Result<Expr, String> {
+        self.expect_keyword("CAST")?;
+        if !matches!(self.peek(), Token::LParen) {
+            return Err(format!("expected ( after CAST, got {:?}", self.peek()));
+        }
+        self.next(); // consume (
+        let expr = self.parse_expr()?;
+        self.expect_keyword("AS")?;
+        // The target type is a keyword (INT, FLOAT, VARCHAR, BIGINT, etc.)
+        // or an identifier.
+        let target_type = match self.peek().clone() {
+            Token::Keyword(k) => k.to_uppercase(),
+            Token::Ident(s) => s.to_uppercase(),
+            other => return Err(format!("expected target type in CAST, got {other:?}")),
+        };
+        self.next();
+        // Optional (length) for VARCHAR(n) — consume and ignore.
+        if matches!(self.peek(), Token::LParen) {
+            self.next();
+            while !matches!(self.peek(), Token::RParen | Token::EOF) {
+                self.next();
+            }
+            if matches!(self.peek(), Token::RParen) {
+                self.next();
+            }
+        }
+        if !matches!(self.peek(), Token::RParen) {
+            return Err(format!("expected ) after CAST expr, got {:?}", self.peek()));
+        }
+        self.next(); // consume )
+        Ok(Expr::Cast { expr: Box::new(expr), target_type })
     }
 }
 
@@ -1301,6 +1394,149 @@ mod tests {
                 assert!(matches!(expr, Expr::Case { .. }));
             }
             other => panic!("expected Expression, got {other:?}"),
+        }
+    }
+
+    /// Wave 67: EXTRACT(YEAR FROM d) must parse to Expr::Extract.
+    #[test]
+    fn parse_extract_year() {
+        let q = parse_sql("SELECT EXTRACT(YEAR FROM d) FROM t").unwrap();
+        assert_eq!(q.select.len(), 1);
+        match &q.select[0] {
+            SelectItem::Expression { expr, alias } => {
+                assert!(alias.is_none());
+                match expr {
+                    Expr::Extract { field, expr } => {
+                        assert_eq!(field, "YEAR", "field must be YEAR (uppercased)");
+                        // The inner expr should be a Column("d").
+                        match expr.as_ref() {
+                            Expr::Column(name) => assert_eq!(name, "d"),
+                            other => panic!("expected Column(d), got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected Expr::Extract, got {other:?}"),
+                }
+            }
+            other => panic!("expected Expression, got {other:?}"),
+        }
+    }
+
+    /// Wave 67: EXTRACT with MONTH and DAY fields also parse.
+    #[test]
+    fn parse_extract_month_day() {
+        let q = parse_sql("SELECT EXTRACT(MONTH FROM d) FROM t").unwrap();
+        match &q.select[0] {
+            SelectItem::Expression { expr, .. } => {
+                match expr {
+                    Expr::Extract { field, .. } => assert_eq!(field, "MONTH"),
+                    other => panic!("expected Extract, got {other:?}"),
+                }
+            }
+            _ => panic!("expected Expression"),
+        }
+        let q = parse_sql("SELECT EXTRACT(DAY FROM d) FROM t").unwrap();
+        match &q.select[0] {
+            SelectItem::Expression { expr, .. } => {
+                match expr {
+                    Expr::Extract { field, .. } => assert_eq!(field, "DAY"),
+                    other => panic!("expected Extract, got {other:?}"),
+                }
+            }
+            _ => panic!("expected Expression"),
+        }
+    }
+
+    /// Wave 67: EXTRACT is case-insensitive (extract(year from d)).
+    #[test]
+    fn parse_extract_case_insensitive() {
+        let q = parse_sql("SELECT extract(year from d) FROM t").unwrap();
+        match &q.select[0] {
+            SelectItem::Expression { expr, .. } => {
+                match expr {
+                    Expr::Extract { field, .. } => assert_eq!(field, "YEAR"),
+                    other => panic!("expected Extract, got {other:?}"),
+                }
+            }
+            _ => panic!("expected Expression"),
+        }
+    }
+
+    /// Wave 67: CAST(x AS INT) must parse to Expr::Cast.
+    #[test]
+    fn parse_cast_int() {
+        let q = parse_sql("SELECT CAST(x AS INT) FROM t").unwrap();
+        assert_eq!(q.select.len(), 1);
+        match &q.select[0] {
+            SelectItem::Expression { expr, alias } => {
+                assert!(alias.is_none());
+                match expr {
+                    Expr::Cast { expr, target_type } => {
+                        assert_eq!(target_type, "INT", "target_type must be INT");
+                        match expr.as_ref() {
+                            Expr::Column(name) => assert_eq!(name, "x"),
+                            other => panic!("expected Column(x), got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected Expr::Cast, got {other:?}"),
+                }
+            }
+            other => panic!("expected Expression, got {other:?}"),
+        }
+    }
+
+    /// Wave 67: CAST with FLOAT, VARCHAR, BIGINT target types.
+    #[test]
+    fn parse_cast_other_types() {
+        for (sql, expected_type) in [
+            ("SELECT CAST(x AS FLOAT) FROM t", "FLOAT"),
+            ("SELECT CAST(x AS BIGINT) FROM t", "BIGINT"),
+            ("SELECT CAST(x AS VARCHAR) FROM t", "VARCHAR"),
+            ("SELECT CAST(x AS VARCHAR(50)) FROM t", "VARCHAR"),
+        ] {
+            let q = parse_sql(sql).unwrap();
+            match &q.select[0] {
+                SelectItem::Expression { expr, .. } => {
+                    match expr {
+                        Expr::Cast { target_type, .. } => {
+                            assert_eq!(*target_type, expected_type, "SQL: {sql}");
+                        }
+                        other => panic!("SQL {sql}: expected Cast, got {other:?}"),
+                    }
+                }
+                other => panic!("SQL {sql}: expected Expression, got {other:?}"),
+            }
+        }
+    }
+
+    /// Wave 67: CAST is case-insensitive (cast(x as int)).
+    #[test]
+    fn parse_cast_case_insensitive() {
+        let q = parse_sql("SELECT cast(x as int) FROM t").unwrap();
+        match &q.select[0] {
+            SelectItem::Expression { expr, .. } => {
+                match expr {
+                    Expr::Cast { target_type, .. } => assert_eq!(*target_type, "INT"),
+                    other => panic!("expected Cast, got {other:?}"),
+                }
+            }
+            _ => panic!("expected Expression"),
+        }
+    }
+
+    /// Wave 67: EXTRACT in WHERE clause must parse (not error).
+    #[test]
+    fn parse_extract_in_where() {
+        let q = parse_sql("SELECT * FROM t WHERE EXTRACT(YEAR FROM d) = 2024").unwrap();
+        let w = q.where_clause.expect("WHERE clause");
+        match w {
+            Expr::Binary { left, op, .. } => {
+                assert_eq!(op, "=");
+                match *left {
+                    Expr::Extract { field, .. } => assert_eq!(field, "YEAR"),
+                    other => panic!("expected Extract in WHERE left, got {other:?}"),
+                }
+            }
+            other => panic!("expected Binary in WHERE, got {other:?}"),
         }
     }
 }

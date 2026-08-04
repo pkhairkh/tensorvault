@@ -115,6 +115,14 @@ pub const KEYWORDS: &[&str] = &[
     "COLUMN",
     "TYPE",
     "INDEX",
+    // Wave 67: EXTRACT + CAST in basic parser.
+    "CAST",
+    "YEAR",
+    "MONTH",
+    "DAY",
+    "HOUR",
+    "MINUTE",
+    "SECOND",
 
     // DML keywords (Wave 4)
     "VALUES",

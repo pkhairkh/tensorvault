@@ -136,8 +136,10 @@ pub fn execute_dispatched(
     // dispatch path can't evaluate it (build_filter_mask / vectorized::filter_rows
     // don't handle Expr::Case). Return None so the query falls through to
     // the tpch interpreter, which evaluates CASE WHEN correctly.
+    // Wave 67: same for EXTRACT and CAST — the basic executor can't
+    // evaluate them per-row, so route to tpch.
     if let Some(ref where_expr) = query.where_clause {
-        if expr_contains_case(where_expr) {
+        if expr_needs_tpch_fallback(where_expr) {
             return None;
         }
     }
@@ -156,12 +158,15 @@ pub fn execute_dispatched(
     Some(execute_shape(shape, query, table))
 }
 
-/// Check whether an Expr contains a CASE WHEN expression (recursively).
-/// Used by execute_dispatched to route CASE WHEN queries to the tpch fallback.
-fn expr_contains_case(expr: &Expr) -> bool {
+/// Check whether an Expr contains a construct the basic dispatch path
+/// can't evaluate (CASE WHEN, EXTRACT, CAST). Used by execute_dispatched
+/// to route such queries to the tpch fallback.
+fn expr_needs_tpch_fallback(expr: &Expr) -> bool {
     match expr {
-        Expr::Case { .. } => true,
-        Expr::Binary { left, right, .. } => expr_contains_case(left) || expr_contains_case(right),
+        Expr::Case { .. } | Expr::Extract { .. } | Expr::Cast { .. } => true,
+        Expr::Binary { left, right, .. } => {
+            expr_needs_tpch_fallback(left) || expr_needs_tpch_fallback(right)
+        }
         Expr::Function { .. } => false,
         Expr::Column(_) | Expr::Literal(_) => false,
     }
