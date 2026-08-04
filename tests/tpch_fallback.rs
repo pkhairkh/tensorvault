@@ -112,15 +112,34 @@ fn case_when_in_select_through_engine() {
 }
 
 #[test]
-fn subquery_in_where() {
-    // Subquery in WHERE — the TPC-H interpreter supports IN with a list
-    // of values (a common subquery pattern). We test IN with explicit
-    // values here; full subquery support is tested in the tpch module's
-    // own integration tests.
+fn in_list_in_where() {
+    // Renamed from subquery_in_where — this test uses an IN LIST
+    // (`IN (1, 2)`), not a real subquery. The TPC-H interpreter supports
+    // IN with a list of literal values.
     let mut e = make_engine();
     let r = e.execute("SELECT count(*) FROM sales WHERE region IN (1, 2)").unwrap();
     // region IN (1,2): rows 1,2,3,4 → 4
     assert_eq!(r.scalar_u64(), Some(4));
+}
+
+/// Wave 58b: real subquery in WHERE — `WHERE region IN (SELECT region FROM
+/// sales WHERE amount > 250)`. The tpch interpreter parses the subquery,
+/// executes it to get the set of regions with amount > 250 (region 3 only,
+/// since row 5 has amount=250 which is NOT > 250, and row 4 has amount=300
+/// in region 2), and filters the outer query by membership in that set.
+#[test]
+fn subquery_in_where() {
+    let mut e = make_engine();
+    // Subquery returns regions where amount > 250.
+    // Row 4 (region 2, amount 300) → region 2 is in the subquery result.
+    // Row 5 (region 3, amount 250) → 250 is NOT > 250, so region 3 is NOT in the result.
+    // Outer query: SELECT count(*) FROM sales WHERE region IN (subquery)
+    // Rows matching region 2: rows 3 (region 2, amount 150) and 4 (region 2, amount 300).
+    // Total: 2 rows.
+    let r = e.execute("SELECT count(*) FROM sales WHERE region IN (SELECT region FROM sales WHERE amount > 250)");
+    assert!(r.is_ok(), "subquery in WHERE must execute; got: {:?}", r.err());
+    let r = r.unwrap();
+    assert_eq!(r.scalar_u64(), Some(2), "subquery must filter to 2 rows (region 2)");
 }
 
 #[test]

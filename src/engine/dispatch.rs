@@ -627,7 +627,11 @@ fn single_value(name: &str, value: u64) -> QueryResult {
 }
 
 fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
-    use crate::exec::flat_hash_table::{hash_group_by_flat, AggFunc};
+    // Wave 58a: removed unused imports `hash_group_by_flat` and `AggFunc`.
+    // These were left over from the Wave 49 multi-agg GROUP BY fix — the new
+    // implementation computes per-group aggregates directly via
+    // `group_buckets` (a FxHashMap<u64, Vec<usize>>) instead of calling
+    // `hash_group_by_flat`. The old import line triggered dead-code warnings.
     use fxhash::FxHashMap;
 
     // Filter rows
@@ -667,17 +671,16 @@ fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
     // first aggregate (used to drive `hash_group_by_flat` for the per-group
     // key→value map), then walk the SELECT list again to emit one column
     // per item (group-by column, literal, or aggregate) using that map.
+    //
+    // Wave 58a: removed the unused `first_agg` variable. It was computed
+    // to "drive the flat hash table" but the new implementation uses
+    // `group_buckets` (a FxHashMap) directly, so `first_agg` was never
+    // read. The only reference was `let _ = &first_agg;` at the bottom
+    // of the function, which existed solely to suppress the unused-variable
+    // warning.
     if group_cols.len() == 1 {
         let group_col = group_cols[0];
         let keys: Vec<u64> = indices.iter().map(|&i| table.columns[group_col][i]).collect();
-
-        // Find the first aggregate in the SELECT list to drive the flat hash
-        // table. Other aggregates will be computed separately below using the
-        // same per-group row-index buckets.
-        let first_agg = query.select.iter().find_map(|s| match s {
-            SelectItem::Aggregate { func, arg, alias } => Some((func.clone(), arg.clone(), alias.clone())),
-            _ => None,
-        });
 
         // Build per-group row-index buckets once, so every aggregate can
         // reuse them without re-scanning the input.
@@ -816,11 +819,6 @@ fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
                 }
             }
         }
-
-        // Suppress unused-variable warning when no aggregate is present
-        // (shape classifier guarantees at least one aggregate, but the
-        // compiler doesn't know that).
-        let _ = &first_agg;
 
         let row_count = group_keys_in_order.len();
         let mut result = QueryResult { columns: result_cols, row_count, elapsed_us: 0 };
