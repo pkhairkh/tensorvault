@@ -357,9 +357,9 @@ fn wal_replays_after_wave50_changes() {
     use tempfile::NamedTempFile;
     let tmp = NamedTempFile::new().unwrap();
     let mut wal = Wal::open(tmp.path()).unwrap();
-    wal.append(&WalRecord { txn_id: 0, sql: "CREATE TABLE t (id INT)".into(), is_commit: false, is_rollback: false }).unwrap();
-    wal.append(&WalRecord { txn_id: 0, sql: "INSERT INTO t VALUES (1)".into(), is_commit: false, is_rollback: false }).unwrap();
-    wal.append(&WalRecord { txn_id: 0, sql: "INSERT INTO t VALUES (2)".into(), is_commit: false, is_rollback: false }).unwrap();
+    wal.append(&WalRecord { txn_id: 0, sql: "CREATE TABLE t (id INT)".into(), is_commit: false, is_rollback: false, physical_change: None }).unwrap();
+    wal.append(&WalRecord { txn_id: 0, sql: "INSERT INTO t VALUES (1)".into(), is_commit: false, is_rollback: false, physical_change: None }).unwrap();
+    wal.append(&WalRecord { txn_id: 0, sql: "INSERT INTO t VALUES (2)".into(), is_commit: false, is_rollback: false, physical_change: None }).unwrap();
     wal.sync().unwrap();
 
     let mut e = QueryEngine::new();

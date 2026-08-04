@@ -10,8 +10,10 @@ pub mod sstable;
 pub mod tablet;
 pub mod wal;
 pub mod recovery;
+pub mod buffer_pool;
 
 pub use page::{Page, PageHeader, HEADER_SIZE, PAGE_CELLS, PAGE_SIZE};
 pub use sstable::{SsTableReader, SsTableWriter};
 pub use tablet::{Tablet, TabletId, REGION_SIZE, TABLET_REGIONS, TABLET_SIZE};
 pub use wal::{detect_zns, Wal, WalReader, WalRecord, WalZone, WalZoneState};
+pub use buffer_pool::{BufferPool, PageId};

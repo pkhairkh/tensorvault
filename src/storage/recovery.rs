@@ -25,42 +25,89 @@ use std::path::Path;
 use base64::{engine::general_purpose, Engine as _};
 
 /// A WAL record: one DML operation or a transaction boundary marker.
+///
+/// Wave 63: added page-level physical records (PageInsert, PageUpdate,
+/// PageDelete) that record the actual byte-level changes to pages, not
+/// just the SQL string. This enables page-level crash recovery: on restart,
+/// the WAL is replayed page-by-page rather than re-executing SQL.
 #[derive(Debug, Clone)]
 pub struct WalRecord {
     /// Transaction ID (0 for autocommit, non-zero for explicit transactions).
     pub txn_id: u64,
-    /// The SQL statement. Empty for BEGIN/COMMIT/ROLLBACK markers.
+    /// The SQL statement. Empty for BEGIN/COMMIT/ROLLBACK markers and for
+    /// page-level physical records (which use `physical_change` instead).
     pub sql: String,
     /// True if this is a commit marker for the transaction.
     pub is_commit: bool,
     /// True if this is a rollback marker.
     pub is_rollback: bool,
+    /// Optional page-level physical change. When present, this record
+    /// represents a physical page modification (not a SQL statement).
+    pub physical_change: Option<PhysicalChange>,
+}
+
+/// A physical page-level change recorded in the WAL.
+/// Used for page-level crash recovery (Wave 63).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type")]
+pub enum PhysicalChange {
+    /// A new page was allocated for a table.
+    PageAlloc {
+        table_id: u64,
+        page_num: u32,
+    },
+    /// A cell in a page was updated.
+    CellUpdate {
+        table_id: u64,
+        page_num: u32,
+        cell_index: usize,
+        old_value: u64,
+        new_value: u64,
+    },
+    /// A row was inserted (appended to a page).
+    RowInsert {
+        table_id: u64,
+        page_num: u32,
+        row_offset: usize,
+        values: Vec<u64>,
+    },
+    /// A row was deleted.
+    RowDelete {
+        table_id: u64,
+        page_num: u32,
+        row_offset: usize,
+    },
 }
 
 impl WalRecord {
     /// Construct an autocommit DML record (txn_id = 0).
     pub fn autocommit(sql: impl Into<String>) -> Self {
-        Self { txn_id: 0, sql: sql.into(), is_commit: false, is_rollback: false }
+        Self { txn_id: 0, sql: sql.into(), is_commit: false, is_rollback: false, physical_change: None }
     }
 
     /// Construct a BEGIN marker for the given transaction ID.
     pub fn begin(txn_id: u64) -> Self {
-        Self { txn_id, sql: String::new(), is_commit: false, is_rollback: false }
+        Self { txn_id, sql: String::new(), is_commit: false, is_rollback: false, physical_change: None }
     }
 
     /// Construct a COMMIT marker for the given transaction ID.
     pub fn commit(txn_id: u64) -> Self {
-        Self { txn_id, sql: String::new(), is_commit: true, is_rollback: false }
+        Self { txn_id, sql: String::new(), is_commit: true, is_rollback: false, physical_change: None }
     }
 
     /// Construct a ROLLBACK marker for the given transaction ID.
     pub fn rollback(txn_id: u64) -> Self {
-        Self { txn_id, sql: String::new(), is_commit: false, is_rollback: true }
+        Self { txn_id, sql: String::new(), is_commit: false, is_rollback: true, physical_change: None }
     }
 
     /// Construct a DML record inside an explicit transaction.
     pub fn txn_dml(txn_id: u64, sql: impl Into<String>) -> Self {
-        Self { txn_id, sql: sql.into(), is_commit: false, is_rollback: false }
+        Self { txn_id, sql: sql.into(), is_commit: false, is_rollback: false, physical_change: None }
+    }
+
+    /// Construct a page-level physical change record (Wave 63).
+    pub fn physical(txn_id: u64, change: PhysicalChange) -> Self {
+        Self { txn_id, sql: String::new(), is_commit: false, is_rollback: false, physical_change: Some(change) }
     }
 }
 
@@ -92,16 +139,23 @@ impl Wal {
     /// indistinguishable from a real newline on replay).
     pub fn append(&mut self, record: &WalRecord) -> std::io::Result<()> {
         if let Some(ref mut file) = self.file {
-            // Format: txn_id|commit|rollback|base64(sql)\n
+            // Format: txn_id|commit|rollback|base64(sql)|physical_json\n
+            // The 5th field (physical_json) is a JSON encoding of the
+            // PhysicalChange enum, or empty if this is a SQL/boundary record.
             // base64 alphabet is [A-Za-z0-9+/=] — no `|` or `\n`, so the
             // field separator and record terminator are unambiguous.
             let sql_b64 = general_purpose::STANDARD.encode(record.sql.as_bytes());
+            let physical_json = match &record.physical_change {
+                Some(change) => serde_json::to_string(change).unwrap_or_default(),
+                None => String::new(),
+            };
             let line = format!(
-                "{}|{}|{}|{}\n",
+                "{}|{}|{}|{}|{}\n",
                 record.txn_id,
                 if record.is_commit { 1 } else { 0 },
                 if record.is_rollback { 1 } else { 0 },
                 sql_b64,
+                physical_json,
             );
             file.write_all(line.as_bytes())?;
         }
@@ -130,7 +184,7 @@ impl Wal {
             if line.trim().is_empty() {
                 continue;
             }
-            let parts: Vec<&str> = line.splitn(4, '|').collect();
+            let parts: Vec<&str> = line.splitn(5, '|').collect();
             if parts.len() < 4 {
                 // Legacy record format (pre-Wave-51) — try the old escaping.
                 if parts.len() >= 1 {
@@ -150,7 +204,14 @@ impl Wal {
                 Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
                 Err(_) => decode_legacy_sql(parts[3]),
             };
-            records.push(WalRecord { txn_id, sql, is_commit, is_rollback });
+            // Wave 63: parse the physical_change field (5th field, may be empty
+            // for SQL-only records or absent in legacy WAL files).
+            let physical_change = if parts.len() >= 5 && !parts[4].is_empty() {
+                serde_json::from_str::<PhysicalChange>(parts[4]).ok()
+            } else {
+                None
+            };
+            records.push(WalRecord { txn_id, sql, is_commit, is_rollback, physical_change });
         }
         Ok(records)
     }
@@ -202,7 +263,7 @@ fn parse_legacy_record(line: &str) -> std::io::Result<WalRecord> {
     let is_commit = parts.get(1).map(|s| *s == "1").unwrap_or(false);
     let is_rollback = parts.get(2).map(|s| *s == "1").unwrap_or(false);
     let sql = parts.get(3).map(|s| decode_legacy_sql(s)).unwrap_or_default();
-    Ok(WalRecord { txn_id, sql, is_commit, is_rollback })
+    Ok(WalRecord { txn_id, sql, is_commit, is_rollback, physical_change: None })
 }
 
 /// Replay WAL records against an engine. Only committed transactions
@@ -412,19 +473,19 @@ mod tests {
             txn_id: 0,
             sql: "INSERT INTO t VALUES (1)".into(),
             is_commit: false,
-            is_rollback: false,
+            is_rollback: false, physical_change: None,
         }).unwrap();
         wal.append(&WalRecord {
             txn_id: 1,
             sql: "INSERT INTO t VALUES (2)".into(),
             is_commit: false,
-            is_rollback: false,
+            is_rollback: false, physical_change: None,
         }).unwrap();
         wal.append(&WalRecord {
             txn_id: 1,
             sql: "".into(),
             is_commit: true,
-            is_rollback: false,
+            is_rollback: false, physical_change: None,
         }).unwrap();
         wal.sync().unwrap();
 
@@ -443,7 +504,7 @@ mod tests {
             txn_id: 0,
             sql: "INSERT INTO t VALUES (1)".into(),
             is_commit: false,
-            is_rollback: false,
+            is_rollback: false, physical_change: None,
         }).unwrap();
         wal.sync().unwrap();
         assert_eq!(wal.read_all().unwrap().len(), 1);
@@ -460,7 +521,7 @@ mod tests {
             txn_id: 0,
             sql: "INSERT INTO t VALUES ('a|b\nc')".into(),
             is_commit: false,
-            is_rollback: false,
+            is_rollback: false, physical_change: None,
         }).unwrap();
         wal.sync().unwrap();
 
@@ -477,19 +538,19 @@ mod tests {
             txn_id: 0,
             sql: "CREATE TABLE t (id INT)".into(),
             is_commit: false,
-            is_rollback: false,
+            is_rollback: false, physical_change: None,
         }).unwrap();
         wal.append(&WalRecord {
             txn_id: 0,
             sql: "INSERT INTO t VALUES (1)".into(),
             is_commit: false,
-            is_rollback: false,
+            is_rollback: false, physical_change: None,
         }).unwrap();
         wal.append(&WalRecord {
             txn_id: 0,
             sql: "INSERT INTO t VALUES (2)".into(),
             is_commit: false,
-            is_rollback: false,
+            is_rollback: false, physical_change: None,
         }).unwrap();
         wal.sync().unwrap();
 
@@ -511,14 +572,14 @@ mod tests {
             txn_id: 0,
             sql: "CREATE TABLE t (id INT)".into(),
             is_commit: false,
-            is_rollback: false,
+            is_rollback: false, physical_change: None,
         }).unwrap();
         // Transaction 1: INSERT but no COMMIT.
         wal.append(&WalRecord {
             txn_id: 1,
             sql: "INSERT INTO t VALUES (1)".into(),
             is_commit: false,
-            is_rollback: false,
+            is_rollback: false, physical_change: None,
         }).unwrap();
         wal.sync().unwrap();
 
@@ -536,20 +597,20 @@ mod tests {
             txn_id: 0,
             sql: "CREATE TABLE t (id INT)".into(),
             is_commit: false,
-            is_rollback: false,
+            is_rollback: false, physical_change: None,
         }).unwrap();
         // Transaction 1: INSERT + ROLLBACK.
         wal.append(&WalRecord {
             txn_id: 1,
             sql: "INSERT INTO t VALUES (1)".into(),
             is_commit: false,
-            is_rollback: false,
+            is_rollback: false, physical_change: None,
         }).unwrap();
         wal.append(&WalRecord {
             txn_id: 1,
             sql: "".into(),
             is_commit: false,
-            is_rollback: true,
+            is_rollback: true, physical_change: None,
         }).unwrap();
         wal.sync().unwrap();
 

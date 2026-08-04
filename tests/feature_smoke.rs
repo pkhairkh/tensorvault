@@ -288,6 +288,7 @@ fn smoke_durability_wal() {
         sql: "CREATE TABLE t (id INT)".into(),
         is_commit: false,
         is_rollback: false,
+        physical_change: None,
     }).unwrap();
     wal.sync().unwrap();
 

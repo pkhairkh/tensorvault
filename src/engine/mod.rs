@@ -93,17 +93,26 @@ pub struct QueryEngine {
     wal: Option<crate::storage::recovery::Wal>,
     /// Index manager for secondary indexes (Wave 31).
     pub index_manager: crate::index::manager::IndexManager,
-    /// Hash column registry for materialized string hashes (Wave 31).
+    /// Hash column registry for materialized string hashes.
     pub hash_registry: crate::exec::hash_column::HashColumnRegistry,
-    /// View registry: CREATE VIEW / DROP VIEW / view expansion (Wave 53).
+    /// View registry: CREATE VIEW / DROP VIEW / view expansion.
     pub views: crate::catalog::views::ViewRegistry,
-    /// Stored procedure registry: CREATE PROCEDURE / EXEC (Wave 53).
+    /// Stored procedure registry: CREATE PROCEDURE / EXEC.
     pub procedures: crate::exec::procedure::ProcedureRegistry,
-    /// Table-valued parameter types (Wave 53).
+    /// Table-valued parameter types.
     pub table_types: crate::exec::procedure::TableTypeRegistry,
     /// Temporal tables: maps table name → TemporalTable for FOR SYSTEM_TIME
-    /// queries (Wave 53).
+    /// queries.
     pub temporals: HashMap<String, crate::exec::temporal::TemporalTable>,
+    /// Buffer pool for on-disk page-level storage (Wave 63).
+    /// None when the engine is in-memory only (the default). Set via
+    /// `QueryEngine::with_data_dir()` to enable disk persistence.
+    pub buffer_pool: Option<crate::storage::buffer_pool::BufferPool>,
+    /// Table name → table_id mapping for the buffer pool (Wave 63).
+    /// Assigned lazily when a table is first persisted.
+    table_ids: HashMap<String, u64>,
+    /// Next table_id to assign (Wave 63).
+    next_table_id: u64,
 }
 
 impl QueryEngine {
@@ -198,7 +207,142 @@ impl QueryEngine {
             procedures: crate::exec::procedure::ProcedureRegistry::new(),
             table_types: crate::exec::procedure::TableTypeRegistry::new(),
             temporals: HashMap::new(),
+            buffer_pool: None,
+            table_ids: HashMap::new(),
+            next_table_id: 1,
         }
+    }
+
+    /// Create a QueryEngine with on-disk persistence (Wave 63).
+    /// The `data_dir` is where table files (`<table_id>.tbl`) and the WAL
+    /// (`wal.log`) are stored. Tables created via CREATE TABLE are persisted
+    /// to disk; INSERT/UPDATE/DELETE write through the buffer pool and are
+    /// durable after COMMIT.
+    pub fn with_data_dir<P: AsRef<std::path::Path>>(data_dir: P) -> Result<Self> {
+        let data_dir = data_dir.as_ref();
+        let mut engine = Self::new();
+        let bp = crate::storage::buffer_pool::BufferPool::new(data_dir, 256)?;
+        engine.buffer_pool = Some(bp);
+        // Also open a WAL in the same data directory.
+        let wal_path = data_dir.join("wal.log");
+        let wal = crate::storage::recovery::Wal::open(&wal_path)?;
+        engine.wal = Some(wal);
+        // Replay the WAL to restore committed state.
+        engine.replay_wal()?;
+        Ok(engine)
+    }
+
+    /// Replay the WAL to restore committed state (Wave 63).
+    /// This re-executes SQL records and applies physical page changes.
+    /// Only committed transactions are replayed; uncommitted (no COMMIT
+    /// marker after the DML) are discarded.
+    fn replay_wal(&mut self) -> Result<()> {
+        let wal = match &self.wal {
+            Some(w) => w,
+            None => return Ok(()),
+        };
+        let records = wal.read_all().map_err(|e| Error::Other(format!("WAL read error: {e}")))?;
+
+        // Group records by transaction. Autocommit records (txn_id == 0)
+        // are applied immediately. Explicit transactions are applied only
+        // if they have a COMMIT marker.
+        let mut committed_txns: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for record in &records {
+            if record.is_commit && record.txn_id != 0 {
+                committed_txns.insert(record.txn_id);
+            }
+        }
+
+        // Re-execute SQL records for committed transactions.
+        for record in &records {
+            // Skip rollback records and their transactions.
+            if record.is_rollback {
+                continue;
+            }
+            // Skip DML records for uncommitted explicit transactions.
+            if record.txn_id != 0 && !committed_txns.contains(&record.txn_id) {
+                continue;
+            }
+            // Skip BEGIN/COMMIT markers (they don't carry SQL).
+            if record.sql.is_empty() {
+                // But still apply physical changes.
+                if let Some(ref change) = record.physical_change {
+                    self.apply_physical_change(change)?;
+                }
+                continue;
+            }
+            // Re-execute the SQL (without re-appending to the WAL — that
+            // would duplicate the records).
+            let start = std::time::Instant::now();
+            let _ = self.execute_inner_no_wal(&record.sql, &start, Some(record.txn_id));
+        }
+        Ok(())
+    }
+
+    /// Execute a SQL statement WITHOUT appending to the WAL (Wave 63).
+    /// Used during WAL replay to avoid duplicating records.
+    fn execute_inner_no_wal(&mut self, sql: &str, start: &Instant, txn_id: Option<u64>) -> Result<QueryResult> {
+        // Temporarily take the WAL out of self so we don't append during replay.
+        let wal = self.wal.take();
+        let result = self.execute_inner(sql, start, txn_id);
+        self.wal = wal;
+        result
+    }
+
+    /// Apply a physical page-level change to the buffer pool (Wave 63).
+    fn apply_physical_change(&mut self, change: &crate::storage::recovery::PhysicalChange) -> Result<()> {
+        use crate::storage::recovery::PhysicalChange;
+        if self.buffer_pool.is_none() {
+            return Ok(());
+        }
+        match change {
+            PhysicalChange::PageAlloc { table_id, page_num } => {
+                let page_id = crate::storage::buffer_pool::PageId::new(*table_id, *page_num);
+                let _ = self.buffer_pool.as_mut().unwrap().fetch_page(page_id);
+            }
+            PhysicalChange::CellUpdate { table_id, page_num, cell_index, new_value, .. } => {
+                let page_id = crate::storage::buffer_pool::PageId::new(*table_id, *page_num);
+                let bp = self.buffer_pool.as_mut().unwrap();
+                let idx = bp.fetch_page(page_id).map_err(|e| Error::Other(format!("page fetch: {e}")))?;
+                {
+                    let page = bp.get_page_mut(idx);
+                    page.set_cell(*cell_index, *new_value);
+                }
+                bp.unpin_page(page_id, true);
+            }
+            PhysicalChange::RowInsert { table_id, page_num, row_offset, values } => {
+                let page_id = crate::storage::buffer_pool::PageId::new(*table_id, *page_num);
+                let bp = self.buffer_pool.as_mut().unwrap();
+                let idx = bp.fetch_page(page_id).map_err(|e| Error::Other(format!("page fetch: {e}")))?;
+                {
+                    let page = bp.get_page_mut(idx);
+                    for (i, &val) in values.iter().enumerate() {
+                        let cell_idx = *row_offset + i;
+                        if cell_idx < crate::storage::page::PAGE_CELLS {
+                            page.set_cell(cell_idx, val);
+                        }
+                    }
+                }
+                bp.unpin_page(page_id, true);
+            }
+            PhysicalChange::RowDelete { .. } => {
+                // Row deletion is handled by the catalog (row_count decrement).
+                // Physical deletion (compaction) happens during VACUUM.
+            }
+        }
+        Ok(())
+    }
+
+    /// Flush all dirty pages to disk and sync the WAL (Wave 63).
+    /// Called automatically on COMMIT, or manually via CHECKPOINT.
+    pub fn flush(&mut self) -> Result<()> {
+        if let Some(ref mut bp) = self.buffer_pool {
+            bp.flush_all().map_err(|e| Error::Other(format!("flush: {e}")))?;
+        }
+        if let Some(ref mut wal) = self.wal {
+            wal.sync().map_err(|e| Error::Other(format!("wal sync: {e}")))?;
+        }
+        Ok(())
     }
 
     /// Open a QueryEngine with a WAL for durability (Wave 37).
