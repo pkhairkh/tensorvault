@@ -65,6 +65,12 @@ memchr = "2"
 # the literal bytes `\n` could not be distinguished from a real newline
 # on replay. Base64 sidesteps the problem entirely.
 base64 = "0.22"
+# Wave 65: SCRAM-SHA-256 authentication for pgwire. The server stores
+# salted password hashes (PBKDF2-HMAC-SHA-256) and verifies the SCRAM
+# client proof on each connection when auth_required = true.
+sha2 = "0.10"
+hmac = "0.12"
+pbkdf2 = { version = "0.12", default-features = false }
 
 [dev-dependencies]
 tempfile = "3.10"
