@@ -1,4 +1,10 @@
-//! **WIRED INTO SQL EXECUTION (Wave 53)** — this module is reachable through QueryEngine::execute() via the dispatch path in engine/mod.rs.
+//! **WIRED INTO SQL EXECUTION (Wave 53, fixed Wave 56a)** — this module is
+//! reachable through `QueryEngine::execute()` via `parse_merge` in
+//! `engine/mod.rs`. Wave 56a fixed a critical bug where `parse_merge`
+//! hardcoded `source_rows = Vec::new()`, leaving the WHEN MATCHED branch
+//! dead. The parser now extracts source rows from `USING (VALUES ...) AS
+//! source(cols)` and resolves `source.col` references in INSERT/UPDATE
+//! actions via the `resolve_val` helper.
 //! # MERGE statement + TRY_CONVERT/TRY_CAST (Wave 10).
 //!
 //! MERGE: upsert operation that INSERTs new rows, UPDATEs matching rows,

@@ -5,7 +5,7 @@
 1. Clone the repo
 2. Install Rust 1.97+ (`rustup install stable`)
 3. `cargo build` — must compile clean
-4. `cargo test --lib --tests` — all 1100+ tests must pass (1046 lib + 50+ integration)
+4. `cargo test --lib --tests` — all 1331+ tests must pass (1048 lib + 283 integration)
 5. `cargo fmt --check` — must pass
 6. `cargo clippy` — should pass (warnings are tolerated; `-D warnings` is aspirational)
 

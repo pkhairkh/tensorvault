@@ -1,4 +1,10 @@
-//! **WIRED INTO SQL EXECUTION (Wave 53)** — this module is reachable through QueryEngine::execute() via the dispatch path in engine/mod.rs.
+//! **WIRED INTO SQL EXECUTION (Wave 53, fixed Wave 56d)** — this module is
+//! reachable through `QueryEngine::execute()` via `parse_for_system_time` in
+//! `engine/mod.rs`. Wave 56d added DDL support: `CREATE TABLE ... WITH
+//! (SYSTEM_VERSIONING = ON)` now registers the table in `self.temporals`,
+//! and `execute_insert` / `execute_update` / `execute_delete` sync changes
+//! to the `TemporalTable` sidecar so `FOR SYSTEM_TIME AS OF <ts>` returns
+//! the correct historical state.
 //! # Temporal tables (Wave 11).
 //!
 //! Implements system-versioned temporal tables: every UPDATE/DELETE on a

@@ -1,3 +1,21 @@
+//! **WIRED INTO SQL EXECUTION (Wave 56c)** — this module is reachable
+//! through `QueryEngine::execute()` via `execute_with_json_value` in
+//! `engine/mod.rs`. The engine detects `JSON_VALUE(col, 'path')` and
+//! `JSON_QUERY(col, 'path')` in the SQL string, rewrites each call to
+//! `col` (tracking the SELECT-list position), executes the rewritten SQL,
+//! and post-processes the result by applying `json_value()` / `json_query()`
+//! to each string value in the corresponding column. Wave 56c also fixed
+//! `execute_insert` to preserve original strings in the `string_columns`
+//! sidecar for VARCHAR / NVARCHAR / TEXT columns (previously strings were
+//! hashed to u64 and the original was lost, so JSON_VALUE / LIKE / range
+//! comparisons on inserted strings were broken).
+//!
+//! Supported SQL syntax:
+//! ```sql
+//!   SELECT JSON_VALUE(payload, '$.name') FROM docs
+//!   SELECT JSON_VALUE(payload, '$.name') AS username FROM docs
+//!   SELECT JSON_QUERY(payload, '$.user') FROM docs
+//! ```
 //! # JSON functions (Wave 9).
 //!
 //! Implements: JSON_VALUE, JSON_QUERY, JSON_MODIFY, ISJSON, FOR JSON PATH.

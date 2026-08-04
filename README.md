@@ -192,5 +192,12 @@ See `ARCHITECTURE.md` and `docs/` for the full design.
 
 ## License
 
-MIT OR Apache-2.0. (The `Cargo.toml` says `CCL-X-1.2` for historical reasons;
-the effective license is MIT OR Apache-2.0 — pick one.)
+CCL-X (Civil Common License X), Version 1.2 — see `LICENSE.md` for the full
+text. The `Cargo.toml` declares `license = "CCL-X-1.2"` and the LICENSE.md
+file in the repo root is the canonical CCL-X v1.2 text. All three sources
+(README, Cargo.toml, LICENSE.md) now agree on CCL-X-1.2.
+
+(Wave 59a fix: the previous README claimed "MIT OR Apache-2.0" and called
+the Cargo.toml value "historical" — but no MIT or Apache LICENSE file
+existed in the repo, and LICENSE.md was already CCL-X. This was a fake
+license claim. Corrected to match the actual license file.)

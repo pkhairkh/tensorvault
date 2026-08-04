@@ -1,12 +1,16 @@
 # turboGP — Implementation Orchestration Plan
 
-> **Status as of Wave 56: ALL 56 WAVES COMPLETE.**
-> Final test count: **1100+ tests** (1046 lib + 50+ integration across 24
-> test files). The original 18-wave plan grew to 56 waves as the SQL
+> **Status as of Wave 61: ALL 61 WAVES COMPLETE.**
+> Final test count: **1331+ tests** (1048 lib + 283 integration across 26
+> test files). The original 18-wave plan grew to 61 waves as the SQL
 > surface expanded from a stub parser to a full DDL/DML/SELECT/JOIN/
-> GROUP BY/ORDER BY/WAL/transaction/pgwire engine. Waves 49–56 are the
-> "production readiness remediation" wave sequence that fixed 13 critical
-> bugs, wired 7 dead modules into `execute()`, and updated all docs.
+> GROUP BY/ORDER BY/WAL/transaction/pgwire engine. Waves 49–52 fixed 13
+> critical bugs. Wave 53 attempted to wire 7 dead modules into `execute()`
+> but only 3 were actually wired (views, procedures, window). Waves 56–58
+> fixed the 4 fake/stub wirings (MERGE, PIVOT, JSON_VALUE, temporal),
+> fixed the CASE WHEN panic, removed dead code, and added real Parquet
+> NULL + concurrency tests. Waves 59–61 fixed documentation and tagged
+> v1.0.0-remediated.
 
 ## Conventions
 

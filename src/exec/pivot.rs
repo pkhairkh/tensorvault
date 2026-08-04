@@ -1,3 +1,16 @@
+//! **WIRED INTO SQL EXECUTION (Wave 56b)** — this module is reachable
+//! through `QueryEngine::execute()` via `parse_pivot_clause` in
+//! `engine/mod.rs`. The engine detects `PIVOT (...)` in the SQL string,
+//! parses the spec (agg, value_col, pivot_col, pivot_values), strips the
+//! PIVOT clause, executes the underlying SELECT, and applies `pivot()` to
+//! the result. The group_col is auto-detected as the first input column
+//! that's neither the pivot_col nor the value_col.
+//!
+//! Supported SQL syntax:
+//! ```sql
+//!   SELECT * FROM sales PIVOT (SUM(amt) FOR qtr IN (1, 2)) AS p
+//!   SELECT * FROM sales PIVOT (COUNT(*) FOR qtr IN ('Q1', 'Q2'))
+//! ```
 //! # PIVOT / UNPIVOT / GROUPING SETS executor (Wave 8).
 //!
 //! Implements:

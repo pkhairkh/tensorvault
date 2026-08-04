@@ -7,7 +7,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [1.0.0-remediated] — 2026-08-04
 
-### Production readiness remediation (Waves 49–56)
+### Production readiness remediation (Waves 49–61)
 
 #### Fixed (13 critical bugs)
 - **LEFT JOIN** silently executed as INNER JOIN (Wave 49)
@@ -24,24 +24,54 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 - **pgwire** Describe executed the query; now returns NoData without executing (Wave 52)
 - **pgwire** max_rows was discarded; now honours cursor-style Execute (Wave 52)
 
-#### Added (dead modules wired into execute())
+#### Fixed (Wave 56–58: fake/stub wirings and dead code)
+- **MERGE** (Wave 56a): `parse_merge` hardcoded `source_rows = Vec::new()` — the
+  WHEN MATCHED branch was dead code. Now parses `USING (VALUES ...) AS source(cols)`
+  and resolves `source.col` references in INSERT/UPDATE actions.
+- **PIVOT** (Wave 56b): `extensions_pivot()` always returned None — dead code.
+  Now detects `PIVOT (...)` in the SQL string, strips it, executes the underlying
+  SELECT, and applies `pivot::pivot()` to the result.
+- **JSON_VALUE** (Wave 56c): not parsed by any executor. Now intercepts
+  `JSON_VALUE(col, 'path')` / `JSON_QUERY(col, 'path')` in the SQL, rewrites
+  to `col`, executes, and post-processes with `json::json_value()`. Also fixed
+  `execute_insert` to preserve original strings in the `string_columns` sidecar
+  for VARCHAR/NVARCHAR/TEXT columns (previously strings were hashed and lost).
+- **Temporal DDL** (Wave 56d): temporal tables only worked via the Rust API.
+  Now `CREATE TABLE ... WITH (SYSTEM_VERSIONING = ON)` registers the table in
+  `self.temporals`, and INSERT/UPDATE/DELETE sync to the TemporalTable sidecar.
+- **CASE WHEN panic** (Wave 57): `tpch.rs:3584` panicked with index-out-of-bounds
+  because `tpch_col_types()` returned an empty Vec for user-created tables.
+  Fixed `ExecTable::from_catalog` to infer types from the table's schema.
+- **Dead code** (Wave 58a): removed unused `hash_group_by_flat`, `AggFunc`
+  imports and `first_agg` variable from `execute_group_by`.
+- **Lying test** (Wave 58b): `subquery_in_where` tested `IN (1, 2)` not a real
+  subquery. Renamed to `in_list_in_where` and added a real `subquery_in_where`
+  test using `IN (SELECT ...)`.
+
+#### Added (real wirings through engine.execute())
 - **Views**: CREATE VIEW / DROP VIEW / SELECT FROM view (materialization) (Wave 53)
 - **Procedures**: CREATE PROCEDURE / EXEC with positional params (Wave 53)
-- **MERGE**: MERGE INTO ... WHEN MATCHED THEN UPDATE/DELETE/INSERT (Wave 53)
-- **JSON**: json_value, json_query, json_modify, is_json (module-level) (Wave 53)
-- **Temporal**: FOR SYSTEM_TIME AS OF <timestamp> (Wave 53)
+- **MERGE**: MERGE INTO ... USING (VALUES ...) ... WHEN MATCHED / NOT MATCHED (Wave 56a)
+- **JSON_VALUE / JSON_QUERY**: SELECT JSON_VALUE(col, '$.path') FROM t (Wave 56c)
+- **Temporal**: CREATE TABLE ... WITH (SYSTEM_VERSIONING = ON) + FOR SYSTEM_TIME AS OF (Wave 56d)
 - **Window functions**: ROW_NUMBER, RANK, DENSE_RANK, SUM, COUNT with OVER (...) (Wave 53)
-- **PIVOT**: pivot() function callable (SQL parsing deferred) (Wave 53)
+- **PIVOT**: SELECT * FROM t PIVOT (SUM(amt) FOR qtr IN (...)) AS p (Wave 56b)
+- **Parquet NULL test**: real Parquet file with NULLs, count(col) excludes NULLs (Wave 58c)
+- **Concurrency test**: 2 TCP clients, concurrent SELECT + INSERT, no deadlock (Wave 58d)
+- **CASE WHEN**: works through engine.execute() in WHERE and SELECT (Wave 57)
+- **Real subquery**: IN (SELECT ...) works through engine.execute() (Wave 58b)
 
 #### Documentation
 - README.md: fixed repo layout, updated research agenda, added "Current SQL Surface" and "Known Limitations" sections
+- README.md: fixed license — now consistently CCL-X-1.2 across README, Cargo.toml, LICENSE.md (Wave 59a)
 - ARCHITECTURE.md: replaced DAG executor description with dispatch-based flow, added CXL/RoCEv2 stub warnings
-- ORCHESTRATION.md: added waves 19-56, updated test count from 554 to 1100+
+- ORCHESTRATION.md: added waves 19-61, updated test count to actual (Wave 59d)
 - ROADMAP.md: updated feature table with actual implementation status
 - CHANGELOG.md: added v0.3.0 through v1.0.0-remediated entries
 - CONTRIBUTING.md: fixed test count, updated build instructions
 - ADRs: added status notes to ADR-011 (ZNS WAL is not production WAL), ADR-018 (morsel executor not used), ADR-019 (DPccp not wired)
-- Module doc comments: marked 10 dead modules with "NOT WIRED INTO SQL EXECUTION" notices
+- Module doc comments: marked 7 dead modules with "NOT WIRED INTO SQL EXECUTION" notices (Wave 59c: corrected count from 10 to 7 — the previous count was inflated)
+- Cargo.toml: bumped version from 0.2.0 to 1.0.0 to match CHANGELOG (Wave 59b)
 
 ## [0.9.0] — 2026-07-29
 
