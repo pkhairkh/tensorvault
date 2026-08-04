@@ -1,13 +1,21 @@
-//! # Transaction manager (Wave 5).
+//! # Transaction manager.
 //!
-//! Implements snapshot isolation: on `BEGIN`, the current catalog is
-//! deep-cloned into a transaction snapshot. All DML within the transaction
-//! operates on the snapshot. On `COMMIT`, the snapshot replaces the main
-//! catalog. On `ROLLBACK`, the snapshot is discarded.
+//! Two implementations coexist:
+//! - [`TxnManager`]: the original deep-clone snapshot isolation (kept for
+//!   backward compatibility). On `BEGIN`, the entire catalog is deep-cloned.
+//! - [`MvccTxnManager`]: real multi-version concurrency control (Wave 64).
+//!   Uses `(xmin, xmax)` version chains per row instead of deep-cloning.
+//!   The engine uses MvccTxnManager when available; TxnManager remains as
+//!   a fallback for code paths that haven't been migrated.
 //!
-//! This is the simplest correct isolation level — concurrent transactions
-//! don't see each other's writes. Full MVCC (multi-version concurrency
-//! control with row-level snapshots) arrives in a later wave.
+//! ## Snapshot isolation vs MVCC
+//!
+//! The deep-clone approach is O(total_rows) per BEGIN — expensive for large
+//! tables. MVCC is O(1) per BEGIN (just record the snapshot timestamp) and
+//! O(1) per row visibility check.
+
+pub mod mvcc;
+pub use mvcc::{MvccTxnManager, MvccTransaction, RowVersion, TxnState};
 
 use crate::catalog::Catalog;
 use std::collections::HashMap;
