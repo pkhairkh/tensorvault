@@ -1,8 +1,8 @@
 # turboGP — Implementation Orchestration Plan
 
-> **Status as of Wave 61: ALL 61 WAVES COMPLETE.**
-> Final test count: **1331+ tests** (1048 lib + 283 integration across 26
-> test files). The original 18-wave plan grew to 61 waves as the SQL
+> **Status as of Wave 62: ALL 62 WAVES COMPLETE.**
+> Final test count: **1342 tests** (1048 lib + 294 integration across 31
+> test files). The original 18-wave plan grew to 62 waves as the SQL
 > surface expanded from a stub parser to a full DDL/DML/SELECT/JOIN/
 > GROUP BY/ORDER BY/WAL/transaction/pgwire engine. Waves 49–52 fixed 13
 > critical bugs. Wave 53 attempted to wire 7 dead modules into `execute()`
@@ -10,7 +10,10 @@
 > fixed the 4 fake/stub wirings (MERGE, PIVOT, JSON_VALUE, temporal),
 > fixed the CASE WHEN panic, removed dead code, and added real Parquet
 > NULL + concurrency tests. Waves 59–61 fixed documentation and tagged
-> v1.0.0-remediated.
+> v1.0.0-remediated. Wave 62 fixed the HAVING parser bug (basic parser
+> now parses `count(*)` in expressions), removed the `eval_case_row` dead
+> code, and corrected documentation overstatements about CASE WHEN
+> dispatch.
 
 ## Conventions
 

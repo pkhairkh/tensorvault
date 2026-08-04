@@ -148,6 +148,16 @@ pub enum Expr {
         /// Optional ELSE clause (defaults to NULL/0).
         else_clause: Option<Box<Expr>>,
     },
+    /// A function call (Wave 62 fix). Used in HAVING expressions to represent
+    /// aggregate calls like `count(*)`, `sum(col)`, `avg(col)`. The executor
+    /// evaluates the function against the current group's row set.
+    /// The `arg` is `*` for COUNT(*), a column name, or empty for no-arg funcs.
+    Function {
+        /// The function name, uppercased (e.g. `COUNT`, `SUM`, `AVG`).
+        name: String,
+        /// The function argument as a raw string (e.g. `*`, `col`, `col1 * col2`).
+        arg: String,
+    },
 }
 
 /// Parse a token stream into a [`SelectQuery`].
@@ -859,6 +869,24 @@ impl Parser {
             }
             Token::Ident(name) => {
                 self.next();
+                // Wave 62 fix: if the next token is '(', this is a function
+                // call (e.g. count(*), sum(col), avg(col)). Parse it as
+                // Expr::Function so HAVING expressions can reference aggregates.
+                // Previously, parse_primary returned Expr::Column(name) and
+                // left the '(' unconsumed, causing "unexpected trailing token:
+                // LParen" errors.
+                if matches!(self.peek(), Token::LParen) {
+                    self.next(); // consume (
+                    let arg = self.parse_agg_arg()?;
+                    if !matches!(self.peek(), Token::RParen) {
+                        return Err(format!("expected ) after function args, got {:?}", self.peek()));
+                    }
+                    self.next(); // consume )
+                    return Ok(Expr::Function {
+                        name: name.to_uppercase(),
+                        arg,
+                    });
+                }
                 Ok(Expr::Column(name))
             }
             Token::LParen => {
@@ -1196,5 +1224,83 @@ mod tests {
         assert_eq!(q.group_by, vec!["URL"]);
         assert_eq!(q.order_by, vec![("c".to_string(), false)]);
         assert_eq!(q.limit, Some(10));
+    }
+
+    /// Wave 62 fix: HAVING with count(*) must parse without error.
+    /// Previously, parse_primary didn't handle `IDENT(` as a function call
+    /// in expression context, causing "unexpected trailing token: LParen".
+    #[test]
+    fn parse_having_with_count_star() {
+        let q = parse_sql("SELECT dept, count(*) FROM t GROUP BY dept HAVING count(*) > 1").unwrap();
+        assert!(q.having.is_some(), "HAVING clause must be parsed");
+        // Verify the HAVING expression is a Binary comparison.
+        match &q.having {
+            Some(Expr::Binary { left, op, right }) => {
+                assert_eq!(op, ">");
+                // Left should be Expr::Function { name: "COUNT", arg: "*" }
+                match left.as_ref() {
+                    Expr::Function { name, arg } => {
+                        assert_eq!(name, "COUNT");
+                        assert_eq!(arg, "*");
+                    }
+                    other => panic!("expected Function, got {other:?}"),
+                }
+                // Right should be Literal(Int(1))
+                match right.as_ref() {
+                    Expr::Literal(Value::Int(1)) => {}
+                    other => panic!("expected Int(1), got {other:?}"),
+                }
+            }
+            other => panic!("expected Binary, got {other:?}"),
+        }
+    }
+
+    /// Wave 62 fix: HAVING with sum(col) must also parse.
+    #[test]
+    fn parse_having_with_sum() {
+        let q = parse_sql("SELECT dept FROM t GROUP BY dept HAVING sum(salary) > 400").unwrap();
+        assert!(q.having.is_some());
+        match &q.having {
+            Some(Expr::Binary { left, op, .. }) => {
+                assert_eq!(op, ">");
+                match left.as_ref() {
+                    Expr::Function { name, arg } => {
+                        assert_eq!(name, "SUM");
+                        assert_eq!(arg, "salary");
+                    }
+                    other => panic!("expected Function, got {other:?}"),
+                }
+            }
+            other => panic!("expected Binary, got {other:?}"),
+        }
+    }
+
+    /// Wave 60d: SELECT DISTINCT must parse and set the distinct flag.
+    #[test]
+    fn parse_select_distinct() {
+        let q = parse_sql("SELECT DISTINCT dept FROM t").unwrap();
+        assert!(q.distinct, "distinct flag must be true");
+        assert_eq!(q.select.len(), 1);
+    }
+
+    /// SELECT without DISTINCT must have distinct = false.
+    #[test]
+    fn parse_select_without_distinct() {
+        let q = parse_sql("SELECT dept FROM t").unwrap();
+        assert!(!q.distinct, "distinct flag must be false");
+    }
+
+    /// Wave 60a: CASE WHEN in SELECT list must parse as SelectItem::Expression.
+    #[test]
+    fn parse_case_when_in_select() {
+        let q = parse_sql("SELECT CASE WHEN x > 5 THEN 1 ELSE 0 END FROM t").unwrap();
+        assert_eq!(q.select.len(), 1);
+        match &q.select[0] {
+            SelectItem::Expression { expr, alias } => {
+                assert!(alias.is_none());
+                assert!(matches!(expr, Expr::Case { .. }));
+            }
+            other => panic!("expected Expression, got {other:?}"),
+        }
     }
 }

@@ -7,7 +7,25 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [1.0.0-remediated] — 2026-08-04
 
-### Production readiness remediation (Waves 49–61)
+### Production readiness remediation (Waves 49–62)
+
+#### Wave 62 fixes (audit-response)
+- **HAVING parser bug fixed**: the basic parser's `parse_primary` didn't
+  handle `IDENT (` as a function call in expression context, so
+  `HAVING count(*) > N` errored with "unexpected trailing token: LParen".
+  Added `Expr::Function` variant and function-call parsing in `parse_primary`.
+  HAVING queries still execute through tpch (the basic executor can't
+  evaluate aggregates in HAVING), but the parser now SUCCEEDS instead of
+  erroring — the difference is explicit routing vs error-fallback.
+- **Dead code removed**: `eval_case_row` at `dispatch.rs:1462` was added in
+  Wave 60a but never called (CASE WHEN goes to tpch). Removed.
+- **CASE WHEN documentation corrected**: Wave 60a claimed CASE WHEN goes
+  through "the fast dispatch path". It doesn't — `classify_query` marks
+  `SelectItem::Expression` as `Complex`, and `execute_dispatched` returns
+  None for CASE in WHERE. CASE WHEN goes through the tpch interpreter.
+  The basic parser PARSES it correctly; the basic executor does NOT execute it.
+- **ORCHESTRATION.md test count corrected**: was "1331+ / 26 files",
+  now "1342 / 31 files" (the actual count).
 
 #### Fixed (13 critical bugs)
 - **LEFT JOIN** silently executed as INNER JOIN (Wave 49)
@@ -58,7 +76,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 - **PIVOT**: SELECT * FROM t PIVOT (SUM(amt) FOR qtr IN (...)) AS p (Wave 56b)
 - **Parquet NULL test**: real Parquet file with NULLs, count(col) excludes NULLs (Wave 58c)
 - **Concurrency test**: 2 TCP clients, concurrent SELECT + INSERT, no deadlock (Wave 58d)
-- **CASE WHEN**: works through engine.execute() in WHERE and SELECT (Wave 57)
+- **CASE WHEN**: works through engine.execute() via tpch fallback (Wave 57).
+  The basic parser PARSES `Expr::Case` correctly (Wave 60a), but the basic
+  executor does NOT evaluate it — `classify_query` marks `Expression` items
+  as `Complex`, and `execute_dispatched` returns None for CASE in WHERE.
+  CASE WHEN queries execute through the tpch interpreter, not the fast
+  dispatch path.
 - **Real subquery**: IN (SELECT ...) works through engine.execute() (Wave 58b)
 
 #### Documentation

@@ -39,6 +39,15 @@ pub fn execute_select(
     kernel_table: &KernelTable,
     cost_model: &crate::planner::CostModel,
 ) -> Result<QueryResult> {
+    // Wave 62 fix: if HAVING is present, the basic executor can't evaluate
+    // it (it doesn't process aggregate expressions in HAVING context).
+    // Return Err immediately so execute_inner falls to the tpch interpreter,
+    // which has a full HAVING implementation. Previously, HAVING queries
+    // could silently execute WITHOUT the HAVING filter, returning wrong rows.
+    if query.having.is_some() {
+        return Err(Error::Other("HAVING requires tpch fallback".into()));
+    }
+
     // 1. Resolve the table(s)
     let table = catalog
         .get(&query.from)

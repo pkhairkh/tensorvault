@@ -142,8 +142,14 @@ pub fn execute_dispatched(
         }
     }
     // Wave 60b: if the HAVING clause is present, the dispatch path can't
-    // evaluate it (the basic parser's Expr doesn't represent aggregates in
-    // HAVING). Return None so the query falls to tpch.
+    // evaluate it (the basic executor doesn't evaluate Expr::Function
+    // aggregates in HAVING context). Return None so the query falls to tpch,
+    // which has a full HAVING implementation.
+    // Wave 62 fix: the basic parser now PARSES HAVING correctly (including
+    // count(*) etc. as Expr::Function), but the basic executor still can't
+    // evaluate it — so we still route to tpch. The difference is that
+    // previously the parser ERRORED and the query fell to tpch as an error
+    // fallback; now the parser SUCCEEDS and we explicitly route to tpch.
     if query.having.is_some() {
         return None;
     }
@@ -156,6 +162,7 @@ fn expr_contains_case(expr: &Expr) -> bool {
     match expr {
         Expr::Case { .. } => true,
         Expr::Binary { left, right, .. } => expr_contains_case(left) || expr_contains_case(right),
+        Expr::Function { .. } => false,
         Expr::Column(_) | Expr::Literal(_) => false,
     }
 }
@@ -1451,23 +1458,7 @@ pub fn sum_arithmetic(
     (sum as f64).to_bits()
 }
 
-/// Evaluate CASE WHEN cond THEN val ELSE default END for a single row.
-fn eval_case_row(
-    whens: &[(crate::sql::parser::Expr, crate::sql::parser::Expr)],
-    else_expr: Option<&crate::sql::parser::Expr>,
-    columns: &[Vec<u64>],
-    column_names: &[String],
-    row_idx: usize,
-) -> u64 {
-    for (cond, result) in whens {
-        // Evaluate condition — if the row matches, return the result
-        let cond_val = eval_arith_row(cond, columns, column_names, row_idx);
-        if cond_val != 0 {
-            return eval_arith_row(result, columns, column_names, row_idx);
-        }
-    }
-    if let Some(e) = else_expr {
-        return eval_arith_row(e, columns, column_names, row_idx);
-    }
-    0
-}
+// Wave 62 fix: removed dead code `eval_case_row` — it was added in Wave 60a
+// but never called because CASE WHEN expressions are routed to the tpch
+// fallback (the basic executor can't evaluate Expr::Case per row). The
+// audit caught this as new dead code introduced by Wave 60a.
