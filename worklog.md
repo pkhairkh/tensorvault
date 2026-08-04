@@ -3071,3 +3071,20 @@ Work Log:
 
 Stage Summary:
 - Ready to start Wave 56.
+
+---
+Task ID: W61
+Agent: orchestrator
+Task: Final DoD + tag v1.0.0-remediated
+
+Work Log:
+- Verified all tests pass: 1342 tests, 0 failures (up from 1317 at start).
+- Verified no #[ignore] tests exist — no tests were deleted or ignored to hide bugs.
+- Verified documentation consistency: Cargo.toml version=1.0.0, license=CCL-X-1.2; README says CCL-X-1.2; LICENSE.md is CCL-X v1.2.
+- Verified all wired modules have engine.execute() tests: MERGE, PIVOT, JSON_VALUE, temporal DDL, CASE WHEN.
+- Verified dead-code warnings for first_agg/hash_group_by_flat/AggFunc are gone.
+- Verified NOT WIRED count: 7 (matches CHANGELOG).
+
+Stage Summary:
+- All 6 waves (56-61) complete. 25 net-new tests added (1317 → 1342).
+- Tagging v1.0.0-remediated.
